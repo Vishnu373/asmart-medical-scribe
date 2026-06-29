@@ -178,32 +178,31 @@ with model load/unload + idle watcher — adapted from the reference transcripti
 **Verification:** `cargo test` with `MockTranscriber`; manual Windows run loading
 Parakeet v3 and transcribing a fixture WAV to expected text.
 
-### Phase B6 — Streaming segmenter (NEW, on top of ported VAD/STT)  `[ ] not started`
+### Phase B6 — Streaming segmenter (NEW, on top of ported VAD/STT)  `[x] done`
 **Goal:** Turn the continuous stream into numbered speech segments that flow to the
 STT worker and emit live `transcript-segment{seq,text}` events.
 **Depends on:** B3, B4, B5
 **Tasks:**
-- [ ] `segment/`: consume capture frames + VAD probabilities; apply onset/hangover/
+- [x] `segment/`: consume capture frames + VAD probabilities; apply onset/hangover/
       prefill smoothing to cut speech segments (design §6.5).
-- [ ] Assign monotonic `seq` numbers; push segments onto an mpsc queue.
-- [ ] STT worker thread drains the queue, calls `Transcriber`, emits
+- [x] Assign monotonic `seq` numbers; push segments onto an mpsc queue.
+- [x] STT worker thread drains the queue, calls `Transcriber`, emits
       `transcript-segment{seq,text}` in order (design §9.5).
-- [ ] Backpressure/ordering tests so out-of-order completion still emits in `seq` order.
+- [x] Backpressure/ordering tests so out-of-order completion still emits in `seq` order.
 **Deliverables:** `segment/` module + STT worker thread.
 **Verification:** `cargo test` — feed a multi-utterance fixture through capture→VAD→
 mock STT, assert correct segment count, `seq` ordering, and emitted text.
 
-### Phase B7 — Recording orchestrator & state machine  `[ ] not started`
+### Phase B7 — Recording orchestrator & state machine  `[x] done`
 **Goal:** Backend-owned IDLE → RECORDING → PROCESSING with guarded transitions and
-`state-changed` events (design §6.6), serialized like Handy's coordinator.
+`state-changed` events (design §6.6), serialized through a single coordinator.
 **Depends on:** B6
 **Tasks:**
-- [ ] `orchestrator/`: single-threaded coordinator (modeled on Handy's
-      `transcription_coordinator.rs`) owning the state; reject illegal/duplicate
-      transitions.
-- [ ] Commands: `start/stop/pause/resume_recording` (design §9.4) drive the machine.
-- [ ] Emit `state-changed{state}` and `error{code,message}` events.
-- [ ] On stop → PROCESSING until the segment queue drains, then IDLE.
+- [x] `orchestrator/`: single-threaded coordinator owning the state; reject
+      illegal/duplicate transitions.
+- [x] Commands: `start/stop/pause/resume_recording` (design §9.4) drive the machine.
+- [x] Emit `state-changed{state}` and `error{code,message}` events.
+- [x] On stop → PROCESSING until the segment queue drains, then IDLE.
 **Deliverables:** `orchestrator/` module, recording commands.
 **Verification:** `cargo test` — transition table (legal/illegal), duplicate-start
 rejected, stop drains then returns IDLE.
@@ -470,3 +469,86 @@ hotkey without focus steal and pastes the chosen section.
     `transcribe-rs` (whisper-cpp C++ + ONNX runtime) — slow, needs the MSVC toolchain. Real
     Parakeet/Whisper transcription (loading a model + a fixture WAV) is a manual Windows check;
     the unit tests above don't load a native model. Expect `dead_code` warnings until B6/B7 wire it.
+
+- 2026-06-29 — **B3/B4/B5 review fixes** (post-review pass; all verified on Windows `cargo test`):
+  1. `audio_toolkit/audio/resampler.rs`: `finish()` now clears `in_buf` AND calls
+     `resampler.reset()` — the worker reuses one `FrameResampler` across Start/Stop cycles, so
+     leftover input bytes / internal FFT state were leaking the previous consult's tail into the
+     next recording. New `finish_resets_state_between_recordings` test.
+  2. `stt/engine.rs`: default language `"en"` → `"auto"` (design FR-2/FR-5) so a French consult
+     isn't force-decoded as English under the Whisper fallback before `set_language` is called.
+  3. `stt/engine.rs`: added a recording-aware guard — `set_recording(bool)` + a `recording` flag
+     the idle watcher checks, so the model is never unloaded mid-consult through a long silence
+     gap (the reference's `is_recording()` keep-alive, which the port had dropped).
+  4. `audio_toolkit/vad/smoothed.rs`: frame-buffer cap `prefill_frames + 1` →
+     `prefill_frames + onset_frames`, so onset voice frames aren't evicted before the trigger
+     fires (clipped leading syllable when `onset > prefill + 1`). New no-clip regression test.
+  5. `stt/engine.rs`: idle timer switched from wall-clock `SystemTime` to a monotonic `Instant`
+     epoch (via `once_cell::Lazy`) so clock changes can't pin or prematurely unload the model.
+  6. `audio_toolkit/audio/visualizer.rs`: `feed()` drains only the consumed window instead of
+     `clear()`-ing, so a cpal chunk larger than `window_size` and partial tails carry across calls.
+  7. `stt/engine.rs`: removed the redundant `is_none()` pre-check in `transcribe()` (double-lock /
+     small TOCTOU); the `take()` match already handles the not-loaded case.
+  - Custom-words (`apply_custom_words`) left in place but unwired (`&None`) — intentional, B7
+    will pass the doctor's vocabulary from settings.
+
+- 2026-06-29 — **B6 — Streaming segmenter** done. New code on the ported VAD/STT pieces.
+  - `segment/segmenter.rs`: `Segmenter` takes a `Box<dyn VoiceActivityDetector>` (production:
+    `SmoothedVad`; tests: a scripted VAD), accumulates speech frames, and cuts a numbered
+    `Segment{seq, audio}` onto an mpsc `Sender` at each pause boundary. `SegmenterConfig` carries
+    the min-floor (discard sub-0.2 s blips) and max-cap (force-cut a non-pausing speaker at 25 s);
+    `finish()` force-flushes the open segment on Stop (final words never lost) and resets the VAD.
+  - `segment/worker.rs`: `spawn_stt_worker(rx, Arc<dyn Transcriber>, sink)` drains the FIFO queue
+    on its own thread, calls `transcribe`, and pushes `TranscriptSegment{seq, text}` to the sink
+    in order (empty/whitespace skipped). `SttWorkerHandle::join`/`Drop` waits for the queue to
+    drain — B7's PROCESSING→IDLE.
+  - **Key decisions:** (a) ordering is inherent — one worker over a FIFO channel, so no reorder
+    buffer (the task's "out-of-order completion" can't occur by construction). (b) The worker
+    emits through a `FnMut` sink, not a Tauri `Emitter`, keeping B6 decoupled/testable like B5;
+    B7 supplies the real `transcript-segment` emit closure. (c) Onset/hangover/prefill smoothing
+    lives in B4's `SmoothedVad` (which the segmenter wraps), not re-implemented here.
+  - **Tests:** segmenter boundary cut / min-floor discard / max-cap force-cut / Stop tail-flush /
+    silence-only; worker seq-ordering + empty-skip. All pure-Rust (scripted VAD + `MockTranscriber`),
+    no native model.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test`.
+
+- 2026-06-29 — **B7 — Recording orchestrator & state machine** done. Wires B3–B6
+  into a single guarded lifecycle.
+  - `orchestrator/coordinator.rs`: `Coordinator` owns `RecordingState`
+    (Idle/Recording/Processing) behind a `Mutex` and serializes every transition.
+    Guards reject illegal/duplicate requests (second Start, Stop while Idle,
+    Start during PROCESSING) returning `Err(String)` to the command. Start failure
+    keeps the machine Idle and emits `error`; a panic-poisoned lock is recovered,
+    not wedged (design §6.6). It drives a `Pipeline` trait (`start/stop/set_paused`),
+    so the whole state machine is unit-tested with a `MockPipeline` — no native deps.
+  - `orchestrator/pipeline.rs`: `RealPipeline` is the production `Pipeline` — built
+    fresh per recording: cpal `AudioRecorder` (frame cb → `Arc<Mutex<Segmenter>>`,
+    level cb → `input-level`) → segment queue → `spawn_stt_worker` over the warm
+    `Arc<SttEngine>`, emitting `transcript-segment` on Ok / `error` on Err. Stop
+    order (no audio lost): recorder.stop() tail-flushes frames → close + drop the
+    recorder (release its frame-cb Arc) → `segmenter.finish()` + drop (closes the
+    queue) → `worker.join()` drains → `engine.set_recording(false)`. `emit_app_event`
+    maps `AppEvent` → Tauri `emit` (`state-changed` / `error`, §9.5).
+  - Commands `start/stop/pause/resume_recording` (`commands/mod.rs`) call the managed
+    `Coordinator`; registered in `lib.rs` `setup`, which builds the long-lived
+    `SttEngine` (5-min idle-unload) + `RealPipeline` and manages the coordinator.
+  - **Key decisions:** (a) Coordinator is generic over a `Pipeline` trait + an
+    `EmitFn` closure (not a Tauri `Emitter`) so the state machine is testable; the
+    Tauri/audio glue lives entirely in `pipeline.rs`. (b) Stop moves the pipeline
+    out of the lock during the blocking drain so a concurrent Start observes
+    PROCESSING and is rejected. (c) Pause/resume gate the capture frame-callback via
+    an `AtomicBool` and stay in RECORDING — design's `state-changed` contract (§9.5)
+    has no PAUSED wire state, so none is emitted (UI tracks its own paused toggle).
+  - **Deviations / deferred:** (i) VAD/STT model **asset paths + STT preload** aren't
+    wired yet (no model-bundling phase) — `RealPipeline` resolves the Silero model
+    from the resource dir, and until the models are bundled/loaded a recording
+    surfaces an `error` event instead of transcribing. (ii) On a transcribe error the
+    worker emits `error{code:"transcription_failed"}`; the model **reload** the design
+    mentions is deferred to when the STT model path exists. Recorded here per the
+    implement-from-design "surface divergence" rule.
+  - **Tests:** transition walk (Idle→Recording→Processing→Idle + event order),
+    duplicate-Start rejected, Stop-while-Idle rejected, start-failure stays Idle +
+    emits error, drain-failure still returns to Idle, pause/resume guards (double
+    pause / resume-when-not-paused rejected, no extra `state-changed`). All pure-Rust
+    via `MockPipeline`.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test`.
