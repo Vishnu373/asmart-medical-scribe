@@ -11,9 +11,9 @@ On-device medical scribe for Windows — records a doctor–patient consult, tra
 
 ### 0. Clone the project
 
-'''
+```
 git clone https://github.com/Vishnu373/medical-scribe.git
-'''
+```
 
 ### 1. Install Bun
 
@@ -21,9 +21,9 @@ Documentation: https://bun.com/docs/installation
 
 ### 2. Navigate to the project folder
 
-'''
+```
 cd medical-scribe
-'''
+```
 
 ### 3. Install frontend dependencies
 
