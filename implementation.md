@@ -1,0 +1,472 @@
+# Implementation Plan
+
+> Source design: design.md
+> Conventions: CLAUDE.md (none in this project — defaults noted below)
+> STT source: reused from the `handy/` reference codebase in this repo
+> Generated: 2026-06-26
+
+## Overview
+
+We build an on-device Windows medical scribe as a Tauri 2 app (React + TypeScript
+frontend, Rust backend) that records a consult, transcribes locally, and generates
+a SOAP note — with zero PHI egress and encryption at rest. The **STT pipeline is
+not written from scratch**: we lift Handy's proven audio + VAD + engine code
+(`audio_toolkit/`, the `transcribe-rs` engine integration, model lifecycle) and
+adapt it from push-to-talk batch dictation into long-form streaming segmentation
+that emits live transcript segments. Everything else (encrypted storage, model
+residency, LLM note generation, records, EMR hand-off, UI) is built fresh on top.
+
+Work is split into **Backend (B1–B11)** and **Frontend (F1–F7)** phases, each
+small and independently verifiable. STT-related backend phases (B3–B6) are
+explicitly framed as *port-and-adapt from `handy/`* rather than green-field.
+
+## Assumptions & Decisions
+
+- **Scope:** Full end-to-end pipeline (capture → transcript → SOAP note → store →
+  hand-off), not a thin MVP. (User-confirmed.)
+- **Dev/build target:** Develop, build, and run directly on Windows 11 native,
+  MSVC toolchain, CPU-only (no WSL split — one environment). DPAPI, global
+  hotkeys, the no-activate overlay, and audio capture are Windows-only and
+  exercised there. (User-confirmed.)
+- **Frontend package manager:** Bun. (User-confirmed.)
+- **Test depth:** Heavy automated coverage — `cargo test` (unit + integration with
+  a mock `Transcriber`) and Vitest/RTL on the frontend. (User-confirmed.)
+- **STT reuse (binding instruction):** Reuse the `handy/` codebase for STT.
+  Concretely we port:
+  - `handy/src-tauri/src/audio_toolkit/` → capture (`cpal`), resampling
+    (`rubato` → 16 kHz mono f32), Silero VAD (`vad-rs`), text filters.
+  - `handy/src-tauri/src/managers/transcription.rs` + `managers/model.rs` → the
+    `transcribe-rs` engine wrapper (`LoadedEngine`, load/unload, idle watcher,
+    `catch_unwind` transcribe, language validation), trimmed to the two engines
+    we need.
+  - Dependency: `transcribe-rs = { version = "0.3.8", features = ["whisper-cpp",
+    "onnx"] }` (CPU-only; the ONNX feature provides Parakeet, whisper-cpp provides
+    Whisper). This is the same crate Handy uses.
+- **STT models (design §6.4):** Default = **Parakeet TDT 0.6B v3** via the
+  `transcribe-rs` ONNX/Parakeet engine (multilingual EN+FR, CPU). Fallback =
+  **Whisper small/medium** via the `transcribe-rs` whisper-cpp engine. Both sit
+  behind one `Transcriber` trait (`transcribe(audio: &[f32]) -> Result<String>`).
+- **Key difference from Handy we must build, not copy:** Handy is push-to-talk
+  (record → stop → transcribe the whole buffer → paste). Medical-scribe is a
+  long-form consult that must emit **live `transcript-segment` events** during
+  recording. So we keep Handy's capture + VAD + engine primitives but write a new
+  **streaming segmenter** (onset/hangover/prefill smoothing → numbered segments →
+  mpsc queue → STT worker thread) on top.
+- **Persistence:** single SQLCipher-encrypted SQLite DB via `rusqlite`
+  (bundled-sqlcipher) for PHI; separate plain JSON settings store (no PHI). Schema
+  per design §9.2 (`records`, `notes`).
+- **Key management:** Windows DPAPI wraps a random AES-256 DB key, scoped to the
+  Windows user; no passphrase (design §10.1).
+- **Note generation:** `llama-cpp-2` GGUF in-process CPU; ≥16 GB → Mistral-7B-
+  Instruct-v0.3 Q4_K_M, <16 GB → Phi-3.5-mini-instruct (design §8). Phase 2.
+- **No CLAUDE.md** exists in the medical-scribe project. Defaults adopted: Rust
+  2021 + `rustfmt` + `clippy`; TypeScript strict + ESLint + Prettier + Vite;
+  `cargo test` + Vitest/RTL; conventional commits. (Handy's own AGENTS.md
+  conventions are followed only when porting its files.)
+- **Standalone constraint:** `design.md` must never name Handy. This plan and the
+  shipped product are standalone; `handy/` is a build-time source we copy from,
+  not a runtime dependency, and no "Handy" branding/strings carry over.
+
+## Target folder structure
+
+```
+medical-scribe/
+├── design.md
+├── implementation.md
+├── package.json / vite.config.ts / tsconfig.json / tailwind.config.js
+├── index.html
+├── src/                              # React + TS frontend
+│   ├── main.tsx / App.tsx
+│   ├── bridge/                       # invoke() wrappers + event listeners
+│   ├── state/                        # store (recording, transcript, notes, settings)
+│   ├── views/                        # RecordingView, RecordsView, SettingsView
+│   ├── components/                   # TranscriptEditor, SoapEditor, handoff overlay, etc.
+│   └── overlay/                      # no-activate hand-off picker window entry
+└── src-tauri/
+    ├── Cargo.toml / tauri.conf.json / build.rs
+    ├── resources/models/             # silero_vad + STT/LLM model files
+    └── src/
+        ├── main.rs / lib.rs          # Tauri setup, manager wiring, commands registry
+        ├── audio_toolkit/            # PORTED from handy: audio/, vad/, text, utils
+        ├── stt/                      # engine wrapper (ported) + Transcriber trait
+        ├── segment/                  # NEW streaming segmenter (numbered segments)
+        ├── orchestrator/             # state machine IDLE/RECORDING/PROCESSING/GENERATING
+        ├── residency/               # RAM probe + co-resident vs swap decision (§7)
+        ├── llm/                      # llama-cpp-2 SOAP note generation (§8)
+        ├── store/                    # SQLCipher DB (records, notes) + migrations
+        ├── crypto/                   # DPAPI-wrapped AES-256 key (§10.1)
+        ├── settings/                # plain JSON settings (no PHI)
+        ├── handoff/                  # global shortcut + overlay + clipboard paste (§8.6)
+        ├── telemetry/               # crash reporting, PHI fields excluded (§10.3)
+        └── commands/                # Tauri command handlers (§9.4)
+```
+
+## Backend
+
+### Phase B1 — Project scaffold & Tauri shell  `[x] done`
+**Goal:** A buildable, empty Tauri 2 app that launches a window on Windows.
+**Depends on:** none
+**Tasks:**
+- [x] Initialize Tauri 2 project (Rust backend + Vite/React/TS frontend), MSVC target.
+- [x] Set up `Cargo.toml` with pinned deps (tauri, serde, anyhow, log, thiserror)
+      and the workspace module layout above (empty modules with `//!` docs).
+- [x] Configure `tauri.conf.json` (single window, app identifier, no auto-updater).
+- [x] Wire `rustfmt.toml`, `clippy` in CI-style `cargo check`, ESLint/Prettier/TS-strict.
+- [x] Add a trivial `ping` command + frontend `invoke('ping')` to prove the bridge.
+**Deliverables:** `src-tauri/`, `src/`, config files, module skeletons.
+**Verification:** `bun run tauri dev` launches; `ping` round-trips; `cargo fmt
+--check`, `cargo clippy`, `bun run build` all pass on Windows.
+
+### Phase B2 — Encrypted storage, crypto & settings  `[x] done`
+**Goal:** Persist records/notes in a SQLCipher DB keyed by a DPAPI-wrapped key,
+plus a plain JSON settings store.
+**Depends on:** B1
+**Tasks:**
+- [x] `crypto/`: generate random AES-256 key; wrap/unwrap with Windows DPAPI
+      (`CryptProtectData`/`CryptUnprotectData` via `windows` crate); persist blob.
+- [x] `store/`: open `rusqlite` with bundled-sqlcipher, apply key, run migrations
+      for `records` + `notes` (schema §9.2) via `rusqlite_migration`.
+- [x] CRUD helpers: insert/list/open/delete record; insert/list notes, `is_active`
+      version toggling.
+- [x] `settings/`: plain JSON store (selected models, language, hotkey, device) —
+      assert no PHI fields.
+**Deliverables:** `crypto/`, `store/`, `settings/` modules + migrations.
+**Verification:** `cargo test` — round-trip encrypt/decrypt key; open DB with key,
+write+read a record/note, reject wrong key; migration idempotency.
+
+### Phase B3 — Port audio capture & resampling  `[x] done`
+**Goal:** Capture mic audio and resample to 16 kHz mono f32 using the ported toolkit.
+**Depends on:** B1
+**Tasks:**
+- [x] Copy the reference `audio_toolkit/audio/` (device, recorder, resampler,
+      utils, visualizer) into `src-tauri/src/audio_toolkit/audio/`; strip branding/i18n;
+      keep `cpal` + `rubato` logic.
+- [x] Adapt `AudioRecorder` to expose a continuous f32 sample stream (frame
+      callback) suitable for streaming, not just stop-and-drain.
+- [x] Port device enumeration (`list_input_devices`) for the settings UI.
+- [x] Emit an `input-level` value from the visualizer path (design §9.5).
+**Deliverables:** ported `audio_toolkit/audio/`, capture API.
+**Verification:** `cargo test` on resampler (rate-convert a known WAV, assert
+length/format); manual: capture a few seconds on Windows and dump a 16 kHz WAV.
+
+### Phase B4 — Port Silero VAD  `[x] done`
+**Goal:** Voice-activity detection over the 16 kHz stream via the ported Silero VAD.
+**Depends on:** B3
+**Tasks:**
+- [x] Copy the reference `audio_toolkit/vad/` (silero, smoothed, mod) and the
+      `vad-rs` dep; vendor the `silero_vad_v4.onnx` model into `resources/models/`.
+- [x] Expose a `VoiceActivityDetector` API returning a per-frame speech decision.
+- [x] Unit-test the smoothing wrapper with synthetic speech/silence frames.
+**Deliverables:** ported `audio_toolkit/vad/`, VAD model resource.
+**Verification:** `cargo test` — silence → no speech, tone/speech fixture → speech;
+smoothing onset/hangover behaves.
+
+### Phase B5 — Port STT engine wrapper (`transcribe-rs`)  `[x] done`
+**Goal:** A `Transcriber` trait backed by Parakeet (default) and Whisper (fallback),
+with model load/unload + idle watcher — adapted from the reference transcription manager.
+**Depends on:** B1, B2
+**Tasks:**
+- [x] Add `transcribe-rs = { version = "0.3.8", features = ["whisper-cpp","onnx"] }`.
+- [x] Port the relevant parts of the reference `managers/transcription.rs`:
+      `LoadedEngine` (trimmed to `Whisper` + `Parakeet` only), `load`/`unload`,
+      idle-unload watcher, `catch_unwind` transcribe, language validation (EN/FR).
+- [x] Define `trait Transcriber { fn transcribe(&self, audio: &[f32]) -> Result<String>; }`
+      and implement it over the ported engine (`SttEngine`).
+- [x] Provide a `MockTranscriber` (echo/fixture) for tests, mirroring the reference mock.
+- [x] Port the `text.rs` filters (`filter_transcription_output`, `apply_custom_words`).
+**Deliverables:** `stt/` module, `Transcriber` trait + Parakeet/Whisper impls + mock.
+**Verification:** `cargo test` with `MockTranscriber`; manual Windows run loading
+Parakeet v3 and transcribing a fixture WAV to expected text.
+
+### Phase B6 — Streaming segmenter (NEW, on top of ported VAD/STT)  `[ ] not started`
+**Goal:** Turn the continuous stream into numbered speech segments that flow to the
+STT worker and emit live `transcript-segment{seq,text}` events.
+**Depends on:** B3, B4, B5
+**Tasks:**
+- [ ] `segment/`: consume capture frames + VAD probabilities; apply onset/hangover/
+      prefill smoothing to cut speech segments (design §6.5).
+- [ ] Assign monotonic `seq` numbers; push segments onto an mpsc queue.
+- [ ] STT worker thread drains the queue, calls `Transcriber`, emits
+      `transcript-segment{seq,text}` in order (design §9.5).
+- [ ] Backpressure/ordering tests so out-of-order completion still emits in `seq` order.
+**Deliverables:** `segment/` module + STT worker thread.
+**Verification:** `cargo test` — feed a multi-utterance fixture through capture→VAD→
+mock STT, assert correct segment count, `seq` ordering, and emitted text.
+
+### Phase B7 — Recording orchestrator & state machine  `[ ] not started`
+**Goal:** Backend-owned IDLE → RECORDING → PROCESSING with guarded transitions and
+`state-changed` events (design §6.6), serialized like Handy's coordinator.
+**Depends on:** B6
+**Tasks:**
+- [ ] `orchestrator/`: single-threaded coordinator (modeled on Handy's
+      `transcription_coordinator.rs`) owning the state; reject illegal/duplicate
+      transitions.
+- [ ] Commands: `start/stop/pause/resume_recording` (design §9.4) drive the machine.
+- [ ] Emit `state-changed{state}` and `error{code,message}` events.
+- [ ] On stop → PROCESSING until the segment queue drains, then IDLE.
+**Deliverables:** `orchestrator/` module, recording commands.
+**Verification:** `cargo test` — transition table (legal/illegal), duplicate-start
+rejected, stop drains then returns IDLE.
+
+### Phase B8 — Records & transcript commands  `[ ] not started`
+**Goal:** Persist a completed consult and expose record/transcript commands.
+**Depends on:** B2, B7
+**Tasks:**
+- [ ] On stop, assemble the full transcript and insert a `records` row.
+- [ ] Commands: `update_transcript`, `list_records`, `open_record`, `delete_record`.
+- [ ] Map errors to `error{code,message}`; ensure deletes cascade to `notes`.
+**Deliverables:** records/transcript commands wired to `store/`.
+**Verification:** `cargo test` — record lifecycle end-to-end with the in-memory/mock
+pipeline; delete removes notes.
+
+### Phase B9 — Model residency strategy  `[ ] not started`
+**Goal:** Decide STT+LLM co-residency vs swap from a one-time RAM probe (design §7).
+**Depends on:** B5
+**Tasks:**
+- [ ] `residency/`: `sysinfo` total-RAM probe; footprint = STT + LLM + 2–3 GB
+      headroom; require ≥2 GB margin for co-resident, else swap; decide-once-cache.
+- [ ] Manual override surfaced via settings.
+- [ ] Integrate so the LLM phase (B10) and STT (B5) honor the residency decision.
+**Deliverables:** `residency/` module.
+**Verification:** `cargo test` — decision boundaries (8/16/32 GB synthetic probes,
+override path).
+
+### Phase B10 — LLM SOAP note generation  `[ ] not started`
+**Goal:** Generate streaming SOAP notes in-process from the transcript (design §8).
+**Depends on:** B8, B9
+**Tasks:**
+- [ ] `llm/`: `llama-cpp-2` GGUF loader; model pick by RAM (Mistral-7B vs Phi-3.5).
+- [ ] Zero-shot SOAP prompt (four `##` headers), low temperature, anti-hallucination
+      guardrails, warmup, cancel; add GENERATING state to the orchestrator.
+- [ ] Stream `generation-token{text}`; persist result as a `notes` row (`is_active`).
+- [ ] Commands: `generate_note`, `regenerate_note`, `cancel_generation`,
+      `update_note`, `revert_version`.
+**Deliverables:** `llm/` module, note commands, GENERATING state.
+**Verification:** `cargo test` with a stub/tiny model or mocked generator —
+streaming tokens, cancel, version revert; manual Windows run produces a SOAP note.
+
+### Phase B11 — EMR hand-off & crash reporting  `[ ] not started`
+**Goal:** Global-hotkey overlay paste of SOAP sections, plus PHI-safe crash reports.
+**Depends on:** B10
+**Tasks:**
+- [ ] `handoff/`: `tauri-plugin-global-shortcut` Alt+P (rebindable) → no-activate
+      always-on-top overlay (`WS_EX_NOACTIVATE`) → S/O/A/P picker.
+- [ ] Deterministic markdown parser → clipboard + simulated Ctrl+V → clipboard
+      auto-clear; command `paste_section`.
+- [ ] `telemetry/`: Sentry-class crash reporting with `transcript`/`soap_data`/
+      `label` structurally excluded.
+**Deliverables:** `handoff/`, `telemetry/` modules + `paste_section` command.
+**Verification:** `cargo test` — markdown→section parser; manual Windows: hotkey
+shows overlay without stealing focus, pastes the chosen section, clipboard clears;
+crash report payload asserted to contain no PHI fields.
+
+## Frontend
+
+### Phase F1 — App shell & Tauri bridge  `[ ] not started`
+**Goal:** React shell with typed `invoke`/event wrappers and global app state.
+**Depends on:** B1
+**Tasks:**
+- [ ] `bridge/`: typed wrappers for all §9.4 commands and §9.5 event listeners.
+- [ ] `state/`: store slices (recording, transcript, notes, records, settings).
+- [ ] App layout/router for Recording / Records / Settings views; Tailwind theme.
+**Deliverables:** `bridge/`, `state/`, shell layout.
+**Verification:** Vitest — bridge wrappers call `invoke` with correct args; shell
+renders; `ping` works through the typed bridge.
+
+### Phase F2 — Recording view  `[ ] not started`
+**Goal:** Start/stop/pause recording with live input level + state display.
+**Depends on:** B7, F1
+**Tasks:**
+- [ ] Record controls bound to `start/stop/pause/resume_recording`.
+- [ ] Input-level meter from `input-level`; status from `state-changed`.
+- [ ] Error toasts from `error` events.
+**Deliverables:** `RecordingView` + meter/status components.
+**Verification:** RTL — controls dispatch correct commands; meter reacts to mocked
+`input-level`; state label follows `state-changed`.
+
+### Phase F3 — Live transcript editor  `[ ] not started`
+**Goal:** Render streaming segments and allow edits saved via `update_transcript`.
+**Depends on:** B6, B8, F2
+**Tasks:**
+- [ ] Append `transcript-segment{seq,text}` in `seq` order; live-growing view.
+- [ ] Editable transcript; debounced save to `update_transcript`.
+**Deliverables:** `TranscriptEditor`.
+**Verification:** RTL — segments render in order from mocked events; edit → save
+invoked with merged text.
+
+### Phase F4 — SOAP note generation UI  `[ ] not started`
+**Goal:** Trigger/stream/edit SOAP notes with versioning.
+**Depends on:** B10, F3
+**Tasks:**
+- [ ] Generate/regenerate/cancel buttons; stream `generation-token` into a SOAP view.
+- [ ] Four-section editor; save via `update_note`; version revert via `revert_version`.
+**Deliverables:** `SoapEditor` + generation controls.
+**Verification:** RTL — streaming tokens accumulate; cancel stops; revert calls
+`revert_version`.
+
+### Phase F5 — Records browser  `[ ] not started`
+**Goal:** List/open/delete past consults and their notes.
+**Depends on:** B8, F1
+**Tasks:**
+- [ ] `RecordsView` listing from `list_records`; open loads transcript + notes.
+- [ ] Delete with confirm → `delete_record`.
+**Deliverables:** `RecordsView`.
+**Verification:** RTL — list renders from mocked data; open/delete invoke correct
+commands.
+
+### Phase F6 — Settings view  `[ ] not started`
+**Goal:** Configure model, language, input device, hotkey, residency override.
+**Depends on:** B5, B9, F1
+**Tasks:**
+- [ ] Forms bound to `get_settings`/`update_settings`; STT/LLM model pickers;
+      language (EN/FR); input device (from B3 enumeration); residency override.
+- [ ] Hotkey rebinding control for hand-off.
+**Deliverables:** `SettingsView`.
+**Verification:** RTL — load/save round-trip; invalid input guarded.
+
+### Phase F7 — Hand-off overlay UI  `[ ] not started`
+**Goal:** The no-activate S/O/A/P picker overlay window.
+**Depends on:** B11, F4
+**Tasks:**
+- [ ] `overlay/` entry window; S/O/A/P picker calling `paste_section`.
+- [ ] Minimal always-on-top styling; keyboard navigable.
+**Deliverables:** overlay window + picker.
+**Verification:** RTL on the picker component; manual Windows: overlay appears via
+hotkey without focus steal and pastes the chosen section.
+
+## Progress Log
+
+- 2026-06-26 — Plan drafted. STT phases (B3–B6) reframed to port-and-adapt from the
+  `handy/` codebase per user instruction; non-STT phases built fresh per design.md.
+  Awaiting approval before any code is written.
+- 2026-06-27 — Plan approved. Decisions added: develop/build/run directly on Windows
+  (no WSL split), Bun as the frontend package manager.
+- 2026-06-27 — **B1 built.** Scaffolded the Tauri 2 shell:
+  - Frontend: `package.json` (Bun, React 18 + TS strict + Vite 6 + Tailwind v4),
+    `vite.config.ts`, `tsconfig*.json`, `index.html`, `src/main.tsx`, `src/App.tsx`,
+    `src/styles.css`, `src/bridge/index.ts` (typed `ping` wrapper), `eslint.config.js`
+    (flat, `no-explicit-any: error`), `.prettierrc`.
+  - Backend: `src-tauri/Cargo.toml`, `build.rs`, `tauri.conf.json` (single 1100×740
+    window, id `com.medscribe.app`, updater off), `capabilities/default.json`,
+    `rustfmt.toml`, `src/main.rs`, `src/lib.rs` (registers `ping`, `tauri-plugin-log`),
+    `src/commands/mod.rs` (`ping`), and 11 empty module skeletons (`audio_toolkit`,
+    `stt`, `segment`, `orchestrator`, `residency`, `llm`, `store`, `crypto`,
+    `settings`, `handoff`, `telemetry`) each with a `//!` doc pointing at its phase.
+  - `.gitignore` excludes `target/`, `gen/`, `node_modules/`, model weights, and any
+    `*.db`/`*.sqlite` (PHI). `resources/models/.gitkeep` + empty `icons/` created.
+  - **Icons:** placeholder icon set generated (teal square + white medical cross) at
+    `src-tauri/icons/` — `tauri-build` requires `icon.ico` even for `dev` on Windows.
+    Replace with real artwork via `bun run tauri icon <png>` before release.
+  - **Windows dev-box setup encountered (one-time):** install Rust via rustup, install
+    VS Build Tools "Desktop development with C++" (provides `link.exe`), and set Smart
+    App Control to Evaluation/Off (it blocked unsigned Rust build-script `.exe`s,
+    os error 4551). **Release follow-up:** Windows code signing so end users don't hit
+    SmartScreen/SAC warnings — separate from the dev-box workaround.
+  - **Verified (Windows):** `bun run tauri dev` opens the window showing the
+    `pong:` bridge reply — frontend↔backend round-trip confirmed. B1 done.
+  - **Pending Windows verification (user):** `bun install`, `bun run tauri dev`
+    (window shows "bridge: pong: hello from frontend"), `cargo fmt --check`,
+    `cargo clippy`, `bun run build`.
+- 2026-06-27 — **B2 built.** Encrypted storage, crypto & settings:
+  - `crypto/mod.rs`: `load_or_create_key(path)` generates a random 32-byte key via
+    `rand::OsRng`, wraps it with Windows DPAPI (`CryptProtectData`, `CRYPTPROTECT_UI_FORBIDDEN`,
+    user-scoped) and writes only the wrapped blob; unwraps on reload. Non-Windows builds
+    get a stub that errors. `#[cfg(all(test, windows))]` round-trip + persist/reload tests.
+  - `store/mod.rs`: `Store::open(path, key)` opens SQLCipher via `rusqlite`, applies the key
+    as raw hex (`PRAGMA key = "x'…'"`), enables FKs, verifies decryption by touching the
+    schema, then runs `rusqlite_migration` to latest. Migration creates `records` + `notes`
+    (schema §9.2) with `ON DELETE CASCADE` + index. CRUD: `create_record`/`update_transcript`/
+    `list_records`(summary)/`open_record`/`delete_record`; `insert_note` (auto-activates,
+    deactivates siblings in a tx)/`list_notes`/`set_active_note`. Tests: migration
+    validity+idempotency, record round-trip, single-active-note toggling+cascade,
+    wrong-key rejection.
+  - `settings/mod.rs`: plain-JSON `Settings` (model/mic/hotkey + internal residency/RAM/
+    vad/idle) with sensible defaults; `load` (defaults if absent) / `save` (pretty JSON).
+    Test asserts the serialized form carries no PHI field names.
+  - **Deps added** (`src-tauri/Cargo.toml`): `rusqlite` (feature
+    `bundled-sqlcipher`), `rusqlite_migration`, `rand`, `uuid`, `zeroize`,
+    `windows` (target-gated to `cfg(windows)`, Foundation + Security_Cryptography),
+    dev-dep `tempfile`.
+  - **DECISION / Windows build prerequisite:** use `bundled-sqlcipher`, linking the
+    **system OpenSSL** (user is installing OpenSSL from the GitHub source / Win64 build).
+    Set `OPENSSL_DIR` to the install (e.g. `C:\Program Files\OpenSSL-Win64`). No Perl/NASM
+    needed (that was the earlier vendored-openssl path). Add to README once confirmed building.
+  - **Hardening:** transient unwrapped key copy is `zeroize()`'d; `set_active_note` enforces
+    the single-active invariant (errors + rolls back on an unknown note_id); settings struct is
+    `#[serde(default)]` for forward-compat; list ordering tiebreaks by `rowid`.
+  - **Pending Windows verification (user):** `cargo test` (DPAPI round-trip is Windows-only;
+    SQLCipher tests need the `bundled-sqlcipher` build to link OpenSSL → `OPENSSL_DIR` set).
+    Expect `dead_code` warnings for the new modules until B7 wires them into Tauri commands.
+- 2026-06-28 — **B3 built.** Ported audio capture & resampling:
+  - `audio_toolkit/mod.rs`: module wiring + re-exports; inlined `get_cpal_host()` and a
+    `TARGET_SAMPLE_RATE = 16_000` const (replaces the reference's `WHISPER_SAMPLE_RATE`).
+  - `audio_toolkit/audio/`: `resampler.rs` (`FrameResampler`, rubato FFT downsample →
+    fixed 30 ms frames, pass-through when rates match), `visualizer.rs` (`AudioVisualiser`
+    FFT spectrum → 16 normalised level buckets), `utils.rs` (WAV read/save/verify),
+    `device.rs` (`list_input_devices` + `CpalDeviceInfo`; dropped unused output enumeration),
+    `recorder.rs` (`AudioRecorder`).
+  - **Key adaptation (streaming, not push-to-talk):** removed the recorder's VAD coupling
+    (VAD moves to the segmenter in B4/B6) and added `with_frame_callback` — each captured
+    16 kHz mono frame is delivered live during recording for the streaming segmenter, while
+    `stop()` still returns the full buffer. `with_level_callback` feeds the input-level meter.
+    Capture stays at the device's native rate; `FrameResampler` downsamples to 16 kHz.
+  - **Deps added** (`src-tauri/Cargo.toml`): `cpal = "0.16"`, `rubato = "0.16"`,
+    `hound = "3.5"`, `rustfft = "6"`.
+  - **Tests:** resampler 48k→16k length, equal-rate pass-through, fixed 480-sample frame
+    size; WAV save/verify/read round-trip; the mic-error string classifiers.
+  - **Note:** the actual Tauri `emit("input-level")` / device-list command wiring is deferred
+    to B7 (orchestrator) and F6 (settings) — the recorder exposes callbacks, not an AppHandle,
+    to stay decoupled and unit-testable.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test` (needs `OPENSSL_DIR`
+    for the bundled-sqlcipher link from B2; cpal links WASAPI). Manual: capture a few seconds
+    and dump a 16 kHz WAV via `save_wav_file`. Expect `dead_code` warnings until B6/B7 wire it.
+- 2026-06-28 — **B4 built.** Ported Silero VAD:
+  - `audio_toolkit/vad/`: `mod.rs` (`VadFrame` Speech/Noise enum + `VoiceActivityDetector`
+    trait with `push_frame`/`is_voice`/`reset`), `silero.rs` (`SileroVad` over `vad-rs`,
+    16 kHz 30 ms frames, probability thresholded to keep/drop), `smoothed.rs` (`SmoothedVad`
+    onset/hangover/prefill wrapper). Re-exported from `audio_toolkit`.
+  - Updated `silero.rs` to use `TARGET_SAMPLE_RATE` (replaces the reference's
+    `constants::WHISPER_SAMPLE_RATE`).
+  - **Trait shape:** the reference trait surfaces a thresholded keep/drop decision
+    (`VadFrame`), not a raw float — kept as-is since the B6 segmenter consumes Speech/Noise
+    frames via `SmoothedVad`, not probabilities. (Plan said "per-frame speech probability";
+    ported faithfully as the equivalent decision API.)
+  - **Dep added:** `vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }`
+    (same fork the reference uses; pulls an ONNX runtime).
+  - **Model:** `silero_vad_v4.onnx` (1.8 MB) copied to `src-tauri/resources/models/`. Per user
+    decision, added a `.gitignore` carve-out (`!silero_vad_v4.onnx`) so this small, startup-required
+    model IS committed; the large STT/LLM weights remain excluded.
+  - **Tests:** `SmoothedVad` onset (N consecutive voice frames required), hangover (holds speech
+    past brief silence), prefill (prepends buffered pre-roll), and sustained-silence stays Noise —
+    driven by a scripted boolean mock VAD, so no ONNX model needed for `cargo test`.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test`. The smoothing tests run
+    pure-Rust; loading `SileroVad` itself needs the ONNX model + runtime and is exercised in B6.
+- 2026-06-28 — **B5 built.** Ported the STT engine wrapper behind a `Transcriber` trait:
+  - `stt/transcriber.rs`: `trait Transcriber { fn transcribe(&self, audio: &[f32]) -> Result<String> }`
+    (design's interface; the segmenter/orchestrator depend only on this).
+  - `stt/engine.rs`: `SttEngine` over `transcribe-rs`. `LoadedEngine` trimmed from the reference's
+    eight engines to `Whisper(WhisperEngine)` + `Parakeet(ParakeetModel)`; `ModelKind` enum;
+    `load(kind, path)` / `unload` / `is_loaded` / `current_model` / `set_language` /
+    `touch_activity`. `transcribe` keeps the reference's **`catch_unwind`** discipline (take the
+    engine out, run the native call unlocked, put it back on success; on panic drop it = unload +
+    clear model id, no mutex poisoning) and runs the result through `filter_transcription_output`.
+    **Idle watcher** decoupled from the reference's AppHandle/settings/recording-state checks: a
+    background thread unloads the model after `idle_timeout` of no activity (0 = never); `Drop`
+    signals shutdown + joins. Language validation trimmed to EN/FR (+auto) for Whisper; Parakeet
+    TDT v3 auto-detects (no language param, as in the reference).
+  - `stt/mock.rs`: `MockTranscriber` — echo (`new`) or queued (`with_responses`) responses with a
+    `call_count`; empty audio → empty string. For B6/B7 tests. Mirrors the reference mock.
+  - `stt/text.rs`: ported verbatim (fuzzy custom-word correction + filler/stutter filtering) with
+    its own 30+ tests.
+  - **Decoupling (key adaptation):** dropped the reference's `AppHandle`/`Emitter` events,
+    download `ModelManager`, `specta` bindings, GPU/Vulkan/DirectML accelerator plumbing and the
+    `model-state-changed` events. The orchestrator (B7) drives load/unload and language; model
+    file paths come from `resources/models/` (residency decision lands in B9).
+  - **Deps added** (`src-tauri/Cargo.toml`): `transcribe-rs = "0.3.8"` (`whisper-cpp` + `onnx`,
+    CPU-only), `natural`, `once_cell`, `regex`, `strsim` (for `text.rs`).
+  - **Tests:** `MockTranscriber` ordering/echo/empty, `SttEngine` language validation + the
+    not-loaded/empty-audio paths (no native model needed), plus the verbatim `text.rs` suite.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test`. First build compiles
+    `transcribe-rs` (whisper-cpp C++ + ONNX runtime) — slow, needs the MSVC toolchain. Real
+    Parakeet/Whisper transcription (loading a model + a fixture WAV) is a manual Windows check;
+    the unit tests above don't load a native model. Expect `dead_code` warnings until B6/B7 wire it.

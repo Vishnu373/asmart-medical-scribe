@@ -1,0 +1,110 @@
+//! Plain JSON settings store (no PHI). Design §9.3. B2.
+//!
+//! Settings are configuration only — model/mic/hotkey choices and a few internal
+//! computed values. No transcripts, notes, or patient labels ever live here, so
+//! this file is intentionally *not* encrypted.
+
+use anyhow::{Context, Result};
+use serde::{Deserialize, Serialize};
+use std::fs;
+use std::path::Path;
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
+// Fields are added per phase; missing keys in an older settings.json must fall
+// back to defaults (config-only, no PHI) rather than fail to parse.
+#[serde(default)]
+pub struct Settings {
+    /// Doctor-facing: `best` / `medium` / `okay` (§7).
+    pub model_choice: String,
+    /// Doctor-facing: selected input device, `None` = system default.
+    pub mic_device: Option<String>,
+    /// Doctor-facing: rebindable paste hotkey, default Alt+P (§8.6).
+    pub paste_hotkey: String,
+    /// Internal: co-resident vs swap, decided once (§7).
+    pub residency_mode: Option<String>,
+    /// Internal: cached RAM probe in bytes (§7).
+    pub observed_total_ram: Option<u64>,
+    /// Internal: VAD speech threshold (§6.2).
+    pub vad_threshold: f32,
+    /// Internal: auto-stop-on-silence seconds.
+    pub idle_timeout: u32,
+}
+
+impl Default for Settings {
+    fn default() -> Self {
+        Self {
+            model_choice: "medium".to_string(),
+            mic_device: None,
+            paste_hotkey: "Alt+P".to_string(),
+            residency_mode: None,
+            observed_total_ram: None,
+            vad_threshold: 0.5,
+            idle_timeout: 30,
+        }
+    }
+}
+
+impl Settings {
+    /// Loads settings from `path`, or returns defaults if the file is absent.
+    pub fn load(path: &Path) -> Result<Self> {
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let json = fs::read_to_string(path).context("read settings file")?;
+        serde_json::from_str(&json).context("parse settings JSON")
+    }
+
+    /// Writes settings to `path` as pretty JSON, creating parent dirs.
+    pub fn save(&self, path: &Path) -> Result<()> {
+        if let Some(dir) = path.parent() {
+            fs::create_dir_all(dir).context("create settings directory")?;
+        }
+        let json = serde_json::to_string_pretty(self).context("serialize settings")?;
+        fs::write(path, json).context("write settings file")?;
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn missing_file_yields_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let s = Settings::load(&dir.path().join("settings.json")).unwrap();
+        assert_eq!(s, Settings::default());
+    }
+
+    #[test]
+    fn save_load_round_trips() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let mut s = Settings::default();
+        s.mic_device = Some("USB Mic".to_string());
+        s.paste_hotkey = "Ctrl+V".to_string();
+        s.save(&path).unwrap();
+        assert_eq!(Settings::load(&path).unwrap(), s);
+    }
+
+    #[test]
+    fn partial_json_fills_missing_fields_with_defaults() {
+        // An older build's settings.json lacking newer keys must still load.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"mic_device":"USB Mic"}"#).unwrap();
+        let s = Settings::load(&path).unwrap();
+        assert_eq!(s.mic_device, Some("USB Mic".to_string()));
+        assert_eq!(s.model_choice, Settings::default().model_choice);
+        assert_eq!(s.idle_timeout, Settings::default().idle_timeout);
+    }
+
+    #[test]
+    fn contains_no_phi_fields() {
+        // Guard against PHI ever leaking into the unencrypted settings file.
+        let json = serde_json::to_string(&Settings::default()).unwrap();
+        for phi in ["transcript", "soap", "note", "label", "record"] {
+            assert!(!json.contains(phi), "settings must not carry PHI field: {phi}");
+        }
+    }
+}

@@ -1,0 +1,25 @@
+# Dependencies
+node_modules/
+
+# Frontend build output
+dist/
+
+# Rust / Tauri build output
+src-tauri/target/
+src-tauri/gen/
+
+# Model weights (downloaded / vendored separately, never committed)
+src-tauri/resources/models/*
+!src-tauri/resources/models/.gitkeep
+# Exception: the Silero VAD model is small (~1.8 MB) and required at startup, so
+# it is committed; the large STT/LLM weights stay excluded by the rule above.
+!src-tauri/resources/models/silero_vad_v4.onnx
+
+# Local database / encrypted key blobs (PHI — never commit)
+*.db
+*.sqlite
+*.sqlite3
+
+# Editor / OS
+.DS_Store
+*.log
