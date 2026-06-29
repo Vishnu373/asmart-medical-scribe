@@ -218,14 +218,14 @@ rejected, stop drains then returns IDLE.
 **Verification:** `cargo test` — record lifecycle end-to-end with the in-memory/mock
 pipeline; delete removes notes.
 
-### Phase B9 — Model residency strategy  `[ ] not started`
+### Phase B9 — Model residency strategy  `[x] done`
 **Goal:** Decide STT+LLM co-residency vs swap from a one-time RAM probe (design §7).
 **Depends on:** B5
 **Tasks:**
-- [ ] `residency/`: `sysinfo` total-RAM probe; footprint = STT + LLM + 2–3 GB
+- [x] `residency/`: `sysinfo` total-RAM probe; footprint = STT + LLM + 2–3 GB
       headroom; require ≥2 GB margin for co-resident, else swap; decide-once-cache.
-- [ ] Manual override surfaced via settings.
-- [ ] Integrate so the LLM phase (B10) and STT (B5) honor the residency decision.
+- [x] Manual override surfaced via settings.
+- [x] Integrate so the LLM phase (B10) and STT (B5) honor the residency decision.
 **Deliverables:** `residency/` module.
 **Verification:** `cargo test` — decision boundaries (8/16/32 GB synthetic probes,
 override path).
@@ -594,3 +594,36 @@ hotkey without focus steal and pastes the chosen section.
     B2 `store` tests.
   - **Pending Windows verification (user):** `cd src-tauri && cargo test` (the
     DPAPI/SQLCipher paths need Windows + `OPENSSL_DIR`, as in B2).
+
+- 2026-06-29 — **B9 — Model residency strategy** done. One-time co-resident-vs-swap
+  decision from a total-RAM probe (design §7).
+  - `residency/mod.rs`: `ResidencyMode { CoResident, Swap }` (+ `as_str`/`from_str`
+    for persistence). `decide_mode(total_ram, llm_footprint)` is the pure §7
+    feasibility calc — `footprint = STT + LLM + headroom`, co-resident only when
+    `total_ram ≥ footprint + 2 GB margin`, else swap ("margin, not bare fit").
+    `default_llm_footprint(total_ram)` encodes the §8.2 model-choice sizes that feed
+    the budget (≥16 GB → Mistral-7B Q4_K_M ~4.4 GB, <16 GB → Phi-3.5-mini Q8_0
+    ~4.0 GB); STT ~2.5 GB (Parakeet) + ~3 GB app/OS headroom. `resolve(settings,
+    total_ram)` applies precedence — manual override > cached decision (valid only
+    while total RAM is unchanged) > (re)decide+cache — returning `(mode, changed)`.
+    `probe_total_ram()` reads `sysinfo` total physical RAM (stable per-device; we
+    never sample momentary *available* RAM, which would flip-flop).
+  - `settings/mod.rs`: added a doctor-facing `residency_override: Option<String>`
+    (force `co_resident`/`swap`; precedence over the cached auto decision) alongside
+    the existing internal `residency_mode` + `observed_total_ram` cache.
+  - `lib.rs` setup: load `settings.json`, `resolve` the mode against the probed RAM,
+    persist only if the cache changed, and log the chosen mode. The decision is made
+    once at the startup probe per §7.
+  - **Footprint constants are design-target estimates** (named consts with comments)
+    to validate during benchmarking — the residency *logic* holds whatever the real
+    model sizes turn out to be; only the constants move.
+  - **Deviation / scope:** the residency mode is *produced and cached* here; the
+    actual STT-unload-on-Stop / LLM-load-at-hand-off that *consumes* it is the
+    lifecycle's job and lands with B10 (LLM). B5's STT idle-unload already exists.
+    Recorded per the surface-divergence rule.
+  - **Deps added:** `sysinfo = { version = "0.32", default-features = false,
+    features = ["system"] }`.
+  - **Tests:** 8/16/32 GiB boundary decisions (swap / co-resident / co-resident),
+    override precedence + bogus-override fallthrough, decide-once caching, and
+    hardware-change re-trigger. All pure-Rust (synthetic RAM values; no real probe).
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test`.

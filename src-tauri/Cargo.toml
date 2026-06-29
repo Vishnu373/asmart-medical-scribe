@@ -46,6 +46,8 @@ rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 # Scrub transient plaintext key copies from memory on drop (§10.1).
 zeroize = "1"
+# One-time total-RAM probe driving the model-residency decision (§7, B9).
+sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 
 # Windows DPAPI for wrapping the DB key (design §10.1).
 [target.'cfg(windows)'.dependencies]

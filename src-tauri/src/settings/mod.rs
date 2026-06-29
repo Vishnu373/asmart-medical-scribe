@@ -20,10 +20,16 @@ pub struct Settings {
     pub mic_device: Option<String>,
     /// Doctor-facing: rebindable paste hotkey, default Alt+P (§8.6).
     pub paste_hotkey: String,
-    /// Internal: co-resident vs swap, decided once (§7).
+    /// Internal: co-resident vs swap, decided once and cached (§7).
     pub residency_mode: Option<String>,
-    /// Internal: cached RAM probe in bytes (§7).
+    /// Doctor-facing: manual residency force; `None` = use the automatic decision.
+    /// Takes precedence over `residency_mode` when set (§7 override).
+    pub residency_override: Option<String>,
+    /// Internal: cached RAM probe in bytes; a mismatch re-triggers the decision (§7).
     pub observed_total_ram: Option<u64>,
+    /// Internal: which footprint formula produced `residency_mode`. Bumped when the
+    /// model-size constants change so a new build re-decides on the same hardware (§7).
+    pub residency_calc_version: Option<u32>,
     /// Internal: VAD speech threshold (§6.2).
     pub vad_threshold: f32,
     /// Internal: auto-stop-on-silence seconds.
@@ -37,7 +43,9 @@ impl Default for Settings {
             mic_device: None,
             paste_hotkey: "Alt+P".to_string(),
             residency_mode: None,
+            residency_override: None,
             observed_total_ram: None,
+            residency_calc_version: None,
             vad_threshold: 0.5,
             idle_timeout: 30,
         }

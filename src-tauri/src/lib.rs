@@ -23,6 +23,7 @@ use std::time::Duration;
 use tauri::Manager;
 
 use orchestrator::{emit_app_event, Coordinator, RealPipeline};
+use settings::Settings;
 use store::{SharedStore, Store};
 use stt::SttEngine;
 
@@ -60,6 +61,18 @@ pub fn run() {
             let store = SharedStore::new(
                 Store::open(&data_dir.join("clinical.db"), &key).map_err(|e| e.to_string())?,
             );
+
+            // One-time model-residency decision (§7): probe total RAM, resolve the
+            // co-resident-vs-swap mode (honoring any manual override), and cache it
+            // to settings. Re-probing total RAM each launch only validates the
+            // cache; the LLM hand-off (B10) consumes the cached mode.
+            let settings_path = data_dir.join("settings.json");
+            let mut app_settings = Settings::load(&settings_path).map_err(|e| e.to_string())?;
+            let (mode, changed) = residency::resolve(&mut app_settings, residency::probe_total_ram());
+            if changed {
+                app_settings.save(&settings_path).map_err(|e| e.to_string())?;
+            }
+            log::info!("model residency mode: {}", mode.as_str());
 
             let handle = app.handle().clone();
             let pipeline = RealPipeline::new(
