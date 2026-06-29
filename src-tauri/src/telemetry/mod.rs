@@ -1,1 +1,154 @@
 //! Crash reporting with PHI fields structurally excluded. Design §10.3. B11.
+//!
+//! NFR-6 forbids PHI egress; §10.3 allows *technical-only* crash reports. PHI is
+//! kept out two ways: (1) by construction — only [`TechnicalContext`] is ever
+//! attached, never a transcript/note/label; and (2) defense-in-depth — every event
+//! passes through [`scrub_event`], which strips any PHI-named field before send.
+//! The scrubber and context are pure and unit-tested here; the Sentry wiring in
+//! [`init`] is behind the off-by-default `crash-reporting` feature, so the default
+//! build is fully offline (no DSN, nothing sent) and the fragile native build is
+//! untouched until a DSN exists.
+
+use serde::Serialize;
+use serde_json::Value;
+
+/// PHI field tokens that must never appear in a crash report (§10.3). Matched
+/// case-insensitively as a substring, so `soap_data`, `Transcript`, `note_body`,
+/// etc. are all caught.
+const PHI_KEY_TOKENS: [&str; 5] = ["transcript", "soap", "note", "label", "record"];
+
+/// Technical-only crash context (§10.3). The stack trace and error type come from
+/// the reporter; this is the non-PHI metadata we attach alongside. No transcript,
+/// note, or patient label — by construction.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct TechnicalContext {
+    pub app_version: &'static str,
+    pub os: &'static str,
+    pub arch: &'static str,
+}
+
+impl TechnicalContext {
+    pub fn current() -> Self {
+        Self {
+            app_version: env!("CARGO_PKG_VERSION"),
+            os: std::env::consts::OS,
+            arch: std::env::consts::ARCH,
+        }
+    }
+}
+
+/// Recursively strip any object key that looks like a PHI field. Run on every
+/// outgoing event as a backstop: even if a future change attaches a richer
+/// payload, a transcript/note/label can never ride along.
+pub fn scrub_event(mut value: Value) -> Value {
+    scrub_in_place(&mut value);
+    value
+}
+
+fn scrub_in_place(value: &mut Value) {
+    match value {
+        Value::Object(map) => {
+            map.retain(|key, _| !is_phi_key(key));
+            for child in map.values_mut() {
+                scrub_in_place(child);
+            }
+        }
+        Value::Array(items) => items.iter_mut().for_each(scrub_in_place),
+        _ => {}
+    }
+}
+
+fn is_phi_key(key: &str) -> bool {
+    let lower = key.to_ascii_lowercase();
+    PHI_KEY_TOKENS.iter().any(|token| lower.contains(token))
+}
+
+/// Initialize crash reporting (§10.3). Disabled unless built with the
+/// `crash-reporting` feature *and* a DSN is set in `MEDSCRIBE_CRASH_DSN`, so the
+/// default offline build sends nothing (NFR-6). When enabled, PII is off and every
+/// event is scrubbed before send.
+#[cfg(feature = "crash-reporting")]
+pub fn init() {
+    let dsn = std::env::var("MEDSCRIBE_CRASH_DSN").unwrap_or_default();
+    if dsn.is_empty() {
+        return;
+    }
+    let ctx = TechnicalContext::current();
+    let guard = sentry::init((
+        dsn,
+        sentry::ClientOptions {
+            release: Some(ctx.app_version.into()),
+            send_default_pii: false,
+            before_send: Some(std::sync::Arc::new(|event| {
+                // Serialize → scrub → deserialize. If the round-trip fails we drop
+                // the event rather than risk sending it unscrubbed — but log it, so
+                // a scrubbed event that can't re-deserialize into `sentry::Event`
+                // doesn't take crash reporting 100% dark while still looking enabled.
+                let scrubbed = match serde_json::to_value(&event) {
+                    Ok(v) => scrub_event(v),
+                    Err(e) => {
+                        log::warn!("crash report dropped: serialize failed: {e}");
+                        return None;
+                    }
+                };
+                match serde_json::from_value(scrubbed) {
+                    Ok(event) => Some(event),
+                    Err(e) => {
+                        log::warn!("crash report dropped: scrubbed event failed to round-trip: {e}");
+                        None
+                    }
+                }
+            })),
+            ..Default::default()
+        },
+    ));
+    // Outlive `setup`: the client lives for the whole process (it flushes pending
+    // events on its own). NOTE: pending first build with the feature enabled.
+    std::mem::forget(guard);
+}
+
+/// Offline default: crash reporting compiled out (NFR-6 — no network egress).
+#[cfg(not(feature = "crash-reporting"))]
+pub fn init() {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn technical_context_carries_no_phi() {
+        let json = serde_json::to_string(&TechnicalContext::current()).unwrap();
+        for token in PHI_KEY_TOKENS {
+            assert!(!json.contains(token), "technical context leaked `{token}`");
+        }
+    }
+
+    #[test]
+    fn scrub_removes_phi_fields_at_any_depth() {
+        let event = json!({
+            "exception": "panic",
+            "extra": {
+                "transcript": "patient says...",
+                "soap_data": "## Subjective\n...",
+                "label": "John Doe 1990",
+                "record_id": "r1",
+                "os": "windows"
+            },
+            "breadcrumbs": [{ "message": "ok", "note": "secret" }]
+        });
+        let scrubbed = scrub_event(event);
+
+        // Technical fields survive.
+        assert_eq!(scrubbed["exception"], json!("panic"));
+        assert_eq!(scrubbed["extra"]["os"], json!("windows"));
+
+        // Every PHI-named field is gone, including nested inside arrays.
+        let dump = scrubbed.to_string();
+        for token in PHI_KEY_TOKENS {
+            assert!(!dump.contains(token), "scrub missed `{token}`: {dump}");
+        }
+        assert!(!dump.contains("patient says"));
+        assert!(!dump.contains("John Doe"));
+    }
+}

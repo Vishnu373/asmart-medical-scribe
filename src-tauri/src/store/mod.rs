@@ -207,6 +207,47 @@ impl Store {
         Ok(rows)
     }
 
+    /// The record's current active note version, if any (§8.5). The EMR hand-off
+    /// (§8.6) always pastes from this, so it reflects the latest edit/regeneration.
+    pub fn active_note(&self, record_id: &str) -> Result<Option<Note>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT id, record_id, soap_data, created_at, is_active
+             FROM notes WHERE record_id = ?1 AND is_active = 1",
+        )?;
+        let mut rows = stmt.query_map(params![record_id], |row| {
+            Ok(Note {
+                id: row.get(0)?,
+                record_id: row.get(1)?,
+                soap_data: row.get(2)?,
+                created_at: row.get(3)?,
+                is_active: row.get::<_, i64>(4)? != 0,
+            })
+        })?;
+        match rows.next() {
+            Some(r) => Ok(Some(r.context("read active note")?)),
+            None => Ok(None),
+        }
+    }
+
+    /// Autosaves the clinician's in-place edits to a note (§8.5). Edits refine the
+    /// active version rather than spawning a new one; a fresh version is created
+    /// only by an explicit (re)generation via [`insert_note`].
+    pub fn update_note(&self, id: &str, soap_data: &str) -> Result<()> {
+        let updated = self
+            .conn
+            .execute(
+                "UPDATE notes SET soap_data = ?2 WHERE id = ?1",
+                params![id, soap_data],
+            )
+            .context("update note")?;
+        // A no-op UPDATE returns Ok(0); without this an autosave to a stale/unknown
+        // id would report success while the clinician's edit was silently dropped.
+        if updated == 0 {
+            return Err(anyhow!("note {id} not found"));
+        }
+        Ok(())
+    }
+
     /// Flips the active version for a record (revert, §8.5).
     pub fn set_active_note(&self, record_id: &str, note_id: &str) -> Result<()> {
         let tx = self.conn.unchecked_transaction()?;
@@ -342,10 +383,24 @@ mod tests {
         assert_eq!(notes.iter().filter(|n| n.is_active).count(), 1);
         assert!(notes.iter().find(|n| n.id == n2.id).unwrap().is_active);
 
+        // An in-place edit autosaves onto a version without spawning a new one.
+        store.update_note(&n2.id, "## S\n2 edited").unwrap();
+        let notes = store.list_notes(&rec.id).unwrap();
+        assert_eq!(notes.len(), 2, "editing must not create a version");
+        assert_eq!(
+            notes.iter().find(|n| n.id == n2.id).unwrap().soap_data,
+            "## S\n2 edited"
+        );
+        // A mistargeted autosave must error, not silently drop the edit.
+        assert!(store.update_note("nope", "## S\nlost").is_err());
+
         store.set_active_note(&rec.id, &n1.id).unwrap();
         let notes = store.list_notes(&rec.id).unwrap();
         assert!(notes.iter().find(|n| n.id == n1.id).unwrap().is_active);
         assert!(!notes.iter().find(|n| n.id == n2.id).unwrap().is_active);
+        // active_note tracks the flip — hand-off (§8.6) pastes from this.
+        assert_eq!(store.active_note(&rec.id).unwrap().unwrap().id, n1.id);
+        assert!(store.active_note("ghost").unwrap().is_none());
 
         // A bogus note_id must error and leave the prior active note intact.
         assert!(store.set_active_note(&rec.id, "nope").is_err());

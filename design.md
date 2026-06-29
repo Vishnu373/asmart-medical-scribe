@@ -102,7 +102,7 @@ All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM (32 
 
 | # | Requirement | Target | Rationale |
 |---|------------|--------|-----------|
-| NFR-1 | **Per-segment transcription latency** | Captured text appears **< 2 s** after a speech pause (for a typical 5–15 s utterance) | Must feel near-instant so the doctor isn't waiting mid-visit; drives choice of a fast STT model (e.g. faster-whisper small/base or distil-whisper) |
+| NFR-1 | **Per-segment transcription latency** | Captured text appears **< 2 s** after a speech pause (for a typical 5–15 s utterance) | Must feel near-instant so the doctor isn't waiting mid-visit; drives choice of a fast, CPU-light STT model (Parakeet TDT v3, §6.4) |
 | NFR-2 | **Note generation** | Runs in a **background queue**; doctor is not blocked and can start the next patient. Target completion **< 90 s** for a ~20-min encounter on the 16 GB profile | A 7–8B quantized LLM on CPU needs time; backgrounding hides it so throughput isn't affected |
 | NFR-3 | **Throughput** | Up to **50 encounters/device/day**, processed **sequentially** (one active encounter at a time) | Matches a busy walk-in/solo clinic peak day; no concurrency required |
 | NFR-4 | **Encounter length** | Handle encounters up to **~30 min** of audio without instability | Headroom over the ~20-min average; long visits must not exhaust memory |
@@ -129,7 +129,7 @@ The application is a single Windows desktop process composed of swappable buildi
 | Component | Responsibility | Choice / status |
 |-----------|----------------|-----------------|
 | **Audio capture** | Read microphone, buffer PCM, detect speech pauses (VAD) to segment utterances | Part of the existing STT codebase being integrated |
-| **STT engine** | Transcribe each audio segment to text; EN/FR auto-detect | **Existing open-source component (TBD after code review).** Assumed Whisper-family, CPU-capable (e.g. faster-whisper class). Exact model/size finalized once the existing codebase is understood |
+| **STT engine** | Transcribe each audio segment to text; EN/FR auto-detect | **Parakeet TDT 0.6B v3**, CPU-only via an ONNX runtime; multilingual EN+FR with auto-detect. Single STT engine for v1 (see §6.4) |
 | **Transcript store** | Hold the live, editable transcript; persist per-encounter; preserve manual edits | App-owned; encrypted local store (see Data Model) |
 | **Note generator (LLM)** | Turn the approved transcript into a structured SOAP note (EN/FR), on click | **Local 7–8B instruct model, 4-bit GGUF, via `llama.cpp`.** Default **Qwen2.5-7B-Instruct (Apache-2.0)**; alternate **Mistral-7B-Instruct v0.3 (Apache-2.0)** |
 | **Prompt/template layer** | SOAP system prompt, section schema, language handling, anti-fabrication guardrails | App-owned; the main thing this project must build well |
@@ -192,9 +192,9 @@ The internal building blocks (Section 4). The STT path is the existing OSS compo
 flowchart LR
     Mic[🎤 Microphone] --> Cap[Audio Capture + VAD]
 
-    subgraph STT["STT path — existing OSS component (TBD)"]
+    subgraph STT["STT path"]
         Cap --> Seg[Segment buffer]
-        Seg --> ASR[STT Engine<br/>Whisper-family, CPU<br/>EN/FR auto-detect]
+        Seg --> ASR[STT Engine<br/>Parakeet TDT v3, CPU<br/>EN/FR auto-detect]
     end
 
     ASR --> TStore[Transcript State<br/>live, editable, edits preserved]
@@ -332,7 +332,7 @@ This stage answers: **when is audio handed to the STT model, and how often?** Th
 | **Max-segment cap** | A speaker who talks continuously with no real pause never triggers a boundary, producing one oversized segment that breaks latency and grows memory | Force-flush the current segment after a maximum duration (≈20–30 s) even without a pause boundary, bounding latency (NFR-1) and memory (NFR-5) |
 | **Min-segment floor** | Tiny blips create useless sub-second fragments | VAD onset filters most; additionally discard segments below a minimum length |
 
-**Trade-off accepted:** transcribing per-segment gives live feedback but means the model sees one utterance at a time and loses cross-segment conversational context. For Whisper-family / Parakeet models this is a minor accuracy cost, accepted in exchange for the live incremental UX that FR-2 requires.
+**Trade-off accepted:** transcribing per-segment gives live feedback but means the model sees one utterance at a time and loses cross-segment conversational context. For the Parakeet model this is a minor accuracy cost, accepted in exchange for the live incremental UX that FR-2 requires.
 
 **Decisions:**
 
@@ -368,14 +368,15 @@ flowchart LR
 
 This stage answers: **which model runs, and when does it live in RAM?** The lifecycle is where the system honors the memory budget (NFR-5, <12 GB peak) without paying a model-load cost on every segment.
 
-**The engine.** Transcription runs through a Rust STT engine that executes Whisper-family and Parakeet models locally on CPU. It sits behind a narrow, swappable interface (`transcribe(audio) -> text`), so the underlying model can be changed without touching the capture, VAD, or assembly stages (NFR-14).
+**The engine.** Transcription runs through a Rust STT engine that executes the Parakeet model locally on CPU via an ONNX runtime. It sits behind a narrow, swappable interface (`transcribe(audio) -> text`), so the underlying model can be changed without touching the capture, VAD, or assembly stages (NFR-14).
 
-**Models** (see §4 for selection rationale):
+**Model** (see §4 for selection rationale):
 
 | Role | Model | License | Notes |
 |------|-------|---------|-------|
-| Default | Parakeet TDT 0.6B v3 | CC-BY-4.0 (attribution required) | Fast, CPU-light, EN+FR; the everyday choice |
-| Fallback | Whisper small / medium | Apache-2.0 | Higher-accuracy / weaker-hardware alternatives, user-selectable |
+| Sole engine (v1) | Parakeet TDT 0.6B v3 | CC-BY-4.0 (attribution required) | Fast, CPU-light, multilingual EN+FR with auto-detect; the all-rounder default. v1 ships this as the only STT engine |
+
+v1 deliberately ships a **single STT engine**. An alternative higher-accuracy engine (e.g. a Whisper-family model) was considered as a user-selectable fallback but is deferred — see [Future Considerations](#13-future-considerations) for the technical reason and the path to adding it later. The `transcribe(audio) -> text` interface keeps that door open without disturbing the pipeline.
 
 Models are downloaded once on first selection and cached on disk thereafter.
 
@@ -396,7 +397,7 @@ Models are downloaded once on first selection and cached on disk thereafter.
 | Model residency | Kept warm in RAM across all segments of a visit | No per-segment reload; drives NFR-1 latency |
 | Load timing | Background preload right after app open | App ready instantly (NFR-13) *and* first Record feels instant; disk read hidden |
 | Idle release | Watcher thread unloads after a configurable idle timeout | Frees RAM between patients (NFR-5); never unloads mid-recording |
-| Engine | Swappable `transcribe(audio) -> text` interface; Parakeet V3 default, Whisper small/medium selectable | Model flexibility without touching the pipeline (NFR-14) |
+| Engine | Single Parakeet V3 engine behind a swappable `transcribe(audio) -> text` interface | One vetted engine for v1; interface keeps a future alternate model pluggable without touching the pipeline (NFR-14) |
 | Phase-two readiness | Lifecycle supports unload-on-Stop to hand memory to a future note generator | Keeps peak under 12 GB when both models exist |
 
 ### 6.5 Transcript assembly & delivery to UI
@@ -915,3 +916,8 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 | **EMR integration** | Direct integration with the EMR (field auto-mapping or an EMR API) instead of the manual section-picker paste | v1 has no EMR API integration; the keyboard hand-off (§8.6) is reliable and EMR-agnostic |
 | **Fine-tuned models** | Note model fine-tuned on SOAP datasets for more consistent output | Few-shot prompting (§8.3) is a cheaper, reversible lever; no evidence yet that fine-tuning is needed |
 | **AI engineering for larger context** | Context-handling techniques (e.g. chunking, summarization, retrieval) for transcripts that exceed the model window | The model window far exceeds a realistic consult (§8.3), so the whole transcript fits in one prompt today; needed only for much longer inputs |
+| **Selectable alternate STT engine** | A user-selectable higher-accuracy / weaker-hardware STT option (e.g. a Whisper-family model) alongside the default Parakeet engine | A native-build constraint, not a product objection — see the note below. Parakeet (§6.4) covers EN+FR well, so a second engine is a refinement, not a v1 need |
+
+**Why the alternate STT engine is deferred (technical note).** The default STT engine (Parakeet) runs on an **ONNX** runtime, while the note-generation LLM (§8) runs on **llama.cpp**. A Whisper-family STT engine would run on **whisper.cpp**. Both whisper.cpp and llama.cpp statically embed their *own* copy of the same low-level tensor library (**ggml**); linking both into one executable produces duplicate-symbol link errors, so they cannot coexist in a single binary. v1 therefore ships exactly one ggml consumer — the LLM — and an ONNX-based STT (Parakeet) that carries no ggml, which links cleanly.
+
+Adding a whisper-based engine later is still possible without this conflict by running one engine **out-of-process** (a separate child process the app talks to locally), so each binary embeds its own ggml independently. That isolation pairs naturally with the **swap** residency mode (§7) — the alternate engine and the LLM would load one at a time, with the clinician shown a brief, plain-language "this may add a short delay" notice at the hand-off rather than any technical detail. This is a known, accepted limitation of the current single-binary design.

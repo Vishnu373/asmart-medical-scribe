@@ -31,8 +31,11 @@ rustfft = "6"
 # Silero voice-activity detection (ONNX). Same fork the reference toolkit uses;
 # the silero_vad_v4.onnx model is vendored under resources/models/ (B4).
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
-# STT engines (B5): Whisper via whisper-cpp + Parakeet/ONNX, CPU-only.
-transcribe-rs = { version = "0.3.8", features = ["whisper-cpp", "onnx"] }
+# STT engine (B5): Parakeet TDT v3 via the ONNX backend, CPU-only. v1 ships
+# Parakeet only — the `whisper-cpp` feature is intentionally omitted because
+# whisper.cpp and llama-cpp-2 (B10) each statically vendor ggml, which collides at
+# link time. Parakeet (ONNX) carries no ggml, so the LLM links cleanly.
+transcribe-rs = { version = "0.3.8", default-features = false, features = ["onnx"] }
 # Transcript text cleanup (custom words + filler/stutter filtering, ported text.rs).
 natural = "0.5"
 once_cell = "1"
@@ -46,14 +49,34 @@ rand = "0.8"
 uuid = { version = "1", features = ["v4"] }
 # Scrub transient plaintext key copies from memory on drop (§10.1).
 zeroize = "1"
-# One-time total-RAM probe driving the model-residency decision (§7, B9).
+# One-time total-RAM probe driving the model-residency decision (§7, B9); also
+# the load-time available-RAM guard before the LLM loads (§8.4, B10).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
+# In-process GGUF note generation (§8, B10). CPU-only llama.cpp binding — no
+# server, no network. Compiles native code via cmake + a C/C++ toolchain on the
+# Windows build host (no CUDA/Metal features).
+llama-cpp-2 = "0.1.122"
+# EMR hand-off (§8.6, B11): global paste hotkey + clipboard. The keystroke (Ctrl+V)
+# is delivered via Win32 SendInput through the `windows` crate below — no input-sim
+# dependency. The no-activate overlay *window* is created on the frontend (F7).
+tauri-plugin-global-shortcut = "2"
+tauri-plugin-clipboard-manager = "2"
+# Optional, off-by-default crash reporting (§10.3, B11). Disabled in the default
+# build so it stays fully offline (NFR-6); enable with `--features crash-reporting`
+# once a DSN exists. PHI is structurally excluded (see telemetry::scrub_event).
+sentry = { version = "0.34", optional = true }
 
-# Windows DPAPI for wrapping the DB key (design §10.1).
+[features]
+default = []
+crash-reporting = ["dep:sentry"]
+
+# Windows DPAPI for wrapping the DB key (design §10.1); the keyboard feature backs
+# the §8.6 Ctrl+V paste via SendInput.
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

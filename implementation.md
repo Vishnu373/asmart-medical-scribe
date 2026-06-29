@@ -39,13 +39,16 @@ explicitly framed as *port-and-adapt from `handy/`* rather than green-field.
     `transcribe-rs` engine wrapper (`LoadedEngine`, load/unload, idle watcher,
     `catch_unwind` transcribe, language validation), trimmed to the two engines
     we need.
-  - Dependency: `transcribe-rs = { version = "0.3.8", features = ["whisper-cpp",
-    "onnx"] }` (CPU-only; the ONNX feature provides Parakeet, whisper-cpp provides
-    Whisper). This is the same crate Handy uses.
-- **STT models (design §6.4):** Default = **Parakeet TDT 0.6B v3** via the
-  `transcribe-rs` ONNX/Parakeet engine (multilingual EN+FR, CPU). Fallback =
-  **Whisper small/medium** via the `transcribe-rs` whisper-cpp engine. Both sit
-  behind one `Transcriber` trait (`transcribe(audio: &[f32]) -> Result<String>`).
+  - Dependency: `transcribe-rs = { version = "0.3.8", default-features = false,
+    features = ["onnx"] }` (CPU-only; the ONNX feature provides Parakeet).
+- **STT models (design §6.4) — v1 is Parakeet-only.** Sole engine = **Parakeet TDT
+  0.6B v3** via the `transcribe-rs` ONNX engine (multilingual EN+FR, CPU), behind
+  the `Transcriber` trait. **Divergence from design §6.4**, which lists Whisper
+  small/medium as a selectable fallback: dropped for v1 (user decision, 2026-06-29)
+  because whisper.cpp and `llama-cpp-2` (B10) each statically vendor **ggml**, which
+  collides at link time (`LNK2005`/`LNK1169`). Parakeet (ONNX) carries no ggml, so
+  the LLM links cleanly. Whisper-as-a-runtime-option is deferred to a possible later
+  out-of-process-sidecar design (keeps each ggml in its own binary).
 - **Key difference from Handy we must build, not copy:** Handy is push-to-talk
   (record → stop → transcribe the whole buffer → paste). Medical-scribe is a
   long-form consult that must emit **live `transcript-segment` events** during
@@ -230,29 +233,29 @@ pipeline; delete removes notes.
 **Verification:** `cargo test` — decision boundaries (8/16/32 GB synthetic probes,
 override path).
 
-### Phase B10 — LLM SOAP note generation  `[ ] not started`
+### Phase B10 — LLM SOAP note generation  `[x] done`
 **Goal:** Generate streaming SOAP notes in-process from the transcript (design §8).
 **Depends on:** B8, B9
 **Tasks:**
-- [ ] `llm/`: `llama-cpp-2` GGUF loader; model pick by RAM (Mistral-7B vs Phi-3.5).
-- [ ] Zero-shot SOAP prompt (four `##` headers), low temperature, anti-hallucination
+- [x] `llm/`: `llama-cpp-2` GGUF loader; model pick by RAM (Mistral-7B vs Phi-3.5).
+- [x] Zero-shot SOAP prompt (four `##` headers), low temperature, anti-hallucination
       guardrails, warmup, cancel; add GENERATING state to the orchestrator.
-- [ ] Stream `generation-token{text}`; persist result as a `notes` row (`is_active`).
-- [ ] Commands: `generate_note`, `regenerate_note`, `cancel_generation`,
+- [x] Stream `generation-token{text}`; persist result as a `notes` row (`is_active`).
+- [x] Commands: `generate_note`, `regenerate_note`, `cancel_generation`,
       `update_note`, `revert_version`.
 **Deliverables:** `llm/` module, note commands, GENERATING state.
 **Verification:** `cargo test` with a stub/tiny model or mocked generator —
 streaming tokens, cancel, version revert; manual Windows run produces a SOAP note.
 
-### Phase B11 — EMR hand-off & crash reporting  `[ ] not started`
+### Phase B11 — EMR hand-off & crash reporting  `[x] done`
 **Goal:** Global-hotkey overlay paste of SOAP sections, plus PHI-safe crash reports.
 **Depends on:** B10
 **Tasks:**
-- [ ] `handoff/`: `tauri-plugin-global-shortcut` Alt+P (rebindable) → no-activate
+- [x] `handoff/`: `tauri-plugin-global-shortcut` Alt+P (rebindable) → no-activate
       always-on-top overlay (`WS_EX_NOACTIVATE`) → S/O/A/P picker.
-- [ ] Deterministic markdown parser → clipboard + simulated Ctrl+V → clipboard
+- [x] Deterministic markdown parser → clipboard + simulated Ctrl+V → clipboard
       auto-clear; command `paste_section`.
-- [ ] `telemetry/`: Sentry-class crash reporting with `transcript`/`soap_data`/
+- [x] `telemetry/`: Sentry-class crash reporting with `transcript`/`soap_data`/
       `label` structurally excluded.
 **Deliverables:** `handoff/`, `telemetry/` modules + `paste_section` command.
 **Verification:** `cargo test` — markdown→section parser; manual Windows: hotkey
@@ -627,3 +630,149 @@ hotkey without focus steal and pastes the chosen section.
     override precedence + bogus-override fallthrough, decide-once caching, and
     hardware-change re-trigger. All pure-Rust (synthetic RAM values; no real probe).
   - **Pending Windows verification (user):** `cd src-tauri && cargo test`.
+
+- **2026-06-29 — Phase B10 (LLM SOAP note generation) done.** In-process GGUF
+  note generation (§8), built on the same testable-core / native-glue split as the
+  recording pipeline so the state machine and prompt logic are unit-tested on Linux
+  while only the `llama-cpp-2` binding needs the Windows build.
+  - **State machine (`orchestrator/coordinator.rs`):** added a distinct `GENERATING`
+    state (§8.4) — `IDLE ──generate──► GENERATING ──complete/cancel/fail──► IDLE`.
+    `generate_note(record_id, transcript)` mirrors `stop_recording`: transition +
+    emit `state-changed{GENERATING}` under the lock, release it for the blocking
+    generation (so recording is blocked and a concurrent cancel can act), reacquire
+    to emit `IDLE`. Resolves with the new note id (`None` if cancelled).
+    `cancel_generation()` flips an `Arc<AtomicBool>` the running generator polls;
+    the partial note is discarded. Both reject unless in the right state.
+  - **`NoteGenerator` trait** (next to `Pipeline`): keeps the coordinator Tauri/
+    store/model-free. Production `RealNoteGenerator` (`llm/generator.rs`) streams
+    each piece as `generation-token{text}` and persists the result via
+    `insert_note` (new active version, §8.5); cancel → nothing persisted.
+  - **`llm/prompt.rs` (pure, tested):** zero-shot `SOAP_SYSTEM_PROMPT` — four fixed
+    `##` headers, "use only information explicitly stated / do not add, assume, or
+    infer", empty-section-kept rule (§8.3) — wrapped in the per-model instruct
+    template (Mistral `[INST]` vs Phi `<|system|>…`).
+  - **`llm/engine.rs` (native, `llama-cpp-2`):** `LlmModel::for_total_ram` picks
+    Mistral-7B Q4_K_M (≥16 GB) vs Phi-3.5-mini Q8_0 (<16 GB) per §8.2; lazy load
+    with an available-RAM guard (§8.4, fails gracefully to IDLE, no silent OOM),
+    a hidden warmup pass after load, and a low-temperature streaming decode loop
+    that stops on EOG / token cap / cancel.
+  - **`store`:** added `update_note` (autosave edits in place, §8.5); `revert_version`
+    reuses the existing `set_active_note`.
+  - **Commands (§9.4):** `generate_note`, `regenerate_note` (identical — each is a
+    new retained version), `cancel_generation`, `update_note`, `revert_version`.
+    `generate_note`/`regenerate_note` load the record and **reject an empty
+    transcript** (§8.1 guard) before transitioning.
+  - **`lib.rs`:** picks the model from the same RAM probe (§8.2); co-resident →
+    warm the model at startup, swap → load per generation and unload after
+    (`swap_mode` into `RealNoteGenerator`).
+  - **Deviations / follow-ups (surface-divergence rule):**
+    - **`llama-cpp-2` binding pending first Windows compile.** The native API
+      surface (sampler chain, `token_to_str`/`is_eog_token`, context params) is
+      written to the ~0.1.x API but **not compiled here** (no Rust build on the
+      Linux box, as with every native dep); the version may need a small bump/
+      adjustment on the first `cargo build` on Windows.
+    - **No note-read command in §9.4.** `generate_note` returns the note id so the
+      UI has the just-generated note; listing prior versions for the revert UI is a
+      F4 follow-up (no `list_notes`/`get_active_note` command was invented now).
+    - **Swap-mode STT↔LLM handoff is LLM-side only.** B10 loads/unloads the *LLM*
+      by residency mode; the design's "unload STT before loading LLM" half waits on
+      STT model bundling (STT preload isn't wired yet — same gap as B5/B9), then
+      becomes a small lib-level wiring step.
+    - **Models not bundled** → a real generation surfaces an `error` until the
+      asset-bundling phase, exactly as STT does today.
+    - **`n_threads`** uses `available_parallelism` (logical cores) as a proxy for
+      the physical-core target (§8.2 tuning, deferred to benchmarking).
+  - **Deps added:** `llama-cpp-2 = "0.1.122"`.
+  - **Tests (pure-Rust, run on Linux):** coordinator GENERATING walk + note-id
+    return, generate-rejected-unless-IDLE, generation-failure → IDLE + `error`,
+    cancel-rejected-when-not-generating, and a threaded cancel test (generation
+    blocks while `cancel_generation` flips the flag → `None`, back to IDLE);
+    prompt structure/anti-hallucination/per-model template; `store.update_note`
+    edit-without-new-version. The native engine is exercised only by the manual
+    Windows run.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test` (+ a
+    manual run once a GGUF model is present produces a SOAP note).
+
+- **2026-06-29 — B10 review fix (concurrency):** `generate_note`/`regenerate_note`
+  are now `async` commands that run the blocking generation on
+  `tauri::async_runtime::spawn_blocking` with an owned `Arc<Coordinator>`. The
+  coordinator is now managed as `Arc<Coordinator>` (all coordinator command
+  signatures take `State<'_, Arc<Coordinator>>`). Previously the sync command
+  blocked Tauri's IPC thread for the whole multi-second generation, so
+  `cancel_generation` could never dispatch and the window froze — the coordinator's
+  lock-release-during-generation design and the threaded unit test only worked
+  because the test moves generation off-thread. Now the IPC thread stays free, so
+  cancel dispatches and the UI stays responsive (§8.4).
+
+- **2026-06-29 — Phase B11 (EMR hand-off & crash reporting) done.** Split like B10:
+  a pure, unit-tested core plus isolated native glue flagged for Windows verify.
+  - **`handoff/parser.rs` (pure, tested).** `SoapSection` (S/O/A/P) with a stable
+    lowercase `key()` for the Tauri boundary and `from_key`; `section_body()` — the
+    deterministic §8.3 splitter that pulls one section's lines (header → next `## `
+    header), strips bold/bullets to plain text, and trims. Tests: per-section
+    extraction, body stops at next header, missing/empty section → empty, bullets
+    stripped, numbered prefixes kept, header trailing-space/case tolerance.
+  - **`store.active_note(record_id)`** (tested) — the current active note, so §8.6
+    always pastes the latest edited/regenerated version.
+  - **`handoff/mod.rs` (native).** `paste_section(record_id, section)` command:
+    active note → `section_body` → clipboard (`tauri-plugin-clipboard-manager`) →
+    Ctrl+V → timed clipboard self-clear (15 s, only if unchanged). Ctrl+V is Win32
+    `SendInput` via the **existing `windows` crate** (added the
+    `Win32_UI_Input_KeyboardAndMouse` feature) — no input-sim dependency.
+    `register_paste_hotkey` registers the rebindable accelerator (default Alt+P from
+    settings) and emits `handoff-requested` on press.
+  - **`telemetry/mod.rs`.** `TechnicalContext` (app version/os/arch — no PHI) and
+    `scrub_event` (recursively drops any PHI-named key: transcript/soap/note/label/
+    record, at any depth, incl. arrays) are pure and tested. `init()` is behind the
+    off-by-default `crash-reporting` cargo feature + a `MEDSCRIBE_CRASH_DSN` env var;
+    when enabled it inits Sentry with `send_default_pii: false` and a `before_send`
+    that serialize→scrub→deserialize-drops PHI.
+  - **lib.rs/Cargo/capabilities:** registered the global-shortcut + clipboard
+    plugins, `telemetry::init()` pre-builder, hotkey registration in setup (non-fatal
+    on failure), `paste_section` in the invoke handler (now 14 commands); added
+    `tauri-plugin-global-shortcut`/`-clipboard-manager`, optional `sentry`, the
+    `[features] crash-reporting` flag, the windows keyboard feature; capability grants
+    `global-shortcut:default` + clipboard read/write-text.
+  - **Deviations / decisions:**
+    - **No-activate overlay *window* + picker is F7 (frontend).** B11 ships the
+      backend mechanism — the hotkey fires `handoff-requested`, F7's overlay window
+      (with `WS_EX_NOACTIVATE` window config) listens and renders the S/O/A/P picker
+      that calls `paste_section`. The focus-preservation window styling is a
+      window-config concern that lands with the overlay window in F7.
+    - **`paste_section` takes `record_id`** (the frontend knows the open record) and
+      resolves the active note server-side, matching §8.6 "always the current active
+      note version."
+    - **Crash reporting is opt-in (feature + DSN), default off.** The default build
+      is fully offline (NFR-6) and sends nothing; the user has no DSN yet, and gating
+      keeps the (currently fragile) native build lean. Surfacing this for confirmation
+      rather than forcing a network/Sentry dep into every build.
+    - **Ctrl+V via Win32 `SendInput`** (reusing the `windows` crate) instead of a
+      cross-platform input-sim crate — fewer deps; non-Windows is a compile stub.
+  - **Deps added:** `tauri-plugin-global-shortcut`, `tauri-plugin-clipboard-manager`,
+    optional `sentry` (feature `crash-reporting`), windows `Win32_UI_Input_KeyboardAndMouse`.
+  - **Tests (pure-Rust):** parser (6), telemetry scrubber/context (2), `active_note`.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test` (note the
+    unresolved whisper.cpp↔llama.cpp ggml link clash still blocks the full build);
+    manual: Alt+P shows the F7 overlay without focus steal, pastes the chosen section,
+    clipboard clears. Sentry `before_send` round-trip is pending a first
+    `--features crash-reporting` build.
+
+- **2026-06-29 — Dropped Whisper STT for v1 (Parakeet-only).** Resolves the
+  whisper.cpp↔llama-cpp-2 **ggml duplicate-symbol link error** (`LNK2005`/`LNK1169`)
+  that blocked the full build after B10: both crates statically vendor their own
+  ggml. Parakeet (ONNX) has no ggml, so the LLM now links cleanly. Changes:
+  - `Cargo.toml`: `transcribe-rs` → `default-features = false, features = ["onnx"]`
+    (whisper-cpp feature removed). *Verify on Windows that disabling defaults still
+    pulls everything the ONNX/Parakeet engine needs.*
+  - `stt/engine.rs`: removed the `whisper_cpp` import, the `LoadedEngine::Whisper`
+    variant, the `ModelKind::Whisper` variant, the Whisper load + transcribe arms,
+    and `validated_whisper_language` (+ its test). `ModelKind`/`LoadedEngine` stay
+    single-variant enums so a future engine slots in without an interface change.
+    Replaced the whisper-language test with a `base_lang` test (still used to drive
+    the transcript-cleanup filter; Parakeet auto-detects the spoken language).
+  - Doc comments in `stt/mod.rs`, `stt/transcriber.rs`, and `engine.rs` updated to
+    Parakeet-only.
+  - **Divergence from design §6.4** (Whisper listed as a selectable fallback) is
+    recorded in Assumptions & Decisions above; whisper as a runtime option is
+    deferred to a possible out-of-process-sidecar phase. The user's swap-residency +
+    "expect a short delay" dialog idea would become that phase's UX, not a v1 change.

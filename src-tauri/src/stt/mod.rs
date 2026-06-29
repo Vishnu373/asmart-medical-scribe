@@ -1,5 +1,5 @@
-//! Speech-to-text behind a `Transcriber` trait: Parakeet (default, multilingual
-//! EN+FR) and Whisper (fallback) over `transcribe-rs`, plus a `MockTranscriber`
+//! Speech-to-text behind a `Transcriber` trait: Parakeet TDT v3 (multilingual
+//! EN+FR, the v1 all-rounder) over `transcribe-rs`, plus a `MockTranscriber`
 //! for tests. Ported and adapted from the reference STT manager (B5).
 //!
 //! Adaptation: the reference manager is wired to a Tauri `AppHandle`, a download

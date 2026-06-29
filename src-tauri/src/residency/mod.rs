@@ -13,10 +13,10 @@ use crate::settings::Settings;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Version of the footprint formula below. The cached decision is derived from
-/// RAM *and* these constants, so bump this whenever any footprint constant changes
-/// — otherwise a new build with corrected sizes would trust a stale cache on
-/// unchanged hardware and silently keep the wrong mode (§7).
+/// Version of the footprint formula. The cached decision is derived from RAM *and*
+/// these inputs, so bump this whenever a footprint changes — the constants below
+/// *or* [`crate::llm::LlmModel::footprint`] — otherwise a new build with corrected
+/// sizes would trust a stale cache on unchanged hardware and keep the wrong mode (§7).
 const RESIDENCY_CALC_VERSION: u32 = 1;
 
 // Footprint inputs (§7 "feasibility calculation"). These are design-target
@@ -26,18 +26,15 @@ const RESIDENCY_CALC_VERSION: u32 = 1;
 //
 // STT: the default Parakeet TDT 0.6B engine, resident.
 const STT_FOOTPRINT: u64 = 5 * GIB / 2; // ~2.5 GB
-// LLM defaults, keyed on total RAM per the model-choice policy (§8.2): ≥16 GB →
-// Mistral-7B Q4_K_M (~4.4 GB), <16 GB → Phi-3.5-mini Q8_0 (~4.0 GB).
-const MISTRAL_7B_Q4_FOOTPRINT: u64 = 22 * GIB / 5; // ~4.4 GB
-const PHI35_Q8_FOOTPRINT: u64 = 4 * GIB; // ~4.0 GB
+// The LLM footprint and its RAM-keyed model choice (§8.2) are owned by the `llm`
+// module ([`LlmModel`]) — the single source of truth, so this budget always sizes
+// for exactly the model the engine loads (see `default_llm_footprint` below).
 // Reserve for the app, webview, and OS on top of the two models (§7: ~2–3 GB);
 // take the conservative upper end.
 const HEADROOM: u64 = 3 * GIB;
 // Required free buffer above the combined footprint before we trust co-residency
 // (§7 "margin, not bare fit"): a bare fit invites paging under any pressure.
 const CO_RESIDENT_MARGIN: u64 = 2 * GIB;
-// The model-choice threshold (§8.2): at/above this, the larger LLM is selected.
-const LLM_MODEL_THRESHOLD: u64 = 16 * GIB;
 
 /// The chosen residency regime (§7 output flag).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -71,13 +68,10 @@ impl ResidencyMode {
 
 /// The default LLM footprint for this machine per the model-choice policy (§8.2).
 /// The residency calc needs the *size* of whichever LLM will be selected; the
-/// model's identity and loading are B10's concern.
+/// choice and its footprint are owned by [`crate::llm::LlmModel`] so this budget
+/// and the engine's actual load can never disagree.
 fn default_llm_footprint(total_ram: u64) -> u64 {
-    if total_ram >= LLM_MODEL_THRESHOLD {
-        MISTRAL_7B_Q4_FOOTPRINT
-    } else {
-        PHI35_Q8_FOOTPRINT
-    }
+    crate::llm::LlmModel::for_total_ram(total_ram).footprint()
 }
 
 /// The pure feasibility calculation (§7): co-resident only when total RAM clears

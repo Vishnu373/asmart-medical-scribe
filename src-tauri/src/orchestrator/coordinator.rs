@@ -1,14 +1,18 @@
-use std::sync::{Mutex, MutexGuard};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use anyhow::Result;
 
-/// The backend-owned recording state (design §6.6). The UI only *requests*
-/// transitions; the coordinator decides whether each is legal.
+/// The backend-owned app state (design §6.6 + §8.4). The UI only *requests*
+/// transitions; the coordinator decides whether each is legal. Note generation
+/// is a distinct `GENERATING` state reachable only from `IDLE`, so recording is
+/// blocked while a note is being produced and vice-versa.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RecordingState {
     Idle,
     Recording,
     Processing,
+    Generating,
 }
 
 impl RecordingState {
@@ -19,6 +23,7 @@ impl RecordingState {
             RecordingState::Idle => "IDLE",
             RecordingState::Recording => "RECORDING",
             RecordingState::Processing => "PROCESSING",
+            RecordingState::Generating => "GENERATING",
         }
     }
 }
@@ -56,6 +61,24 @@ pub trait Pipeline: Send {
     fn set_paused(&mut self, paused: bool);
 }
 
+/// Produces a SOAP note from a finalized transcript (design §8). Abstracted
+/// behind a trait so the GENERATING state machine is unit-testable with a mock,
+/// while production wires the in-process `llama-cpp-2` model (`RealNoteGenerator`).
+///
+/// `generate` is long-running and synchronous; the coordinator calls it with the
+/// state lock released so a concurrent `cancel_generation` can flip `cancel`. The
+/// implementation streams `generation-token` events and persists the finished
+/// note itself, returning the new note id, or `None` if it was cancelled (the
+/// partial note is discarded, design §8.4).
+pub trait NoteGenerator: Send + Sync {
+    fn generate(
+        &self,
+        record_id: &str,
+        transcript: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Option<String>>;
+}
+
 struct Inner {
     state: RecordingState,
     paused: bool,
@@ -63,6 +86,9 @@ struct Inner {
     /// blocking drain runs without holding the state lock, letting a concurrent
     /// Start observe PROCESSING and be rejected (design §6.6).
     pipeline: Option<Box<dyn Pipeline>>,
+    /// Set while GENERATING; `cancel_generation` flips it and the running
+    /// generator polls it. Cleared when generation ends.
+    cancel: Option<Arc<AtomicBool>>,
 }
 
 /// Single-threaded coordinator that owns the recording state and serializes all
@@ -71,17 +97,24 @@ struct Inner {
 /// corrupt the machine (design §6.6).
 pub struct Coordinator {
     inner: Mutex<Inner>,
+    generator: Box<dyn NoteGenerator>,
     emit: EmitFn,
 }
 
 impl Coordinator {
-    pub fn new(pipeline: Box<dyn Pipeline>, emit: EmitFn) -> Self {
+    pub fn new(
+        pipeline: Box<dyn Pipeline>,
+        generator: Box<dyn NoteGenerator>,
+        emit: EmitFn,
+    ) -> Self {
         Self {
             inner: Mutex::new(Inner {
                 state: RecordingState::Idle,
                 paused: false,
                 pipeline: Some(pipeline),
+                cancel: None,
             }),
+            generator,
             emit,
         }
     }
@@ -181,6 +214,57 @@ impl Coordinator {
         Ok(())
     }
 
+    /// IDLE → GENERATING → IDLE: produce a SOAP note from `transcript` and persist
+    /// it (design §8.4). Rejected unless IDLE, so it can't run mid-recording and a
+    /// second Generate is ignored while one is in flight. Mirrors `stop_recording`:
+    /// the state lock is released for the blocking generation (letting a concurrent
+    /// `cancel_generation` flip the flag) and reacquired to emit IDLE atomically.
+    /// Resolves with the new note's id, or `None` if it was cancelled.
+    pub fn generate_note(
+        &self,
+        record_id: &str,
+        transcript: &str,
+    ) -> Result<Option<String>, String> {
+        let mut inner = self.lock();
+        if inner.state != RecordingState::Idle {
+            return Err(reject("generate_note", inner.state));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        inner.state = RecordingState::Generating;
+        inner.cancel = Some(cancel.clone());
+        (self.emit)(AppEvent::StateChanged(RecordingState::Generating));
+        drop(inner);
+
+        let result = self.generator.generate(record_id, transcript, cancel);
+
+        let mut inner = self.lock();
+        inner.state = RecordingState::Idle;
+        inner.cancel = None;
+        (self.emit)(AppEvent::StateChanged(RecordingState::Idle));
+        match result {
+            Ok(note_id) => Ok(note_id),
+            Err(e) => {
+                let msg = e.to_string();
+                self.fail("generation_failed", &msg);
+                Err(msg)
+            }
+        }
+    }
+
+    /// Signal the in-flight generation to stop; the partial note is discarded and
+    /// the machine returns to IDLE on its own (design §8.4). Rejected unless
+    /// GENERATING. Only flips the flag — the generator observes it and unwinds.
+    pub fn cancel_generation(&self) -> Result<(), String> {
+        let inner = self.lock();
+        if inner.state != RecordingState::Generating {
+            return Err(reject("cancel_generation", inner.state));
+        }
+        if let Some(cancel) = &inner.cancel {
+            cancel.store(true, Ordering::Relaxed);
+        }
+        Ok(())
+    }
+
     fn fail(&self, code: &str, message: &str) {
         log::error!("{code}: {message}");
         (self.emit)(AppEvent::Error {
@@ -254,13 +338,66 @@ mod tests {
         }
     }
 
+    /// A note generator with configurable behavior. By default it returns a saved
+    /// note id immediately; `block_until_cancel` makes it spin until cancelled (to
+    /// test cancellation), and `fail` makes it error.
+    #[derive(Default)]
+    struct MockGenerator {
+        record_id: Option<String>,
+        block_until_cancel: bool,
+        fail: bool,
+    }
+
+    impl MockGenerator {
+        fn saved() -> Self {
+            Self {
+                record_id: Some("note-1".to_string()),
+                ..Default::default()
+            }
+        }
+    }
+
+    impl NoteGenerator for MockGenerator {
+        fn generate(
+            &self,
+            _record_id: &str,
+            _transcript: &str,
+            cancel: Arc<AtomicBool>,
+        ) -> Result<Option<String>> {
+            if self.fail {
+                anyhow::bail!("model load failed");
+            }
+            if self.block_until_cancel {
+                // Spin (bounded) until cancel_generation flips the flag.
+                for _ in 0..10_000 {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None); // partial note discarded
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                panic!("cancel was never signalled");
+            }
+            Ok(self.record_id.clone())
+        }
+    }
+
     /// Build a coordinator plus handles to inspect the pipeline calls and the
-    /// emitted events.
+    /// emitted events. Uses a no-op generator unless `build_with` is used.
     fn build(pipeline: MockPipeline) -> (Coordinator, Arc<Mutex<Vec<AppEvent>>>) {
+        build_with(pipeline, MockGenerator::saved())
+    }
+
+    fn build_with(
+        pipeline: MockPipeline,
+        generator: MockGenerator,
+    ) -> (Coordinator, Arc<Mutex<Vec<AppEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let emit: EmitFn = Box::new(move |ev| sink.lock().unwrap().push(ev));
-        (Coordinator::new(Box::new(pipeline), emit), events)
+        (
+            Coordinator::new(Box::new(pipeline), Box::new(generator), emit),
+            events,
+        )
     }
 
     #[test]
@@ -380,5 +517,91 @@ mod tests {
         assert!(co.pause_recording().is_err());
         assert!(co.resume_recording().is_err());
         assert!(calls.lock().unwrap().paused.is_empty());
+    }
+
+    #[test]
+    fn generate_walks_idle_generating_idle_and_returns_note_id() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let (co, events) = build(MockPipeline::new(calls));
+
+        // Resolves with the persisted note id so the UI can edit / revert it.
+        assert_eq!(
+            co.generate_note("rec-1", "patient reports a headache").unwrap(),
+            Some("note-1".to_string())
+        );
+        assert_eq!(co.state(), RecordingState::Idle);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                AppEvent::StateChanged(RecordingState::Generating),
+                AppEvent::StateChanged(RecordingState::Idle),
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_is_rejected_unless_idle() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let (co, _events) = build(MockPipeline::new(calls));
+
+        co.start_recording().unwrap(); // now RECORDING
+        assert!(co.generate_note("rec-1", "t").is_err());
+        assert_eq!(co.state(), RecordingState::Recording);
+    }
+
+    #[test]
+    fn generation_failure_returns_to_idle_and_emits_error() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut g = MockGenerator::saved();
+        g.fail = true;
+        let (co, events) = build_with(MockPipeline::new(calls), g);
+
+        assert!(co.generate_note("rec-1", "t").is_err());
+        assert_eq!(co.state(), RecordingState::Idle); // recovered, not wedged
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                AppEvent::StateChanged(RecordingState::Generating),
+                AppEvent::StateChanged(RecordingState::Idle),
+                AppEvent::Error {
+                    code: "generation_failed".to_string(),
+                    message: "model load failed".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn cancel_is_rejected_when_not_generating() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let (co, _events) = build(MockPipeline::new(calls));
+        assert!(co.cancel_generation().is_err()); // IDLE, nothing to cancel
+    }
+
+    #[test]
+    fn cancel_generation_signals_the_running_generation() {
+        // Concurrency: generate_note blocks in the generator (lock released) while
+        // cancel_generation runs on the main thread and flips the flag.
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut g = MockGenerator::saved();
+        g.block_until_cancel = true;
+        let (co, _events) = build_with(MockPipeline::new(calls), g);
+        let co = Arc::new(co);
+
+        let worker = {
+            let co = co.clone();
+            std::thread::spawn(move || co.generate_note("rec-1", "t"))
+        };
+
+        // Wait until the generation is actually in flight, then cancel it.
+        while co.state() != RecordingState::Generating {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        co.cancel_generation().unwrap();
+
+        // Cancelled generation discards the partial note (returns None) and the
+        // machine settles back at IDLE.
+        assert_eq!(worker.join().unwrap().unwrap(), None);
+        assert_eq!(co.state(), RecordingState::Idle);
     }
 }

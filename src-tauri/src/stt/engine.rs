@@ -12,25 +12,24 @@ use transcribe_rs::{
         parakeet::{ParakeetModel, ParakeetParams, TimestampGranularity},
         Quantization,
     },
-    whisper_cpp::{WhisperEngine, WhisperInferenceParams},
     SpeechModel,
 };
 
 use super::text::filter_transcription_output;
 use super::Transcriber;
 
-/// Which engine backs a model. Parakeet TDT (multilingual EN+FR) is the default;
-/// Whisper is the fallback (design §6.4).
+/// Which engine backs a model. v1 ships a single STT engine — Parakeet TDT v3,
+/// multilingual EN+FR, the all-rounder default (design §6.4). The enum keeps the
+/// load interface open for additional engines later.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelKind {
     Parakeet,
-    Whisper,
 }
 
-/// The two engines we ship, trimmed from the reference's eight. Dropping the
-/// engine value frees the model (used by `unload` and the idle watcher).
+/// The engine we ship, behind an enum so a future engine slots in without
+/// touching the interface. Dropping the value frees the model (used by `unload`
+/// and the idle watcher).
 enum LoadedEngine {
-    Whisper(WhisperEngine),
     Parakeet(ParakeetModel),
 }
 
@@ -79,8 +78,8 @@ impl SttEngine {
             shutdown,
             watcher: Some(watcher),
             // Default to auto-detect (design FR-2/FR-5: the app detects EN/FR).
-            // Forcing "en" would garble a French consult under the Whisper
-            // fallback before the orchestrator ever calls set_language.
+            // Parakeet v3 auto-detects the language itself; this drives the
+            // transcript-cleanup filter until the orchestrator sets a language.
             language: Mutex::new("auto".to_string()),
         }
     }
@@ -117,10 +116,6 @@ impl SttEngine {
     /// Load a model from `model_path`, replacing any currently loaded one.
     pub fn load(&self, kind: ModelKind, model_path: &Path) -> Result<()> {
         let loaded = match kind {
-            ModelKind::Whisper => LoadedEngine::Whisper(
-                WhisperEngine::load(model_path)
-                    .map_err(|e| anyhow!("failed to load Whisper model: {e}"))?,
-            ),
             ModelKind::Parakeet => LoadedEngine::Parakeet(
                 ParakeetModel::load(model_path, &Quantization::Int8)
                     .map_err(|e| anyhow!("failed to load Parakeet model: {e}"))?,
@@ -158,7 +153,6 @@ impl Transcriber for SttEngine {
         }
 
         let language = self.language.lock().unwrap().clone();
-        let whisper_language = validated_whisper_language(&language);
 
         // Take the engine out so we own it during the (panic-prone) native call.
         // We catch_unwind so an engine panic unloads the model instead of
@@ -171,17 +165,8 @@ impl Transcriber for SttEngine {
 
         let outcome = catch_unwind(AssertUnwindSafe(|| -> Result<String> {
             match &mut engine {
-                LoadedEngine::Whisper(w) => {
-                    let params = WhisperInferenceParams {
-                        language: whisper_language.clone(),
-                        ..Default::default()
-                    };
-                    w.transcribe_with(audio, &params)
-                        .map(|r| r.text)
-                        .map_err(|e| anyhow!("Whisper transcription failed: {e}"))
-                }
                 // Parakeet TDT v3 is multilingual and auto-detects; it takes no
-                // language param here (matches the reference engine call).
+                // language param here.
                 LoadedEngine::Parakeet(p) => {
                     let params = ParakeetParams {
                         timestamp_granularity: Some(TimestampGranularity::Segment),
@@ -270,19 +255,10 @@ fn now_ms() -> u64 {
     EPOCH.elapsed().as_millis() as u64
 }
 
-/// Base language code without region, e.g. "en-US" -> "en".
+/// Base language code without region, e.g. "en-US" -> "en". Drives the
+/// transcript-cleanup filter (Parakeet auto-detects the spoken language itself).
 fn base_lang(lang: &str) -> &str {
     lang.split(['-', '_']).next().unwrap_or(lang)
-}
-
-/// Map the configured language to what Whisper expects: `Some(code)` for a
-/// supported language (EN/FR), `None` to auto-detect (also for "auto"/unknown).
-fn validated_whisper_language(lang: &str) -> Option<String> {
-    match base_lang(lang) {
-        "en" => Some("en".to_string()),
-        "fr" => Some("fr".to_string()),
-        _ => None,
-    }
 }
 
 fn panic_message(payload: Box<dyn std::any::Any + Send>) -> String {
@@ -300,11 +276,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn language_validation_maps_supported_and_falls_back() {
-        assert_eq!(validated_whisper_language("en"), Some("en".to_string()));
-        assert_eq!(validated_whisper_language("fr-FR"), Some("fr".to_string()));
-        assert_eq!(validated_whisper_language("auto"), None);
-        assert_eq!(validated_whisper_language("de"), None);
+    fn base_lang_strips_region() {
+        assert_eq!(base_lang("en"), "en");
+        assert_eq!(base_lang("fr-FR"), "fr");
+        assert_eq!(base_lang("en_US"), "en");
+        assert_eq!(base_lang("auto"), "auto");
     }
 
     #[test]
