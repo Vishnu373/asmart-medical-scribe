@@ -49,7 +49,9 @@ pub trait Pipeline: Send {
     fn start(&mut self) -> Result<()>;
     /// Stop capture, tail-flush the open segment, and drain the worker. Blocks
     /// until every in-flight segment has been transcribed (design §6.6 "Stop").
-    fn stop(&mut self) -> Result<()>;
+    /// Returns the id of the persisted `records` row, or `None` when nothing was
+    /// transcribed (an empty consult isn't saved).
+    fn stop(&mut self) -> Result<Option<String>>;
     /// Gate capture without tearing the pipeline down (pause/resume mid-consult).
     fn set_paused(&mut self, paused: bool);
 }
@@ -118,7 +120,7 @@ impl Coordinator {
     /// RECORDING → PROCESSING (drain) → IDLE. Rejected unless currently RECORDING.
     /// The pipeline is moved out for the drain so the lock isn't held while it
     /// blocks, and a Start arriving mid-drain sees PROCESSING and is rejected.
-    pub fn stop_recording(&self) -> Result<(), String> {
+    pub fn stop_recording(&self) -> Result<Option<String>, String> {
         let mut inner = self.lock();
         if inner.state != RecordingState::Recording {
             return Err(reject("stop_recording", inner.state));
@@ -142,10 +144,14 @@ impl Coordinator {
         inner.state = RecordingState::Idle;
         (self.emit)(AppEvent::StateChanged(RecordingState::Idle));
         match result {
-            Ok(()) => Ok(()),
+            Ok(record_id) => Ok(record_id),
             Err(e) => {
+                // The drain steps swallow their own errors; the only failure
+                // `stop()` surfaces is persisting the record (the pipeline has
+                // already spilled the transcript to a recovery file), so report
+                // it as a save failure rather than a generic drain failure.
                 let msg = e.to_string();
-                self.fail("drain_failed", &msg);
+                self.fail("save_failed", &msg);
                 Err(msg)
             }
         }
@@ -213,6 +219,8 @@ mod tests {
         calls: Arc<Mutex<Calls>>,
         fail_start: bool,
         fail_stop: bool,
+        /// The record id a successful stop reports (None = empty consult).
+        record_id: Option<String>,
     }
 
     impl MockPipeline {
@@ -221,6 +229,7 @@ mod tests {
                 calls,
                 fail_start: false,
                 fail_stop: false,
+                record_id: Some("rec-1".to_string()),
             }
         }
     }
@@ -233,12 +242,12 @@ mod tests {
             }
             Ok(())
         }
-        fn stop(&mut self) -> Result<()> {
+        fn stop(&mut self) -> Result<Option<String>> {
             self.calls.lock().unwrap().stopped += 1;
             if self.fail_stop {
-                anyhow::bail!("drain failed");
+                anyhow::bail!("disk full");
             }
-            Ok(())
+            Ok(self.record_id.clone())
         }
         fn set_paused(&mut self, paused: bool) {
             self.calls.lock().unwrap().paused.push(paused);
@@ -262,7 +271,9 @@ mod tests {
         assert_eq!(co.state(), RecordingState::Idle);
         co.start_recording().unwrap();
         assert_eq!(co.state(), RecordingState::Recording);
-        co.stop_recording().unwrap();
+        // Stop reports the persisted record id back to the caller (the command
+        // resolves with it so the UI can later save edits / generate a note).
+        assert_eq!(co.stop_recording().unwrap(), Some("rec-1".to_string()));
         assert_eq!(co.state(), RecordingState::Idle);
 
         let c = calls.lock().unwrap();
@@ -317,7 +328,7 @@ mod tests {
     }
 
     #[test]
-    fn drain_failure_still_returns_to_idle() {
+    fn stop_failure_still_returns_to_idle() {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut p = MockPipeline::new(calls.clone());
         p.fail_stop = true;
@@ -334,8 +345,8 @@ mod tests {
                 AppEvent::StateChanged(RecordingState::Processing),
                 AppEvent::StateChanged(RecordingState::Idle),
                 AppEvent::Error {
-                    code: "drain_failed".to_string(),
-                    message: "drain failed".to_string(),
+                    code: "save_failed".to_string(),
+                    message: "disk full".to_string(),
                 },
             ]
         );

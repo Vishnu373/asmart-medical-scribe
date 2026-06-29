@@ -207,13 +207,13 @@ mock STT, assert correct segment count, `seq` ordering, and emitted text.
 **Verification:** `cargo test` — transition table (legal/illegal), duplicate-start
 rejected, stop drains then returns IDLE.
 
-### Phase B8 — Records & transcript commands  `[ ] not started`
+### Phase B8 — Records & transcript commands  `[x] done`
 **Goal:** Persist a completed consult and expose record/transcript commands.
 **Depends on:** B2, B7
 **Tasks:**
-- [ ] On stop, assemble the full transcript and insert a `records` row.
-- [ ] Commands: `update_transcript`, `list_records`, `open_record`, `delete_record`.
-- [ ] Map errors to `error{code,message}`; ensure deletes cascade to `notes`.
+- [x] On stop, assemble the full transcript and insert a `records` row.
+- [x] Commands: `update_transcript`, `list_records`, `open_record`, `delete_record`.
+- [x] Map errors to `error{code,message}`; ensure deletes cascade to `notes`.
 **Deliverables:** records/transcript commands wired to `store/`.
 **Verification:** `cargo test` — record lifecycle end-to-end with the in-memory/mock
 pipeline; delete removes notes.
@@ -552,3 +552,45 @@ hotkey without focus steal and pastes the chosen section.
     pause / resume-when-not-paused rejected, no extra `state-changed`). All pure-Rust
     via `MockPipeline`.
   - **Pending Windows verification (user):** `cd src-tauri && cargo test`.
+
+- 2026-06-29 — **B8 — Records & transcript commands** done. Persists a consult and
+  exposes the records/transcript bridge.
+  - `store/mod.rs`: added `SharedStore` — a `Clone`able `Arc<Mutex<Store>>` (the
+    `rusqlite::Connection` is `Send` but `!Sync`, so access is serialized; a poisoned
+    lock is recovered). One handle is managed as Tauri state and another clone lives
+    in `RealPipeline`, so the pipeline's save-on-stop and the records commands hit the
+    same keyed connection.
+  - `orchestrator/pipeline.rs`: the STT worker sink now also pushes each segment's
+    text into a per-recording `Arc<Mutex<Vec<String>>>` (in `seq` order, since the
+    worker emits in order). On stop — after the drain and `set_recording(false)` — the
+    segments are joined (`assemble_transcript`, trims + drops blanks) and, if non-empty,
+    inserted as a `records` row; the new id is returned. An empty consult saves nothing.
+  - `orchestrator/coordinator.rs`: `Pipeline::stop` and `Coordinator::stop_recording`
+    now return `Result<Option<String>, String>` — the saved record id flows back to the
+    caller. The frontend's `invoke('stop_recording')` resolves with the id so it can load
+    the record for editing / note generation. Mock + the transition-walk test updated to
+    assert the id propagates.
+  - `commands/mod.rs`: `stop_recording` returns `Option<String>`; added
+    `update_transcript`, `list_records`, `open_record`, `delete_record` over the managed
+    `SharedStore`, each mapping store errors to an `Err(String)` the frontend surfaces.
+    Deletes cascade to `notes` via the existing FK (B2).
+  - `lib.rs` setup: loads/creates the DPAPI-wrapped key (`crypto`) and opens the
+    SQLCipher DB at `app_data_dir/clinical.db` (key blob at `app_data_dir/db.key`),
+    wraps it in `SharedStore`, hands a clone to `RealPipeline`, and manages it. Registers
+    the four new commands.
+  - **Key decisions:** (a) record creation lives in `RealPipeline` (it owns the
+    accumulated transcript), keeping the `Coordinator` a pure, Tauri/store-free state
+    machine. (b) The new record id is delivered as the `stop_recording` return value
+    rather than a new event — no `record-saved` event exists in §9.5, and a command
+    resolving with its result is the conventional Tauri shape.
+  - **Deviations / deferred:** (i) The saved `language` is hardcoded `"en"`
+    (`DEFAULT_LANGUAGE`) — design §9.2 expects `en`/`fr` from settings; real language
+    wiring lands with F6/settings (and any detection). Recorded per the surface-divergence
+    rule. (ii) `label` is saved empty; the doctor titles the encounter in the Records
+    view (F5).
+  - **Tests:** `assemble_transcript` join/trim/blank-skip + empty cases (pure-Rust in
+    `pipeline.rs`); coordinator walk asserts the mock pipeline's record id propagates
+    through `stop_recording`. Record CRUD + delete→notes cascade already covered by the
+    B2 `store` tests.
+  - **Pending Windows verification (user):** `cd src-tauri && cargo test` (the
+    DPAPI/SQLCipher paths need Windows + `OPENSSL_DIR`, as in B2).

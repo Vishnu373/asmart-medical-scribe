@@ -1,6 +1,7 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use anyhow::{anyhow, Result};
 use serde_json::json;
@@ -8,6 +9,7 @@ use tauri::{AppHandle, Emitter};
 
 use crate::audio_toolkit::{AudioRecorder, SileroVad, SmoothedVad};
 use crate::segment::{spawn_stt_worker, Segmenter, SegmenterConfig, SttWorkerHandle};
+use crate::store::SharedStore;
 use crate::stt::{SttEngine, Transcriber};
 
 use super::coordinator::{AppEvent, Pipeline};
@@ -19,6 +21,11 @@ const VAD_PREFILL_FRAMES: usize = 8; // ~240 ms pre-roll prepended on onset
 const VAD_HANGOVER_FRAMES: usize = 24; // ~720 ms held after the detector goes quiet
 const VAD_ONSET_FRAMES: usize = 3; // ~90 ms of voice required to start speech
 
+// Language stamped on a saved record. Until settings/detection are wired (F6),
+// consults are saved as English; the doctor can't yet change this. (Divergence
+// from design §9.2, which expects `en`/`fr` from settings — recorded in the log.)
+const DEFAULT_LANGUAGE: &str = "en";
+
 /// The live capture → segment → transcribe pipeline. Built fresh on each
 /// `start()` and fully torn down on `stop()`; only the STT model (`SttEngine`)
 /// is long-lived and stays warm across recordings (design §6.4/§6.6).
@@ -26,6 +33,11 @@ pub struct RealPipeline {
     app: AppHandle,
     engine: Arc<SttEngine>,
     vad_model_path: PathBuf,
+    store: SharedStore,
+    /// App data dir; on a DB save failure the transcript is spilled here as a
+    /// recoverable `.txt` so a finished consult is never lost (it lived only in
+    /// memory until this point).
+    data_dir: PathBuf,
     running: Option<Running>,
 }
 
@@ -35,14 +47,26 @@ struct Running {
     segmenter: Arc<Mutex<Segmenter>>,
     worker: SttWorkerHandle,
     paused: Arc<AtomicBool>,
+    /// Transcribed segment text, accumulated in `seq` order by the worker sink and
+    /// joined into the saved transcript on stop (design §9.6: the document, not
+    /// the transient segments, is what's persisted).
+    transcript: Arc<Mutex<Vec<String>>>,
 }
 
 impl RealPipeline {
-    pub fn new(app: AppHandle, engine: Arc<SttEngine>, vad_model_path: PathBuf) -> Self {
+    pub fn new(
+        app: AppHandle,
+        engine: Arc<SttEngine>,
+        vad_model_path: PathBuf,
+        store: SharedStore,
+        data_dir: PathBuf,
+    ) -> Self {
         Self {
             app,
             engine,
             vad_model_path,
+            store,
+            data_dir,
             running: None,
         }
     }
@@ -68,11 +92,19 @@ impl Pipeline for RealPipeline {
             seg_tx,
         )));
 
+        let transcript = Arc::new(Mutex::new(Vec::<String>::new()));
+
         let worker = {
             let app = self.app.clone();
+            let transcript = transcript.clone();
             let transcriber: Arc<dyn Transcriber> = self.engine.clone();
             spawn_stt_worker(seg_rx, transcriber, move |res| match res {
                 Ok(ts) => {
+                    // Accumulate for the final saved transcript (the worker emits
+                    // in seq order, so push order is seq order), then notify the UI.
+                    if let Ok(mut t) = transcript.lock() {
+                        t.push(ts.text.clone());
+                    }
                     let _ = app.emit("transcript-segment", json!({ "seq": ts.seq, "text": ts.text }));
                 }
                 Err(e) => {
@@ -128,18 +160,20 @@ impl Pipeline for RealPipeline {
             segmenter,
             worker,
             paused,
+            transcript,
         });
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<()> {
+    fn stop(&mut self) -> Result<Option<String>> {
         let Some(running) = self.running.take() else {
-            return Ok(());
+            return Ok(None);
         };
         let Running {
             mut recorder,
             segmenter,
             worker,
+            transcript,
             ..
         } = running;
 
@@ -164,7 +198,36 @@ impl Pipeline for RealPipeline {
 
         // Model stays warm; the idle-watcher unloads it later (design §6.6).
         self.engine.set_recording(false);
-        Ok(())
+
+        // 5. Assemble the finalized transcript and persist the encounter. An empty
+        //    consult (silence / nothing recognized) isn't saved.
+        let segments = match transcript.lock() {
+            Ok(t) => t.clone(),
+            Err(p) => p.into_inner().clone(),
+        };
+        let text = assemble_transcript(&segments);
+        if text.is_empty() {
+            return Ok(None);
+        }
+        // Label starts empty; the doctor titles the encounter in the Records view.
+        match self.store.lock().create_record("", DEFAULT_LANGUAGE, &text) {
+            Ok(record) => Ok(Some(record.id)),
+            Err(e) => {
+                // The transcript only ever lived in memory — don't let a DB error
+                // throw away a whole consult. Spill it to a recoverable file and
+                // fold that location into the error the UI surfaces.
+                match save_fallback_transcript(&self.data_dir, &text) {
+                    Ok(path) => Err(anyhow!(
+                        "failed to save record: {e}; transcript preserved at {}",
+                        path.display()
+                    )),
+                    Err(write_err) => Err(anyhow!(
+                        "failed to save record: {e}; \
+                         AND failed to write fallback transcript: {write_err}"
+                    )),
+                }
+            }
+        }
     }
 
     fn set_paused(&mut self, paused: bool) {
@@ -172,6 +235,33 @@ impl Pipeline for RealPipeline {
             running.paused.store(paused, Ordering::Relaxed);
         }
     }
+}
+
+/// Join the transcribed segments into the finalized transcript blob persisted on
+/// the record (design §9.6: segments are transient transport; the document is the
+/// blob). The worker already skips empty results; trimming here is defensive.
+fn assemble_transcript(segments: &[String]) -> String {
+    segments
+        .iter()
+        .map(|s| s.trim())
+        .filter(|s| !s.is_empty())
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// Last-resort recovery when the encrypted DB insert fails: write the assembled
+/// transcript to a timestamped `.txt` in the data dir and return its path. NB:
+/// this file is plaintext PHI outside the SQLCipher DB — acceptable only because
+/// the alternative is silently losing the consult; the doctor re-imports/deletes
+/// it. Stays on the same device (no egress).
+fn save_fallback_transcript(dir: &Path, text: &str) -> Result<PathBuf> {
+    let ts = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0);
+    let path = dir.join(format!("recovered-transcript-{ts}.txt"));
+    std::fs::write(&path, text)?;
+    Ok(path)
 }
 
 /// Map an `AppEvent` from the coordinator onto a Tauri `emit`. This is the seam
@@ -184,5 +274,30 @@ pub fn emit_app_event(app: &AppHandle, event: AppEvent) {
         AppEvent::Error { code, message } => {
             let _ = app.emit("error", json!({ "code": code, "message": message }));
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::assemble_transcript;
+
+    #[test]
+    fn assembles_segments_into_one_blob() {
+        let segments = vec![
+            "Patient reports a headache.".to_string(),
+            "  No fever.  ".to_string(),
+            String::new(), // defensive: skipped
+            "Started two days ago.".to_string(),
+        ];
+        assert_eq!(
+            assemble_transcript(&segments),
+            "Patient reports a headache. No fever. Started two days ago."
+        );
+    }
+
+    #[test]
+    fn empty_or_blank_segments_assemble_to_empty() {
+        assert_eq!(assemble_transcript(&[]), "");
+        assert_eq!(assemble_transcript(&["   ".to_string()]), "");
     }
 }

@@ -23,6 +23,7 @@ use std::time::Duration;
 use tauri::Manager;
 
 use orchestrator::{emit_app_event, Coordinator, RealPipeline};
+use store::{SharedStore, Store};
 use stt::SttEngine;
 
 /// How long the STT model sits unused before the idle-watcher unloads it
@@ -49,13 +50,31 @@ pub fn run() {
                 .join("models")
                 .join("silero_vad.onnx");
 
+            // Encrypted PHI store: the AES-256 key is wrapped by Windows DPAPI and
+            // never persisted in the clear (design §10.1). Both the pipeline (which
+            // saves a record on stop) and the records commands share this handle.
+            let data_dir = app.path().app_data_dir()?;
+            std::fs::create_dir_all(&data_dir)?;
+            let key = crypto::load_or_create_key(&data_dir.join("db.key"))
+                .map_err(|e| e.to_string())?;
+            let store = SharedStore::new(
+                Store::open(&data_dir.join("clinical.db"), &key).map_err(|e| e.to_string())?,
+            );
+
             let handle = app.handle().clone();
-            let pipeline = RealPipeline::new(handle.clone(), engine, vad_model_path);
+            let pipeline = RealPipeline::new(
+                handle.clone(),
+                engine,
+                vad_model_path,
+                store.clone(),
+                data_dir,
+            );
             let coordinator = Coordinator::new(
                 Box::new(pipeline),
                 Box::new(move |event| emit_app_event(&handle, event)),
             );
             app.manage(coordinator);
+            app.manage(store);
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -64,6 +83,10 @@ pub fn run() {
             commands::stop_recording,
             commands::pause_recording,
             commands::resume_recording,
+            commands::update_transcript,
+            commands::list_records,
+            commands::open_record,
+            commands::delete_record,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

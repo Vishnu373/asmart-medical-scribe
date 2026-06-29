@@ -10,6 +10,7 @@ use rusqlite_migration::{Migrations, M};
 use serde::{Deserialize, Serialize};
 use std::fmt::Write as _;
 use std::path::Path;
+use std::sync::{Arc, Mutex, MutexGuard};
 
 /// A recorded encounter: the finalized, editable transcript. No audio.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -227,6 +228,25 @@ impl Store {
     }
 }
 
+/// Thread-safe shared handle to the encrypted store. `rusqlite::Connection` is
+/// `Send` but not `Sync`, so access is serialized behind a `Mutex`; clones share
+/// the one keyed connection — the pipeline persists a record on stop while the
+/// records commands read/write the same DB (managed as Tauri state, B8).
+#[derive(Clone)]
+pub struct SharedStore(Arc<Mutex<Store>>);
+
+impl SharedStore {
+    pub fn new(store: Store) -> Self {
+        Self(Arc::new(Mutex::new(store)))
+    }
+
+    /// Locks the connection, recovering a poisoned lock rather than wedging the
+    /// app (a panic mid-statement leaves the DB readable).
+    pub fn lock(&self) -> MutexGuard<'_, Store> {
+        self.0.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
 /// Schema migrations (design §9.2). Append new `M::up(...)` entries; never edit
 /// a released one.
 fn migrations() -> Migrations<'static> {
@@ -334,6 +354,22 @@ mod tests {
         assert!(notes.iter().find(|n| n.id == n1.id).unwrap().is_active);
 
         // Deleting the record cascades to its notes.
+        store.delete_record(&rec.id).unwrap();
+        assert!(store.list_notes(&rec.id).unwrap().is_empty());
+    }
+
+    #[test]
+    fn delete_record_cascades_to_notes() {
+        // Focused guard for the FK cascade (§9.2): a record with notes, deleted,
+        // must leave no orphaned notes. Catches `PRAGMA foreign_keys=ON` ever being
+        // dropped — without it the notes would persist with a dangling record_id.
+        let dir = tempfile::tempdir().unwrap();
+        let store = Store::open(&dir.path().join("c.db"), &test_key(6)).unwrap();
+
+        let rec = store.create_record("V", "en", "t").unwrap();
+        store.insert_note(&rec.id, "## S\n note").unwrap();
+        assert_eq!(store.list_notes(&rec.id).unwrap().len(), 1);
+
         store.delete_record(&rec.id).unwrap();
         assert!(store.list_notes(&rec.id).unwrap().is_empty());
     }
