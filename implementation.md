@@ -306,12 +306,12 @@ invoked with merged text.
 **Verification:** RTL — streaming tokens accumulate; cancel stops; revert calls
 `revert_version`.
 
-### Phase F5 — Records browser  `[ ] not started`
+### Phase F5 — Records browser  `[x] done`
 **Goal:** List/open/delete past consults and their notes.
 **Depends on:** B8, F1
 **Tasks:**
-- [ ] `RecordsView` listing from `list_records`; open loads transcript + notes.
-- [ ] Delete with confirm → `delete_record`.
+- [x] `RecordsView` listing from `list_records`; open loads transcript + notes.
+- [x] Delete with confirm → `delete_record`.
 **Deliverables:** `RecordsView`.
 **Verification:** RTL — list renders from mocked data; open/delete invoke correct
 commands.
@@ -879,3 +879,28 @@ hotkey without focus steal and pastes the chosen section.
     `useBackendEvents.test.tsx`.
   - **Verification pending on Windows:** `bun run test` + `bun run build`; `cargo test`
     for the new `list_notes` command.
+
+- **2026-06-30 — F5 built (Records browser).** Saved-encounter list with open/delete:
+  - `views/RecordsView.tsx`: loads `list_records` on mount into the `records` slice
+    and renders each as a row (label, localized `created_at`, language). Empty state when
+    none.
+  - **Open** calls `open_record` then `list_notes`, loads the `Record.transcript` +
+    note versions into the store (`currentRecordId`/`transcript`/`notes`, `segments`
+    cleared, `streamingNote` reset) and switches `view` to recording — reusing the
+    Recording view's transcript/SOAP editors, which are already keyed off
+    `currentRecordId` (state stays IDLE, so both are editable). No new detail view needed.
+  - **Delete** is a per-row inline two-step confirm (Delete → Confirm/Cancel) rather than a
+    `window.confirm`, calling `delete_record` then refreshing the list. Permanent (NFR-9);
+    the backend cascades notes (B8).
+  - Tests: `RecordsView.test.tsx` — list renders from mocked `list_records`; Open invokes
+    `open_record`+`list_notes` and populates the store/view; Delete only fires
+    `delete_record` after the inline Confirm.
+  - **Verification pending on Windows:** `bun run test` + `bun run build`.
+
+- **2026-06-30 — F5 follow-up: lock nav while busy.** Opening a record mid-RECORDING
+  would repoint `currentRecordId`/`transcript` while the backend kept streaming
+  `transcript-segment` into the original session, corrupting state (and the F4 NotePanel
+  shared the same nav-during-recording gap). Fixed at the nav level: `NavBar` disables
+  every non-active view button while `recordingState !== "IDLE"`, keeping the clinician
+  on the Recording view until the session returns to IDLE. Test: `NavBar.test.tsx` (nav
+  works when idle; Records is disabled and a no-op during RECORDING).
