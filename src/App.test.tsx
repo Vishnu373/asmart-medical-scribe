@@ -4,8 +4,9 @@ import userEvent from "@testing-library/user-event";
 import App from "@/App";
 import { useAppStore } from "@/state";
 
-// Bridge calls go through `invoke`; the shell only pings on mount.
+// Bridge calls go through `invoke`; the shell pings on mount and wires events.
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue("pong: ready") }));
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
 beforeEach(() => useAppStore.setState({ view: "recording" }));
 

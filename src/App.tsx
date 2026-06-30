@@ -1,7 +1,9 @@
 import { useEffect, useState } from "react";
 import { ping } from "@/bridge";
 import { useAppStore } from "@/state";
+import { useBackendEvents } from "@/hooks/useBackendEvents";
 import NavBar from "@/components/NavBar";
+import Toaster from "@/components/Toaster";
 import RecordingView from "@/views/RecordingView";
 import RecordsView from "@/views/RecordsView";
 import SettingsView from "@/views/SettingsView";
@@ -20,6 +22,9 @@ function ActiveView() {
 
 function App() {
   const [bridgeOk, setBridgeOk] = useState<boolean | null>(null);
+
+  // Wire backend → UI events (§9.5) into the store, once, at the root.
+  useBackendEvents();
 
   // Liveness probe through the typed bridge (carried over from B1).
   useEffect(() => {
@@ -45,6 +50,7 @@ function App() {
           <ActiveView />
         </main>
       </div>
+      <Toaster />
     </div>
   );
 }

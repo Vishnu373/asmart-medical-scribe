@@ -28,3 +28,23 @@ describe("app store slices", () => {
     expect(useAppStore.getState().streamingNote).toBe("## Subjective");
   });
 });
+
+describe("toast slice coalesces and caps", () => {
+  it("collapses repeat alerts into one toast with a count", () => {
+    const { pushToast } = useAppStore.getState();
+    pushToast("transcription failed", "error");
+    pushToast("transcription failed", "error");
+    pushToast("transcription failed", "error");
+    const toasts = useAppStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0].count).toBe(3);
+  });
+
+  it("caps the stack at 3, dropping the oldest", () => {
+    const { pushToast } = useAppStore.getState();
+    ["a", "b", "c", "d"].forEach((m) => pushToast(m, "error"));
+    const toasts = useAppStore.getState().toasts;
+    expect(toasts).toHaveLength(3);
+    expect(toasts.map((t) => t.message)).toEqual(["b", "c", "d"]);
+  });
+});

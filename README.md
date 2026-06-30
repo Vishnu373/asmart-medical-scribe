@@ -135,7 +135,7 @@ cd src-tauri
 cargo test
 
 # Frontend (Vitest) — from the project root
-bun test
+bun run test
 ```
 
 ---

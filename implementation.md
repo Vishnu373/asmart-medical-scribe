@@ -275,13 +275,13 @@ crash report payload asserted to contain no PHI fields.
 **Verification:** Vitest — bridge wrappers call `invoke` with correct args; shell
 renders; `ping` works through the typed bridge.
 
-### Phase F2 — Recording view  `[ ] not started`
+### Phase F2 — Recording view  `[x] done`
 **Goal:** Start/stop/pause recording with live input level + state display.
 **Depends on:** B7, F1
 **Tasks:**
-- [ ] Record controls bound to `start/stop/pause/resume_recording`.
-- [ ] Input-level meter from `input-level`; status from `state-changed`.
-- [ ] Error toasts from `error` events.
+- [x] Record controls bound to `start/stop/pause/resume_recording`.
+- [x] Input-level meter from `input-level`; status from `state-changed`.
+- [x] Error toasts from `error` events.
 **Deliverables:** `RecordingView` + meter/status components.
 **Verification:** RTL — controls dispatch correct commands; meter reacts to mocked
 `input-level`; state label follows `state-changed`.
@@ -811,3 +811,22 @@ hotkey without focus steal and pastes the chosen section.
   updates the cache (a failed write leaves the in-memory copy intact), and takes the
   full `Settings` object so internal keys survive the frontend round-trip. Verified
   by a new `shared_settings_update_persists_and_caches` unit test (Windows `cargo test`).
+
+- **2026-06-30 — F2 built (Recording view).** Start/stop/pause/resume, live meter,
+  status and error toasts:
+  - `hooks/useBackendEvents.ts`: subscribes `state-changed` / `input-level` / `error`
+    (§9.5) into the store once at the app root; views read state reactively and never
+    touch the event layer. `transcript-segment` / `generation-token` deferred to F3/F4.
+  - State: added `paused` to the recording slice (the backend has **no PAUSED state** —
+    it stays RECORDING and emits no event on pause/resume per `coordinator.rs`, so the
+    UI owns the flag) and a `toasts` slice (`pushToast`/`dismissToast`).
+  - Components: `RecordingControls` (commands + state-derived button set; a rejected
+    `Err(String)` becomes an error toast), `StatusBadge` (state label + "Paused"
+    override), `LevelMeter` (one bar per `input-level` bucket, FR-12), `Toaster`
+    (auto-dismiss, mounted globally in `App`). `RecordingView` composes them.
+  - `App` now calls `useBackendEvents()` and renders `<Toaster/>`.
+  - Tests: `RecordingView.test.tsx` (controls dispatch the right commands, Stop stores
+    the returned record id, pause→Resume, rejected command→toast, status follows state,
+    meter bar count = bucket count), `useBackendEvents.test.tsx` (events update the
+    store), plus the event-module mock added to `App.test.tsx`.
+  - **Verification pending on Windows:** `bun test` + `bun run build`.
