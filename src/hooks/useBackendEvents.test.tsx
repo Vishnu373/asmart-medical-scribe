@@ -9,6 +9,7 @@ const captured = vi.hoisted(() => {
     state?: (p: { state: string }) => void;
     level?: (p: { level: number[] }) => void;
     segment?: (p: { seq: number; text: string }) => void;
+    token?: (p: { text: string }) => void;
     error?: (p: { code: string; message: string }) => void;
   };
 });
@@ -24,6 +25,10 @@ vi.mock("@/bridge", () => ({
   },
   onTranscriptSegment: (h: (p: { seq: number; text: string }) => void) => {
     captured.segment = h;
+    return Promise.resolve(() => {});
+  },
+  onGenerationToken: (h: (p: { text: string }) => void) => {
+    captured.token = h;
     return Promise.resolve(() => {});
   },
   onError: (h: (p: { code: string; message: string }) => void) => {
@@ -43,6 +48,7 @@ beforeEach(() =>
     inputLevel: [],
     segments: [],
     transcript: "",
+    streamingNote: "",
     toasts: [],
   }),
 );
@@ -72,6 +78,13 @@ describe("useBackendEvents wires §9.5 events into the store", () => {
     act(() => captured.segment!({ seq: 2, text: "world" }));
     act(() => captured.segment!({ seq: 1, text: "hello" }));
     expect(useAppStore.getState().transcript).toBe("hello world");
+  });
+
+  it("generation-token accumulates into the streaming note", () => {
+    render(<Probe />);
+    act(() => captured.token!({ text: "## Sub" }));
+    act(() => captured.token!({ text: "jective" }));
+    expect(useAppStore.getState().streamingNote).toBe("## Subjective");
   });
 
   it("error pushes a toast", () => {

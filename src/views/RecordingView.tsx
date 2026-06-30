@@ -3,9 +3,10 @@ import RecordingControls from "@/components/RecordingControls";
 import StatusBadge from "@/components/StatusBadge";
 import LevelMeter from "@/components/LevelMeter";
 import TranscriptEditor from "@/components/TranscriptEditor";
+import NotePanel from "@/components/NotePanel";
 
-/** Recording view: controls, live status, input-level meter and the live,
- *  editable transcript (FR-4, FR-5, FR-12). */
+/** Recording view: controls, live status, input-level meter, the live editable
+ *  transcript and the SOAP note panel (FR-4..FR-12). */
 export default function RecordingView() {
   const recordingState = useAppStore((s) => s.recordingState);
   const paused = useAppStore((s) => s.paused);
@@ -25,6 +26,8 @@ export default function RecordingView() {
       <RecordingControls />
 
       <TranscriptEditor />
+
+      <NotePanel />
     </section>
   );
 }

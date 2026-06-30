@@ -47,6 +47,15 @@ describe("transcript slice", () => {
   });
 });
 
+describe("notes slice", () => {
+  it("appendStreamingToken accumulates the live note", () => {
+    const { appendStreamingToken } = useAppStore.getState();
+    appendStreamingToken("## Sub");
+    appendStreamingToken("jective");
+    expect(useAppStore.getState().streamingNote).toBe("## Subjective");
+  });
+});
+
 describe("toast slice coalesces and caps", () => {
   it("collapses repeat alerts into one toast with a count", () => {
     const { pushToast } = useAppStore.getState();

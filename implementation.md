@@ -296,12 +296,12 @@ renders; `ping` works through the typed bridge.
 **Verification:** RTL — segments render in order from mocked events; edit → save
 invoked with merged text.
 
-### Phase F4 — SOAP note generation UI  `[ ] not started`
+### Phase F4 — SOAP note generation UI  `[x] done`
 **Goal:** Trigger/stream/edit SOAP notes with versioning.
 **Depends on:** B10, F3
 **Tasks:**
-- [ ] Generate/regenerate/cancel buttons; stream `generation-token` into a SOAP view.
-- [ ] Four-section editor; save via `update_note`; version revert via `revert_version`.
+- [x] Generate/regenerate/cancel buttons; stream `generation-token` into a SOAP view.
+- [x] Four-section editor; save via `update_note`; version revert via `revert_version`.
 **Deliverables:** `SoapEditor` + generation controls.
 **Verification:** RTL — streaming tokens accumulate; cancel stops; revert calls
 `revert_version`.
@@ -849,3 +849,33 @@ hotkey without focus steal and pastes the chosen section.
     `addSegment` ordering + dedupe, and a `transcript-segment` case in
     `useBackendEvents.test.tsx`.
   - **Verification pending on Windows:** `bun test` + `bun run build`.
+
+- **2026-06-30 — F4 built (SOAP note generation UI).** Generate → stream → edit →
+  version-revert:
+  - **Divergence (backend gap, resolved): no command exposed a record's notes.**
+    Design §9.5 says GENERATING→IDLE "loads the active note" and §8.5 requires version
+    revert, but §9.4 listed no note-read command and `open_record` returns only the
+    `Record`. Added a `list_notes(record_id) -> Vec<Note>` Tauri command (mirrors
+    `list_records`, wraps the existing `store.list_notes`, newest-first) and registered
+    it. It covers both "load the active note" (the `is_active` row) and the revertable
+    history. Same pattern as the earlier settings-command gap.
+  - State: `notes` slice gained `appendStreamingToken` (accumulates `generation-token`
+    into `streamingNote`); `useBackendEvents` now subscribes `generation-token`.
+  - `lib/soap.ts`: pure `parseSoap`/`serializeSoap` between the backend's four-`##`-header
+    markdown and `{subjective,objective,assessment,plan}` (round-trips byte-compatibly;
+    empty section → bare header, per the prompt contract).
+  - `components/SoapEditor.tsx`: four labeled textareas for the active note; edits
+    debounce-save (600 ms) via `update_note` with the sections reassembled to markdown,
+    flushing on unmount and on note switch (regenerate/revert) so no edit is lost.
+  - `components/NotePanel.tsx`: Generate/Regenerate (creates a new active version) +
+    Cancel; live streaming `<pre>` during GENERATING; the four-section editor + a version
+    list with per-version Revert otherwise. Loads notes via `list_notes` after a
+    generation resolves (non-null id) and after a revert. Mounted in `RecordingView`.
+  - `RecordingControls.onStart` also clears `notes`/`streamingNote` for a fresh consult.
+  - Tests: `lib/soap.test.ts` (parse/serialize round-trip + bare header), `SoapEditor.test.tsx`
+    (renders 4 sections, debounced `update_note` with reassembled markdown, unmount flush),
+    `NotePanel.test.tsx` (generate→list_notes→editor, streaming view + cancel, revert→
+    `revert_version`), plus store `appendStreamingToken` and a `generation-token` case in
+    `useBackendEvents.test.tsx`.
+  - **Verification pending on Windows:** `bun run test` + `bun run build`; `cargo test`
+    for the new `list_notes` command.

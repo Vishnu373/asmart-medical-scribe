@@ -150,6 +150,7 @@ pub fn run() {
             commands::update_transcript,
             commands::list_records,
             commands::open_record,
+            commands::list_notes,
             commands::delete_record,
             commands::generate_note,
             commands::regenerate_note,

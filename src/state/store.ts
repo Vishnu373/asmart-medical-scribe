@@ -55,12 +55,14 @@ interface TranscriptSlice {
 }
 
 interface NotesSlice {
-  /** All note versions for the open record (§8.5). */
+  /** All note versions for the open record, newest first (§8.5). */
   notes: Note[];
   /** Tokens accumulated during GENERATING (§8.5). */
   streamingNote: string;
   setNotes: (notes: Note[]) => void;
   setStreamingNote: (text: string) => void;
+  /** Append a streamed `generation-token` to the live note (§9.5). */
+  appendStreamingToken: (text: string) => void;
 }
 
 interface RecordsSlice {
@@ -133,6 +135,7 @@ export const useAppStore = create<AppStore>((set) => ({
   streamingNote: "",
   setNotes: (notes) => set({ notes }),
   setStreamingNote: (streamingNote) => set({ streamingNote }),
+  appendStreamingToken: (text) => set((s) => ({ streamingNote: s.streamingNote + text })),
 
   // Records
   records: [],

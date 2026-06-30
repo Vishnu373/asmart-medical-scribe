@@ -6,7 +6,7 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { Record, RecordSummary, Settings, SoapSection } from "@/bridge/types";
+import type { Note, Record, RecordSummary, Settings, SoapSection } from "@/bridge/types";
 
 /** Round-trips a message through the backend to verify the bridge is wired. */
 export function ping(message: string): Promise<string> {
@@ -59,6 +59,11 @@ export function updateNote(id: string, soapData: string): Promise<void> {
 
 export function revertVersion(recordId: string, noteId: string): Promise<void> {
   return invoke("revert_version", { recordId, noteId });
+}
+
+/** A record's note versions, newest first; the `is_active` one is current (§8.5). */
+export function listNotes(recordId: string): Promise<Note[]> {
+  return invoke<Note[]>("list_notes", { recordId });
 }
 
 // — Records (FR-13)

@@ -10,7 +10,7 @@ use tauri::State;
 
 use crate::orchestrator::Coordinator;
 use crate::settings::{Settings, SharedSettings};
-use crate::store::{Record, RecordSummary, SharedStore};
+use crate::store::{Note, Record, RecordSummary, SharedStore};
 
 /// Echoes a message back to the frontend with a prefix, proving the bridge works.
 #[tauri::command]
@@ -67,6 +67,14 @@ pub fn list_records(store: State<'_, SharedStore>) -> Result<Vec<RecordSummary>,
 #[tauri::command]
 pub fn open_record(store: State<'_, SharedStore>, id: String) -> Result<Option<Record>, String> {
     store.lock().open_record(&id).map_err(|e| e.to_string())
+}
+
+/// List a record's note versions, newest first; the `is_active` row is the
+/// current note and the rest are the revertable history (§8.5). The frontend
+/// loads these after a record opens and after GENERATING→IDLE (design §9.5).
+#[tauri::command]
+pub fn list_notes(store: State<'_, SharedStore>, record_id: String) -> Result<Vec<Note>, String> {
+    store.lock().list_notes(&record_id).map_err(|e| e.to_string())
 }
 
 /// Permanently delete a record and its notes (cascade via FK; NFR-9, §9.4).

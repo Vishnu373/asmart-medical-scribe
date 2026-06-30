@@ -18,6 +18,8 @@ export default function RecordingControls() {
   const setInputLevel = useAppStore((s) => s.setInputLevel);
   const setSegments = useAppStore((s) => s.setSegments);
   const setTranscript = useAppStore((s) => s.setTranscript);
+  const setNotes = useAppStore((s) => s.setNotes);
+  const setStreamingNote = useAppStore((s) => s.setStreamingNote);
   const setCurrentRecordId = useAppStore((s) => s.setCurrentRecordId);
   const pushToast = useAppStore((s) => s.pushToast);
 
@@ -32,9 +34,11 @@ export default function RecordingControls() {
 
   const onStart = () =>
     run(async () => {
-      // Clear the previous session's transcript before a fresh consult.
+      // Clear the previous session's transcript and note before a fresh consult.
       setSegments([]);
       setTranscript("");
+      setNotes([]);
+      setStreamingNote("");
       setCurrentRecordId(null);
       await startRecording();
       setPaused(false);

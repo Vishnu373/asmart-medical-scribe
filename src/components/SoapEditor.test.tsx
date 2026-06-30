@@ -1,0 +1,54 @@
+import { describe, it, expect, beforeEach, vi } from "vitest";
+import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { invoke } from "@tauri-apps/api/core";
+import SoapEditor from "@/components/SoapEditor";
+import type { Note } from "@/bridge";
+
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue(null) }));
+const mockInvoke = vi.mocked(invoke);
+
+const note: Note = {
+  id: "n1",
+  record_id: "r1",
+  soap_data: "## Subjective\ncough\n\n## Objective\n\n## Assessment\n\n## Plan\nrest",
+  created_at: 0,
+  is_active: true,
+};
+
+beforeEach(() => mockInvoke.mockClear().mockResolvedValue(null));
+
+describe("SoapEditor", () => {
+  it("renders the four sections parsed from soap_data", () => {
+    render(<SoapEditor note={note} />);
+    expect(screen.getByRole("textbox", { name: "Subjective" })).toHaveValue("cough");
+    expect(screen.getByRole("textbox", { name: "Plan" })).toHaveValue("rest");
+    expect(screen.getByRole("textbox", { name: "Objective" })).toHaveValue("");
+  });
+
+  it("debounce-saves edits via update_note with reassembled markdown", async () => {
+    vi.useFakeTimers();
+    render(<SoapEditor note={note} />);
+    fireEvent.change(screen.getByRole("textbox", { name: "Objective" }), {
+      target: { value: "temp 38" },
+    });
+    expect(mockInvoke).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(600);
+    expect(mockInvoke).toHaveBeenCalledWith("update_note", {
+      id: "n1",
+      soapData: "## Subjective\ncough\n\n## Objective\ntemp 38\n\n## Assessment\n\n## Plan\nrest",
+    });
+    vi.useRealTimers();
+  });
+
+  it("flushes a pending edit on unmount", () => {
+    render(<SoapEditor note={note} />);
+    fireEvent.change(screen.getByRole("textbox", { name: "Plan" }), {
+      target: { value: "follow up" },
+    });
+    cleanup();
+    expect(mockInvoke).toHaveBeenCalledWith(
+      "update_note",
+      expect.objectContaining({ id: "n1" }),
+    );
+  });
+});
