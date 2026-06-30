@@ -286,12 +286,12 @@ renders; `ping` works through the typed bridge.
 **Verification:** RTL — controls dispatch correct commands; meter reacts to mocked
 `input-level`; state label follows `state-changed`.
 
-### Phase F3 — Live transcript editor  `[ ] not started`
+### Phase F3 — Live transcript editor  `[x] done`
 **Goal:** Render streaming segments and allow edits saved via `update_transcript`.
 **Depends on:** B6, B8, F2
 **Tasks:**
-- [ ] Append `transcript-segment{seq,text}` in `seq` order; live-growing view.
-- [ ] Editable transcript; debounced save to `update_transcript`.
+- [x] Append `transcript-segment{seq,text}` in `seq` order; live-growing view.
+- [x] Editable transcript; debounced save to `update_transcript`.
 **Deliverables:** `TranscriptEditor`.
 **Verification:** RTL — segments render in order from mocked events; edit → save
 invoked with merged text.
@@ -829,4 +829,23 @@ hotkey without focus steal and pastes the chosen section.
     the returned record id, pause→Resume, rejected command→toast, status follows state,
     meter bar count = bucket count), `useBackendEvents.test.tsx` (events update the
     store), plus the event-module mock added to `App.test.tsx`.
+  - **Verification pending on Windows:** `bun test` + `bun run build`.
+
+- **2026-06-30 — F3 built (Live transcript editor).** Streaming segments → editable,
+  debounced-saved transcript:
+  - State: added `addSegment` to the transcript slice — inserts a `transcript-segment`
+    in `seq` order (dedupes a repeated `seq` from STT retries) and mirrors the ordered
+    segments into the editable `transcript` buffer. Segments only stream during
+    RECORDING, so this never clobbers post-stop manual edits.
+  - `hooks/useBackendEvents.ts`: now also subscribes `transcript-segment` → `addSegment`.
+  - `components/TranscriptEditor.tsx`: a textarea bound to `transcript`; user edits
+    debounce-save (600 ms) via `update_transcript`, guarded on `currentRecordId` (only
+    set once `stop_recording` returns) — matching the record → stop → edit flow. Mounted
+    in `RecordingView` (replaces the F3 placeholder).
+  - `RecordingControls.onStart` clears the prior session's `segments`/`transcript`/
+    `currentRecordId` before a fresh consult.
+  - Tests: `TranscriptEditor.test.tsx` (renders merged text; debounced save fires with
+    merged text once a record id exists; no save without a record id), store tests for
+    `addSegment` ordering + dedupe, and a `transcript-segment` case in
+    `useBackendEvents.test.tsx`.
   - **Verification pending on Windows:** `bun test` + `bun run build`.

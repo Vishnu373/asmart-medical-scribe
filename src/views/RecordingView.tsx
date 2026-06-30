@@ -2,9 +2,10 @@ import { useAppStore } from "@/state";
 import RecordingControls from "@/components/RecordingControls";
 import StatusBadge from "@/components/StatusBadge";
 import LevelMeter from "@/components/LevelMeter";
+import TranscriptEditor from "@/components/TranscriptEditor";
 
-/** Recording view: controls, live status and input-level meter (FR-4, FR-12).
- *  The live transcript editor lands on top of this in F3. */
+/** Recording view: controls, live status, input-level meter and the live,
+ *  editable transcript (FR-4, FR-5, FR-12). */
 export default function RecordingView() {
   const recordingState = useAppStore((s) => s.recordingState);
   const paused = useAppStore((s) => s.paused);
@@ -23,7 +24,7 @@ export default function RecordingView() {
 
       <RecordingControls />
 
-      <p className="text-sm text-neutral-500">The live transcript appears here (F3).</p>
+      <TranscriptEditor />
     </section>
   );
 }

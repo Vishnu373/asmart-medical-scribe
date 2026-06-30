@@ -44,10 +44,12 @@ interface RecordingSlice {
 }
 
 interface TranscriptSlice {
-  /** Streamed segments for the live view (§9.5); ordering handled in F3. */
+  /** Streamed segments for the live view (§9.5), kept in `seq` order. */
   segments: TranscriptSegmentEvent[];
   /** The editable transcript text (saved via `update_transcript`). */
   transcript: string;
+  /** Append a streamed segment in `seq` order; mirrors it into `transcript`. */
+  addSegment: (segment: TranscriptSegmentEvent) => void;
   setSegments: (segments: TranscriptSegmentEvent[]) => void;
   setTranscript: (transcript: string) => void;
 }
@@ -114,6 +116,15 @@ export const useAppStore = create<AppStore>((set) => ({
   // Transcript
   segments: [],
   transcript: "",
+  addSegment: (segment) =>
+    set((s) => {
+      // Ignore a duplicate seq (STT retries), then keep segments ordered and
+      // mirror them into the editable buffer. Segments only stream during
+      // RECORDING, so this never clobbers post-stop manual edits.
+      if (s.segments.some((x) => x.seq === segment.seq)) return s;
+      const segments = [...s.segments, segment].sort((a, b) => a.seq - b.seq);
+      return { segments, transcript: segments.map((x) => x.text).join(" ") };
+    }),
   setSegments: (segments) => set({ segments }),
   setTranscript: (transcript) => set({ transcript }),
 

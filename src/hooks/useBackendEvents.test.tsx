@@ -8,6 +8,7 @@ const captured = vi.hoisted(() => {
   return {} as {
     state?: (p: { state: string }) => void;
     level?: (p: { level: number[] }) => void;
+    segment?: (p: { seq: number; text: string }) => void;
     error?: (p: { code: string; message: string }) => void;
   };
 });
@@ -19,6 +20,10 @@ vi.mock("@/bridge", () => ({
   },
   onInputLevel: (h: (p: { level: number[] }) => void) => {
     captured.level = h;
+    return Promise.resolve(() => {});
+  },
+  onTranscriptSegment: (h: (p: { seq: number; text: string }) => void) => {
+    captured.segment = h;
     return Promise.resolve(() => {});
   },
   onError: (h: (p: { code: string; message: string }) => void) => {
@@ -33,7 +38,13 @@ function Probe() {
 }
 
 beforeEach(() =>
-  useAppStore.setState({ recordingState: "IDLE", inputLevel: [], toasts: [] }),
+  useAppStore.setState({
+    recordingState: "IDLE",
+    inputLevel: [],
+    segments: [],
+    transcript: "",
+    toasts: [],
+  }),
 );
 
 describe("useBackendEvents wires §9.5 events into the store", () => {
@@ -54,6 +65,13 @@ describe("useBackendEvents wires §9.5 events into the store", () => {
     act(() => captured.level!({ level: [0.1, 0.4] }));
     act(() => captured.state!({ state: "PROCESSING" }));
     expect(useAppStore.getState().inputLevel).toEqual([]);
+  });
+
+  it("transcript-segment appends to the transcript in order", () => {
+    render(<Probe />);
+    act(() => captured.segment!({ seq: 2, text: "world" }));
+    act(() => captured.segment!({ seq: 1, text: "hello" }));
+    expect(useAppStore.getState().transcript).toBe("hello world");
   });
 
   it("error pushes a toast", () => {

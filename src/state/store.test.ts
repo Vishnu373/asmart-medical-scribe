@@ -29,6 +29,24 @@ describe("app store slices", () => {
   });
 });
 
+describe("transcript slice", () => {
+  it("orders segments by seq and mirrors them into the transcript", () => {
+    const { addSegment } = useAppStore.getState();
+    addSegment({ seq: 2, text: "world" });
+    addSegment({ seq: 1, text: "hello" });
+    const s = useAppStore.getState();
+    expect(s.segments.map((x) => x.seq)).toEqual([1, 2]);
+    expect(s.transcript).toBe("hello world");
+  });
+
+  it("ignores a duplicate seq", () => {
+    const { addSegment } = useAppStore.getState();
+    addSegment({ seq: 1, text: "hello" });
+    addSegment({ seq: 1, text: "hello-again" });
+    expect(useAppStore.getState().segments).toHaveLength(1);
+  });
+});
+
 describe("toast slice coalesces and caps", () => {
   it("collapses repeat alerts into one toast with a count", () => {
     const { pushToast } = useAppStore.getState();

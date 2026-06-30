@@ -16,6 +16,8 @@ export default function RecordingControls() {
   const paused = useAppStore((s) => s.paused);
   const setPaused = useAppStore((s) => s.setPaused);
   const setInputLevel = useAppStore((s) => s.setInputLevel);
+  const setSegments = useAppStore((s) => s.setSegments);
+  const setTranscript = useAppStore((s) => s.setTranscript);
   const setCurrentRecordId = useAppStore((s) => s.setCurrentRecordId);
   const pushToast = useAppStore((s) => s.pushToast);
 
@@ -30,6 +32,10 @@ export default function RecordingControls() {
 
   const onStart = () =>
     run(async () => {
+      // Clear the previous session's transcript before a fresh consult.
+      setSegments([]);
+      setTranscript("");
+      setCurrentRecordId(null);
       await startRecording();
       setPaused(false);
     });
