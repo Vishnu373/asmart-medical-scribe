@@ -124,16 +124,13 @@ pub fn run() {
             app.manage(Arc::new(coordinator));
             app.manage(store);
 
-            // EMR hand-off hotkey (§8.6): the rebindable paste key (default Alt+P)
-            // emits `handoff-requested`; the overlay window (F7) shows the picker.
-            // A registration failure (e.g. the combo is already taken) is non-fatal.
-            if let Err(e) = handoff::register_paste_hotkey(app.handle(), &app_settings.paste_hotkey)
-            {
-                log::warn!(
-                    "paste hotkey '{}' not registered: {e}",
-                    app_settings.paste_hotkey
-                );
-            }
+            // EMR hand-off (§8.6): the Alt+P global hotkey + no-activate picker
+            // overlay are deferred. v1 hand-off is manual — the clinician copies a
+            // SOAP section (per-section Copy button → `copy_to_clipboard`) and
+            // pastes it into the EMR with Ctrl+V. The `register_paste_hotkey` /
+            // `rebind_paste_hotkey` / `paste_section` machinery (B11) stays in place,
+            // dormant, for when the overlay is built. So no global shortcut is
+            // registered at startup.
 
             // Settings (§9.3) managed for the `get_settings`/`update_settings`
             // commands (§9.4). Takes ownership of the (residency-resolved) settings
@@ -162,6 +159,7 @@ pub fn run() {
             commands::list_input_devices,
             handoff::paste_section,
             handoff::rebind_paste_hotkey,
+            handoff::copy_to_clipboard,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

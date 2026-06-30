@@ -107,6 +107,16 @@ pub fn rebind_paste_hotkey(app: AppHandle, accelerator: String) -> Result<(), St
     register_paste_hotkey(&app, &accelerator)
 }
 
+/// Put plain text on the clipboard for manual paste into the EMR (F7 interim).
+/// The no-activate overlay + Alt+P auto-paste (§8.6) are deferred — the clinician
+/// instead copies a SOAP section and pastes it with Ctrl+V. No auto-clear here:
+/// unlike the hotkey path, the clinician controls when the paste happens, so a
+/// timed wipe could clear the text before they use it.
+#[tauri::command]
+pub fn copy_to_clipboard(app: AppHandle, text: String) -> Result<(), String> {
+    app.clipboard().write_text(text).map_err(|e| e.to_string())
+}
+
 /// Deliver a Ctrl+V keystroke to the focused window via the Win32 `SendInput` API
 /// (no extra dependency — reuses the `windows` crate already pulled in for DPAPI).
 #[cfg(windows)]

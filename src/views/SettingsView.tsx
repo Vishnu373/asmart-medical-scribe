@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getSettings, listInputDevices, rebindPasteHotkey, updateSettings } from "@/bridge";
+import { getSettings, listInputDevices, updateSettings } from "@/bridge";
 import type { InputDevice, Settings } from "@/bridge";
 import { useAppStore } from "@/state";
 
@@ -17,13 +17,13 @@ const RESIDENCY: { value: string; label: string }[] = [
   { value: "swap", label: "Swap models (lower RAM)" },
 ];
 
-const MODIFIERS = new Set(["Control", "Alt", "Shift", "Meta"]);
-
 /**
- * Settings view (§9.3, F6). The doctor-facing keys are deliberately few — model,
- * microphone, paste hotkey — plus the residency override. Internal keys
- * (`residency_mode`, `observed_total_ram`, VAD, idle timeout) are never shown and
- * are preserved across save by spreading the loaded object (read-modify-write).
+ * Settings view (§9.3, F6). The doctor-facing keys are model, microphone, and the
+ * residency override. (The paste-hotkey control is removed while EMR hand-off is
+ * manual copy/paste, F7; the persisted value is untouched for when the hotkey
+ * returns.) Internal keys (`residency_mode`, `observed_total_ram`, VAD, idle
+ * timeout) are never shown and are preserved across save by spreading the loaded
+ * object (read-modify-write).
  */
 export default function SettingsView() {
   const settings = useAppStore((s) => s.settings);
@@ -62,35 +62,10 @@ export default function SettingsView() {
     setSaved(false);
   };
 
-  // Capture a modifier+key combo (§9.3: rebindable 2-key hotkey). A lone key with
-  // no modifier is rejected so the paste hotkey can't collide with normal typing.
-  const onHotkeyKeyDown = (e: React.KeyboardEvent<HTMLInputElement>) => {
-    e.preventDefault();
-    if (MODIFIERS.has(e.key)) return; // still holding only modifiers
-    const mods: string[] = [];
-    if (e.ctrlKey) mods.push("Ctrl");
-    if (e.altKey) mods.push("Alt");
-    if (e.shiftKey) mods.push("Shift");
-    // Emit "Super" (not "Win") — the backend's accelerator parser only knows
-    // ALT/CTRL/SHIFT/COMMAND/SUPER; an unrecognized "Win" token would be treated
-    // as the main key and fail to register at launch.
-    if (e.metaKey) mods.push("Super");
-    if (mods.length === 0) {
-      pushToast("Hotkey must include a modifier (Ctrl, Alt, Shift or Win).", "info");
-      return;
-    }
-    const key = e.key.length === 1 ? e.key.toUpperCase() : e.key;
-    patch({ paste_hotkey: [...mods, key].join("+") });
-  };
-
   const onSave = async () => {
     try {
       await updateSettings(form);
       setSettings(form);
-      // Re-register the global hotkey so a rebind applies live (§8.6) instead of
-      // only after the next launch. A failure here (combo already taken) is
-      // surfaced but doesn't undo the saved settings.
-      await rebindPasteHotkey(form.paste_hotkey);
       setSaved(true);
     } catch (e) {
       pushToast(String(e), "error");
@@ -133,21 +108,6 @@ export default function SettingsView() {
             </option>
           ))}
         </select>
-      </label>
-
-      <label className="flex flex-col gap-1">
-        <span className="text-sm font-medium text-neutral-200">Paste hotkey</span>
-        <input
-          aria-label="Paste hotkey"
-          readOnly
-          value={form.paste_hotkey}
-          onKeyDown={onHotkeyKeyDown}
-          placeholder="Focus and press a combo (e.g. Alt+P)"
-          className="w-48 cursor-pointer rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-600 focus:outline-none"
-        />
-        <span className="text-xs text-neutral-500">
-          Used to paste a SOAP section into the focused EMR field.
-        </span>
       </label>
 
       <label className="flex flex-col gap-1">

@@ -326,15 +326,17 @@ commands.
 **Deliverables:** `SettingsView`.
 **Verification:** RTL — load/save round-trip; invalid input guarded.
 
-### Phase F7 — Hand-off overlay UI  `[ ] not started`
-**Goal:** The no-activate S/O/A/P picker overlay window.
+### Phase F7 — EMR hand-off (manual copy/paste)  `[x] done`
+**Goal:** Get a SOAP section into the EMR. **Scope changed (user decision):** the
+no-activate Alt+P picker overlay is deferred; v1 hand-off is manual copy/paste.
 **Depends on:** B11, F4
 **Tasks:**
-- [ ] `overlay/` entry window; S/O/A/P picker calling `paste_section`.
-- [ ] Minimal always-on-top styling; keyboard navigable.
-**Deliverables:** overlay window + picker.
-**Verification:** RTL on the picker component; manual Windows: overlay appears via
-hotkey without focus steal and pastes the chosen section.
+- [x] ~~`overlay/` entry window; S/O/A/P picker calling `paste_section`~~ →
+      per-section **Copy** button → `copy_to_clipboard`; clinician pastes with Ctrl+V.
+- [x] ~~Minimal always-on-top styling; keyboard navigable~~ → Alt+P global hotkey
+      not registered at startup (B11 machinery left dormant).
+**Deliverables:** per-section Copy buttons in `SoapEditor`; `copy_to_clipboard` command.
+**Verification:** RTL — Copy invokes `copy_to_clipboard` with the section text.
 
 ## Progress Log
 
@@ -945,3 +947,26 @@ hotkey without focus steal and pastes the chosen section.
   is toasted without undoing the saved settings. Also fixed the Meta-key token: the
   capture now emits `Super` (the accelerator parser has no `Win` arm). Test updated to
   assert the `rebind_paste_hotkey` call on save.
+
+- **2026-06-30 — F7 built (manual EMR hand-off).** Scope changed by user decision: the
+  §8.6 no-activate overlay + Alt+P auto-paste are **deferred**. The clinically-correct
+  behavior (a pop-up that never steals focus so the EMR field keeps the caret, navigated
+  by backend-forwarded global keys) is largely native Windows-only work — WS_EX_NOACTIVATE
+  window styling Tauri config doesn't expose, plus a register/forward/unregister global-key
+  system B11 never built — none of which is verifiable on the Linux dev box. Rather than
+  ship unverifiable native code, v1 hand-off is **manual**:
+  - `SoapEditor`: a per-section **Copy** button copies that section's current (live, incl.
+    unsaved) text to the clipboard; the clinician pastes into the focused EMR field with
+    Ctrl+V. Disabled for empty sections; toasts '<Section> copied'.
+  - Backend `handoff::copy_to_clipboard(text)` (clipboard write, no keystroke, no auto-clear
+    — the clinician controls paste timing, so a timed wipe could clear it too early) +
+    registered + bridge `copyToClipboard`.
+  - **Alt+P removed for now:** the startup `register_paste_hotkey` call is gone, so no global
+    shortcut is grabbed. B11's `paste_section`/`register_paste_hotkey`/`rebind_paste_hotkey`
+    stay in place, dormant, for when the overlay is built. The F6 Settings paste-hotkey
+    control + its live-rebind-on-save were removed (the value still persists in settings for
+    the future); SettingsView tests updated accordingly.
+  - Tests: `SoapEditor.test.tsx` — Copy invokes `copy_to_clipboard` with the section text.
+  - **Follow-up (when on Windows):** build the real no-activate overlay + global-key nav +
+    record-id plumbing to restore the one-key §8.6 hand-off.
+  - **Verification pending on Windows:** `bun run test` + `bun run build`; `cargo test`.

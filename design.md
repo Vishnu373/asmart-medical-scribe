@@ -613,7 +613,7 @@ A single threshold at 16 GB governs the choice. Below it, Phi defaults to the hi
 - **Display** — rendered as a formatted document in the UI (like a markdown preview), so the clinician sees an ordinary-looking note rather than raw `##`/`**` markers.
 - **Edit** — the clinician edits in-app (§8.1); the note stays markdown throughout.
 - **Store & version** — markdown is plain text, so persistence and versioning (§8.5) are trivial.
-- **EMR hand-off** — at paste time (§8.6) the fixed headers let a **deterministic parser** split the note into per-section text, and markdown markers are stripped to plain text. This is ordinary string processing — **no JSON, no grammar constraint, and no AI post-processing step.**
+- **EMR hand-off** — at copy time (§8.6) the fixed headers let a **deterministic parser** split the note into per-section text, and markdown markers are stripped to plain text. This is ordinary string processing — **no JSON, no grammar constraint, and no AI post-processing step.**
 
 Choosing markdown over JSON/GBNF keeps generation robust (no broken-JSON failure mode), gives a natural document for the clinician, and still yields structured sections via header parsing when needed.
 
@@ -714,36 +714,31 @@ This section covers how the streamed note reaches the screen and how it is store
 
 ### 8.6 EMR hand-off
 
-v1 has no direct EMR integration. The note is delivered into the clinician's EMR (web or desktop) by a **global hotkey** that pastes a chosen section into whichever field the clinician has focused. Automatic field detection and mapping is deferred (see Future Considerations).
+v1 has no direct EMR integration, and the automated paste **hotkey is deferred to Future Considerations (§13)**. The clinician moves the note into their EMR (web or desktop) by **manual copy/paste**, section by section.
 
 **Flow.**
 
-1. The clinician clicks the target field in their EMR (so the cursor is in it).
-2. They press the global paste hotkey **Alt+P**.
-3. A small section picker appears — **Subjective / Objective / Assessment / Plan** — navigable by keyboard.
-4. They select a section; **only that section's text** (plain text, markdown stripped) is pasted into the focused field.
-5. The picker can be reused field-by-field; already-pasted sections are **greyed out** so the clinician can track what remains.
+1. The note is shown as four editable sections — **Subjective / Objective / Assessment / Plan** (§8.5).
+2. The clinician clicks **Copy** on a section; that section's text (plain text) is placed on the clipboard.
+3. They click the target field in their EMR and paste with **Ctrl+V**.
+4. They repeat per field, pasting sections in whatever order their EMR layout needs.
 
-**Single hotkey, latest note.** There is no separate "copy/stage" step — **Alt+P always acts on the current active note version** (§8.5). If the note is edited or regenerated between pastes, subsequent sections reflect the latest content. This keeps the interaction to one hotkey at the cost of not freezing a snapshot mid-hand-off (an accepted trade-off, since the clinician controls when they edit).
+**Note source.** Copy acts on the **current on-screen section text, including unsaved edits** — so the pasted content is always the latest, with no separate freeze/stage step.
 
-**Focus preservation (key constraint).** The paste must land in the EMR field the clinician selected, but a normal pop-up window would steal focus from that field when the picker appears — sending the paste nowhere useful. The picker is therefore shown as a **non-activating, always-on-top overlay** (a no-activate pop-up on Windows): it never takes focus, so the EMR field keeps the caret throughout. The clinician navigates the picker via globally-captured keystrokes, and the paste (clipboard + simulated Ctrl+V) is delivered while the EMR field is still focused.
+**Section text.** Each section is copied as **plain text** (the body under its `##` header, §8.3), since EMR fields are plain-text boxes.
 
-**Section pasting.** The four `##` SOAP headers let a **deterministic parser** (§8.3) isolate each section's body. Markdown markers are stripped so the EMR receives plain text, since EMR fields are plain-text boxes.
-
-**Clipboard hygiene.** Each paste places PHI on the system clipboard, which is readable by any process. The clipboard is therefore **automatically cleared a few seconds after the paste**, limiting how long the section's text lingers in a globally-readable buffer.
+**No clipboard auto-clear in v1.** A copied section places PHI on the system clipboard, which is readable by any process. Because the clinician controls **when** they paste, the app does **not** time-wipe the clipboard — a timed clear could remove the text before they use it. Trade-off: a copied section lingers on the clipboard until overwritten or cleared by the clinician. (The deferred hotkey hand-off restores auto-clear, since there the paste timing is known — §13.)
 
 **Decisions:**
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Delivery mechanism | Global hotkey paste into focused EMR field | v1 has no EMR API integration |
-| Hotkey | Single **Alt+P**; opens a section picker | One key; section chosen at paste time |
-| Note source | Always the current active note version; no freeze/stage step | One hotkey; reflects latest edits |
-| Section selection | Keyboard-navigable picker (S/O/A/P); pasted sections greyed out | Matches EMR's per-field structure; tracks progress |
-| Focus handling | Non-activating always-on-top overlay; EMR field keeps the caret | Paste must land in the field the clinician selected |
-| Paste format | Plain text, markdown stripped (deterministic parser, §8.3) | EMR fields are plain text |
-| Clipboard | Auto-clear a few seconds after paste | Limits PHI exposure in the shared clipboard |
-| Field auto-mapping | Deferred to Future Considerations | Out of scope for v1 |
+| Delivery mechanism | Manual per-section **Copy** button → **Ctrl+V** into the EMR field | v1 has no EMR API integration; the one-key hotkey hand-off is deferred (§13) |
+| Note source | Current on-screen section text (incl. unsaved edits); no freeze/stage step | Reflects the latest edits |
+| Section format | Plain text, one section per Copy | EMR fields are plain text; clinician pastes field by field |
+| Clipboard | No auto-clear in v1 | Manual paste timing is unknown; a timed wipe could clear it too early |
+| One-key hotkey paste | Deferred to Future Considerations (§13) | Needs native Windows no-activate + global-key work best built/verified on Windows |
+| Field auto-mapping | Deferred to Future Considerations (§13) | Out of scope for v1 |
 
 ## 9. Data Model & Interfaces
 
@@ -790,7 +785,7 @@ Doctor-facing settings are deliberately minimal (Model, Microphone, Paste key). 
 |-----|-----------|---------|
 | `model_choice` | **Doctor** | `best` (Mistral-7B) / `medium` (Phi-3.5 Q8) / `okay` (Phi-3.5 Q4); options the machine can't run are greyed out (§7) |
 | `mic_device` | **Doctor** | Selected input device |
-| `paste_hotkey` | **Doctor** | Rebindable (any 2-key combo); default **Alt+P** |
+| `paste_hotkey` | internal (v1) | Rebindable (any 2-key combo); default **Alt+P**. Persisted but **not surfaced in v1** — the doctor-facing rebind control returns with the deferred hotkey hand-off (§13) |
 | `residency_mode` | internal | Co-resident vs swap, decided once (§7) |
 | `observed_total_ram` | internal | Cached probe; re-probed only on hardware change (§7) |
 | `vad_threshold` | internal | Fixed sensible default (§6.2) |
@@ -807,7 +802,7 @@ The backend owns all state; commands are requests, and state guards reject illeg
 | Notes | `generate_note`, `regenerate_note`, `cancel_generation`, `update_note`, `revert_version` | Produce/edit/cancel notes; flip the active version (§8.4–8.5) |
 | Records | `list_records`, `open_record`, `delete_record` | Saved-encounter browsing (FR-13); `delete_record` is permanent (NFR-9) |
 | Settings | `get_settings`, `update_settings` | Read/patch the JSON store, including mic device |
-| Hand-off | `paste_section` | Paste a chosen SOAP section into the focused EMR field (§8.6) |
+| Hand-off | `copy_to_clipboard` | Copy a SOAP section's plain text to the clipboard for manual paste into the EMR (§8.6). `paste_section` (one-key hotkey paste) is built but dormant, reserved for the deferred overlay (§13) |
 
 ### 9.5 Tauri events (backend → UI `emit`)
 
@@ -913,7 +908,8 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 
 | Item | What it adds | Why deferred from v1 |
 |------|--------------|----------------------|
-| **EMR integration** | Direct integration with the EMR (field auto-mapping or an EMR API) instead of the manual section-picker paste | v1 has no EMR API integration; the keyboard hand-off (§8.6) is reliable and EMR-agnostic |
+| **One-key EMR paste (no-activate overlay)** | A global hotkey (default **Alt+P**) that opens a non-activating, always-on-top **S/O/A/P picker** and pastes the chosen section into the focused EMR field (clipboard + simulated Ctrl+V), with clipboard auto-clear and already-pasted sections greyed out | Needs native Windows-specific work — see the technical note below. v1 ships **manual copy/paste** (§8.6) instead, which is reliable and needs no native focus handling |
+| **EMR integration** | Direct integration with the EMR (field auto-mapping or an EMR API) instead of manual paste | v1 has no EMR API integration; the manual hand-off (§8.6) is reliable and EMR-agnostic |
 | **Fine-tuned models** | Note model fine-tuned on SOAP datasets for more consistent output | Few-shot prompting (§8.3) is a cheaper, reversible lever; no evidence yet that fine-tuning is needed |
 | **AI engineering for larger context** | Context-handling techniques (e.g. chunking, summarization, retrieval) for transcripts that exceed the model window | The model window far exceeds a realistic consult (§8.3), so the whole transcript fits in one prompt today; needed only for much longer inputs |
 | **Selectable alternate STT engine** | A user-selectable higher-accuracy / weaker-hardware STT option (e.g. a Whisper-family model) alongside the default Parakeet engine | A native-build constraint, not a product objection — see the note below. Parakeet (§6.4) covers EN+FR well, so a second engine is a refinement, not a v1 need |
@@ -921,3 +917,5 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 **Why the alternate STT engine is deferred (technical note).** The default STT engine (Parakeet) runs on an **ONNX** runtime, while the note-generation LLM (§8) runs on **llama.cpp**. A Whisper-family STT engine would run on **whisper.cpp**. Both whisper.cpp and llama.cpp statically embed their *own* copy of the same low-level tensor library (**ggml**); linking both into one executable produces duplicate-symbol link errors, so they cannot coexist in a single binary. v1 therefore ships exactly one ggml consumer — the LLM — and an ONNX-based STT (Parakeet) that carries no ggml, which links cleanly.
 
 Adding a whisper-based engine later is still possible without this conflict by running one engine **out-of-process** (a separate child process the app talks to locally), so each binary embeds its own ggml independently. That isolation pairs naturally with the **swap** residency mode (§7) — the alternate engine and the LLM would load one at a time, with the clinician shown a brief, plain-language "this may add a short delay" notice at the hand-off rather than any technical detail. This is a known, accepted limitation of the current single-binary design.
+
+**Why the one-key EMR paste is deferred (technical note).** The hotkey hand-off's core requirement is **focus preservation**: the paste must land in the EMR field the clinician selected, so the picker must appear **without stealing focus** from that field. A normal pop-up window activates when shown — Windows moves keyboard focus to it, the EMR field loses the caret, and the simulated Ctrl+V then pastes nowhere useful. Solving this needs two pieces of native, Windows-specific work: (1) a **non-activating, always-on-top overlay** — the Win32 `WS_EX_NOACTIVATE` extended window style, which the app framework does not expose and which must be set on the window handle directly; and (2) because a window that never holds focus also never receives keyboard events, the picker can't be driven by ordinary in-page key handling — the navigation keys (S/O/A/P, arrows, Enter, Esc) must be captured **globally by the backend** while the overlay is visible and **forwarded** to it, then unregistered when it closes. Both pieces only do anything on a real Windows machine and can't be validated on the Linux/WSL build host, so they are best built and verified in a Windows session. v1 therefore ships the **manual copy/paste** hand-off (§8.6); the backend command surface for the hotkey path (`paste_section`, global-shortcut registration) is built but dormant, so adding the overlay later is additive rather than a rework.

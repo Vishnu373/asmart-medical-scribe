@@ -106,11 +106,11 @@ export function listInputDevices(): Promise<InputDevice[]> {
 
 // — Hand-off (§8.6)
 
-export function pasteSection(recordId: string, section: SoapSection): Promise<void> {
-  return invoke("paste_section", { recordId, section });
+/** Copy a SOAP section's plain text to the clipboard for manual EMR paste (F7 interim). */
+export function copyToClipboard(text: string): Promise<void> {
+  return invoke("copy_to_clipboard", { text });
 }
 
-/** Re-register the global paste hotkey so a Settings rebind applies without restart (§8.6). */
-export function rebindPasteHotkey(accelerator: string): Promise<void> {
-  return invoke("rebind_paste_hotkey", { accelerator });
+export function pasteSection(recordId: string, section: SoapSection): Promise<void> {
+  return invoke("paste_section", { recordId, section });
 }

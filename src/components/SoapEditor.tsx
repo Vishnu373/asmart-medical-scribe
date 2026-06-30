@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
-import { updateNote, type Note } from "@/bridge";
+import { copyToClipboard, updateNote, type Note } from "@/bridge";
 import { useAppStore } from "@/state";
-import { parseSoap, serializeSoap, SOAP_ORDER, type SoapSections } from "@/lib/soap";
+import { parseSoap, serializeSoap, stripMarkdown, SOAP_ORDER, type SoapSections } from "@/lib/soap";
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -53,13 +53,39 @@ export default function SoapEditor({ note }: { note: Note }) {
     timer.current = setTimeout(flush, SAVE_DEBOUNCE_MS);
   };
 
+  // Manual EMR hand-off (F7): copy this section's current text so the clinician
+  // can paste it into the focused EMR field with Ctrl+V. Copies the live editor
+  // value (unsaved edits included), with markdown stripped to plain text so it
+  // matches the dormant native paste path byte-for-byte (§8.6).
+  const onCopy = (key: keyof SoapSections) => {
+    const text = stripMarkdown(sections[key]);
+    if (!text) return;
+    copyToClipboard(text)
+      .then(() => pushToast(`${LABEL[key]} copied`, "info"))
+      .catch((e) => pushToast(String(e), "error"));
+  };
+
   return (
     <div className="flex flex-col gap-4">
       {SOAP_ORDER.map((key) => (
-        <label key={key} className="flex flex-col gap-1">
-          <span className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
-            {LABEL[key]}
-          </span>
+        // A plain <div>, not <label>: a <label> binds to its first labelable
+        // descendant, which would be the Copy <button> — hijacking its accessible
+        // name. The textarea carries its own aria-label, so no wrapper label is
+        // needed.
+        <div key={key} className="flex flex-col gap-1">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wide text-neutral-400">
+              {LABEL[key]}
+            </span>
+            <button
+              type="button"
+              onClick={() => onCopy(key)}
+              disabled={!sections[key].trim()}
+              className="rounded border border-neutral-700 px-2 py-0.5 text-xs hover:bg-neutral-800 disabled:opacity-40"
+            >
+              Copy
+            </button>
+          </div>
           <textarea
             aria-label={LABEL[key]}
             value={sections[key]}
@@ -67,7 +93,7 @@ export default function SoapEditor({ note }: { note: Note }) {
             rows={3}
             className="resize-none rounded-md border border-neutral-800 bg-neutral-900 p-2 text-sm leading-relaxed text-neutral-100 focus:border-neutral-600 focus:outline-none"
           />
-        </label>
+        </div>
       ))}
     </div>
   );

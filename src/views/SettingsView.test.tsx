@@ -53,22 +53,6 @@ describe("SettingsView", () => {
     expect(mockInvoke).toHaveBeenCalledWith("update_settings", {
       settings: { ...settings, model_choice: "best" },
     });
-    // Rebinds the global hotkey live so the change applies without a restart.
-    expect(mockInvoke).toHaveBeenCalledWith("rebind_paste_hotkey", { accelerator: "Alt+P" });
     expect(await screen.findByText("Saved.")).toBeInTheDocument();
-  });
-
-  it("captures a modifier+key combo into the paste hotkey", async () => {
-    render(<SettingsView />);
-    const hotkey = await screen.findByLabelText<HTMLInputElement>("Paste hotkey");
-    await userEvent.type(hotkey, "{Control>}k{/Control}");
-    expect(hotkey).toHaveValue("Ctrl+K");
-  });
-
-  it("rejects a hotkey with no modifier", async () => {
-    render(<SettingsView />);
-    const hotkey = await screen.findByLabelText<HTMLInputElement>("Paste hotkey");
-    await userEvent.type(hotkey, "k");
-    expect(hotkey).toHaveValue("Alt+P"); // unchanged
   });
 });

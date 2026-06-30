@@ -40,6 +40,33 @@ describe("SoapEditor", () => {
     vi.useRealTimers();
   });
 
+  it("copies a section's text to the clipboard for manual paste", () => {
+    render(<SoapEditor note={note} />);
+    // Buttons are in S/O/A/P order; the first (Subjective) has text, so it's enabled.
+    fireEvent.click(screen.getAllByRole("button", { name: "Copy" })[0]);
+    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", { text: "cough" });
+  });
+
+  it("strips markdown on copy so the EMR gets plain text", () => {
+    const md: Note = {
+      ...note,
+      soap_data:
+        "## Subjective\nPatient reports a **sore throat** for 3 days.\n\n" +
+        "## Objective\n- Temp 38.1 C\n- Throat erythematous\n\n" +
+        "## Assessment\n\n## Plan\n",
+    };
+    render(<SoapEditor note={md} />);
+    const buttons = screen.getAllByRole("button", { name: "Copy" });
+    fireEvent.click(buttons[0]); // Subjective: bold stripped
+    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
+      text: "Patient reports a sore throat for 3 days.",
+    });
+    fireEvent.click(buttons[1]); // Objective: bullet markers stripped
+    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
+      text: "Temp 38.1 C\nThroat erythematous",
+    });
+  });
+
   it("flushes a pending edit on unmount", () => {
     render(<SoapEditor note={note} />);
     fireEvent.change(screen.getByRole("textbox", { name: "Plan" }), {

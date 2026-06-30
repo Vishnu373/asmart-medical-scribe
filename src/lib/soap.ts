@@ -40,6 +40,24 @@ export function parseSoap(markdown: string): SoapSections {
   return buf;
 }
 
+/**
+ * Strip the markdown the generator may emit so the EMR (a plain-text field) gets
+ * clean text. Mirrors the backend `handoff::parser::strip_markdown` line-for-line:
+ * a leading unordered-list marker and bold (`**`/`__`) emphasis are removed;
+ * numbered prefixes are kept (clinical content, not markup). Manual Copy and the
+ * dormant native paste path must produce identical text (design §8.6 / §8.3).
+ */
+export function stripMarkdown(text: string): string {
+  return text
+    .split("\n")
+    .map((line) => {
+      const content = line.trim().replace(/^[-*+] /, "");
+      return content.replaceAll("**", "").replaceAll("__", "");
+    })
+    .join("\n")
+    .trim();
+}
+
 /** Reassemble the four sections into the canonical headered markdown. */
 export function serializeSoap(sections: SoapSections): string {
   return SOAP_ORDER.map((s) => {
