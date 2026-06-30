@@ -316,13 +316,13 @@ invoked with merged text.
 **Verification:** RTL — list renders from mocked data; open/delete invoke correct
 commands.
 
-### Phase F6 — Settings view  `[ ] not started`
+### Phase F6 — Settings view  `[x] done`
 **Goal:** Configure model, language, input device, hotkey, residency override.
 **Depends on:** B5, B9, F1
 **Tasks:**
-- [ ] Forms bound to `get_settings`/`update_settings`; STT/LLM model pickers;
+- [x] Forms bound to `get_settings`/`update_settings`; STT/LLM model pickers;
       language (EN/FR); input device (from B3 enumeration); residency override.
-- [ ] Hotkey rebinding control for hand-off.
+- [x] Hotkey rebinding control for hand-off.
 **Deliverables:** `SettingsView`.
 **Verification:** RTL — load/save round-trip; invalid input guarded.
 
@@ -904,3 +904,44 @@ hotkey without focus steal and pastes the chosen section.
   every non-active view button while `recordingState !== "IDLE"`, keeping the clinician
   on the Recording view until the session returns to IDLE. Test: `NavBar.test.tsx` (nav
   works when idle; Records is disabled and a no-op during RECORDING).
+
+- **2026-06-30 — F6 built (Settings view).** Doctor-facing config bound to
+  `get_settings`/`update_settings`:
+  - `views/SettingsView.tsx`: loads settings + the device list on mount into a local
+    edit buffer; **Save** spreads the loaded object so internal keys
+    (`residency_mode`/`observed_total_ram`/`residency_calc_version`/`vad_threshold`/
+    `idle_timeout`) survive the read-modify-write. Controls: Note model (best/medium/okay,
+    §9.3), Microphone (System default + enumerated devices; stores the chosen `name`,
+    null = default), Paste hotkey (focus-and-press capture, formats e.g. `Ctrl+K`), Model
+    residency override (Automatic/co_resident/swap).
+  - **Backend addition:** exposed `list_input_devices` as a Tauri command (`commands::
+    InputDevice { name, is_default }`, wraps the existing `audio_toolkit::list_input_devices`
+    dropping the non-serializable cpal handle) + registered it + bridge `listInputDevices`.
+    The enumeration existed since B3 but no §9.4 command surfaced it — same gap class as the
+    earlier `list_notes`/settings-command additions.
+  - Bridge: `InputDevice` type + `listInputDevices()` wrapper.
+  - **Divergences from the F6 task / design (surfaced, not silently filled):**
+    (i) **No language (EN/FR) picker** — `Settings` has no language field and §9.3 lists the
+    doctor keys as Model/Mic/Paste-key only; language is per-segment auto-detect (FR-5,
+    Parakeet) and was deferred at B5/B7, so there is nothing to bind. Not added.
+    (ii) **No greying of unrunnable model tiers** (§9.3 'options the machine can't run are
+    greyed out') — there is no per-choice feasibility query (B9 decides one mode, not
+    per-tier runnability); all three tiers stay selectable. Deferred.
+    (iii) **One model picker, not separate STT/LLM pickers** — the backend models a single
+    `model_choice`; STT (Parakeet) is fixed for v1.
+    (iv) `residency_override` is surfaced as a doctor control even though the §9.3 table omits
+    it; the `Settings` struct doc marks it doctor-facing and the F6 task lists it.
+  - Tests: `SettingsView.test.tsx` — load (settings + device list), save round-trip
+    asserting the merged full object (internal keys preserved), hotkey capture
+    (Ctrl+K), and the no-modifier guard (rejected, value unchanged).
+  - **Verification pending on Windows:** `bun run test` + `bun run build`; `cargo test`
+    for the new `list_input_devices` command (cpal enumeration needs the Windows host).
+
+- **2026-06-30 — F6 follow-up: live hotkey rebind.** `register_paste_hotkey` ran only
+  once at startup, so a Settings rebind needed an app relaunch to take effect. Added a
+  `rebind_paste_hotkey(accelerator)` Tauri command (`handoff/mod.rs`: `unregister_all`
+  then re-register) + registered it + bridge `rebindPasteHotkey`; `SettingsView.onSave`
+  calls it after persisting so the new combo binds live. A rebind failure (combo taken)
+  is toasted without undoing the saved settings. Also fixed the Meta-key token: the
+  capture now emits `Super` (the accelerator parser has no `Win` arm). Test updated to
+  assert the `rebind_paste_hotkey` call on save.

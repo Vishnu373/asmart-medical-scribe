@@ -4,8 +4,33 @@ import userEvent from "@testing-library/user-event";
 import App from "@/App";
 import { useAppStore } from "@/state";
 
-// Bridge calls go through `invoke`; the shell pings on mount and wires events.
-vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn().mockResolvedValue("pong: ready") }));
+// Bridge calls go through `invoke`. The mock is command-aware because mounting a
+// view (e.g. Settings) fires its own loads — `list_input_devices` must return an
+// array (the real backend always does), or `devices.map` throws during render.
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: vi.fn((cmd: string) => {
+    switch (cmd) {
+      case "ping":
+        return Promise.resolve("pong: ready");
+      case "list_input_devices":
+        return Promise.resolve([]);
+      case "get_settings":
+        return Promise.resolve({
+          model_choice: "medium",
+          mic_device: null,
+          paste_hotkey: "Alt+P",
+          residency_mode: null,
+          residency_override: null,
+          observed_total_ram: null,
+          residency_calc_version: null,
+          vad_threshold: 0.5,
+          idle_timeout: 30,
+        });
+      default:
+        return Promise.resolve(null);
+    }
+  }),
+}));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
 beforeEach(() => useAppStore.setState({ view: "recording" }));

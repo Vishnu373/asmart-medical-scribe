@@ -172,6 +172,32 @@ pub fn update_settings(
     state.update(settings).map_err(|e| e.to_string())
 }
 
+/// A microphone choice for the settings picker (FR-12). Display-only metadata —
+/// the live cpal handle stays in the backend; `mic_device` persists the chosen
+/// `name` (`None` = system default).
+#[derive(serde::Serialize)]
+pub struct InputDevice {
+    pub name: String,
+    pub is_default: bool,
+}
+
+/// Enumerate capture devices so the Settings view can populate the mic picker
+/// (§9.3 `mic_device`, FR-12). Wraps the existing audio-toolkit enumeration,
+/// dropping the non-serializable cpal handle.
+#[tauri::command]
+pub fn list_input_devices() -> Result<Vec<InputDevice>, String> {
+    crate::audio_toolkit::list_input_devices()
+        .map(|devs| {
+            devs.into_iter()
+                .map(|d| InputDevice {
+                    name: d.name,
+                    is_default: d.is_default,
+                })
+                .collect()
+        })
+        .map_err(|e| e.to_string())
+}
+
 /// Load a record's transcript for generation, rejecting a missing record or an
 /// empty transcript (§8.1 "Generate is disabled when the transcript is empty").
 fn load_transcript(store: &State<'_, SharedStore>, record_id: &str) -> Result<String, String> {

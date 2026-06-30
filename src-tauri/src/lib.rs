@@ -159,7 +159,9 @@ pub fn run() {
             commands::revert_version,
             commands::get_settings,
             commands::update_settings,
+            commands::list_input_devices,
             handoff::paste_section,
+            handoff::rebind_paste_hotkey,
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

@@ -93,6 +93,20 @@ pub fn register_paste_hotkey(app: &AppHandle, accelerator: &str) -> Result<(), S
         .map_err(|e| e.to_string())
 }
 
+/// Re-bind the paste hotkey at runtime (Settings save, §8.6). Clears the prior
+/// shortcut, then registers the new accelerator so a rebind takes effect without
+/// an app restart. The app only ever registers this one global shortcut, so an
+/// unconditional clear is safe.
+#[tauri::command]
+pub fn rebind_paste_hotkey(app: AppHandle, accelerator: String) -> Result<(), String> {
+    use tauri_plugin_global_shortcut::GlobalShortcutExt;
+
+    app.global_shortcut()
+        .unregister_all()
+        .map_err(|e| e.to_string())?;
+    register_paste_hotkey(&app, &accelerator)
+}
+
 /// Deliver a Ctrl+V keystroke to the focused window via the Win32 `SendInput` API
 /// (no extra dependency — reuses the `windows` crate already pulled in for DPAPI).
 #[cfg(windows)]

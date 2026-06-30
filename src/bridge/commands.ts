@@ -6,7 +6,14 @@
  */
 
 import { invoke } from "@tauri-apps/api/core";
-import type { Note, Record, RecordSummary, Settings, SoapSection } from "@/bridge/types";
+import type {
+  InputDevice,
+  Note,
+  Record,
+  RecordSummary,
+  Settings,
+  SoapSection,
+} from "@/bridge/types";
 
 /** Round-trips a message through the backend to verify the bridge is wired. */
 export function ping(message: string): Promise<string> {
@@ -92,8 +99,18 @@ export function updateSettings(settings: Settings): Promise<void> {
   return invoke("update_settings", { settings });
 }
 
+/** Enumerate capture devices for the mic picker (§9.3, FR-12). */
+export function listInputDevices(): Promise<InputDevice[]> {
+  return invoke<InputDevice[]>("list_input_devices");
+}
+
 // — Hand-off (§8.6)
 
 export function pasteSection(recordId: string, section: SoapSection): Promise<void> {
   return invoke("paste_section", { recordId, section });
+}
+
+/** Re-register the global paste hotkey so a Settings rebind applies without restart (§8.6). */
+export function rebindPasteHotkey(accelerator: string): Promise<void> {
+  return invoke("rebind_paste_hotkey", { accelerator });
 }
