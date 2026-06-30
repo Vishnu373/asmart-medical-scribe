@@ -1,193 +1,170 @@
 # Medical Scribe
 
-On-device medical scribe for Windows — records a doctor–patient consult, transcribes it locally, and generates a SOAP note. Built with **Tauri 2** (Rust backend + React/TypeScript frontend).
+> On-device medical scribe for Windows — records a doctor–patient consult, transcribes it locally, and generates a SOAP note. **Nothing leaves the machine.**
 
-- Architecture: [`design.md`](./design.md)
-- Build plan & progress: [`implementation.md`](./implementation.md)
+Built with **Tauri 2** (Rust backend + React / TypeScript frontend), fully offline and CPU-only.
+
+| | |
+|---|---|
+| **Platform** | Windows 11 (MSVC, CPU-only) |
+| **Stack** | Tauri 2 · Rust · React + TypeScript · Bun |
+| **Speech-to-text** | Parakeet TDT v3 (ONNX, on-device) |
+| **Note generation** | llama.cpp (GGUF, in-process) |
+| **Storage** | SQLCipher (encrypted) + Windows DPAPI-wrapped key |
+
+📐 Architecture → [`design.md`](./design.md) · 🛠️ Build plan & progress → [`implementation.md`](./implementation.md)
 
 ---
 
-## Setup
+## ✨ What it does
 
-### 0. Clone the project
+- 🎙️ **Records & transcribes** a consult locally — no cloud, no PHI egress.
+- 📝 **Generates a SOAP note** from the transcript with an on-device LLM.
+- 🔒 **Encrypts everything at rest** (SQLCipher; key sealed by Windows DPAPI).
+- 📋 **Hands off to your EMR** — paste any SOAP section into the focused field via a global hotkey.
 
-```
+---
+
+## ✅ Prerequisites
+
+Install these first — the native build won't compile without them.
+
+| Tool | Why it's needed | Link |
+|------|-----------------|------|
+| **Bun** | Frontend package manager & test runner | [bun.com/docs/installation](https://bun.com/docs/installation) |
+| **Rust + MSVC** | Backend toolchain | [rust-lang.org/tools/install](https://rust-lang.org/tools/install/) |
+| **OpenSSL** | Linked by the encrypted DB (SQLCipher) | [github.com/openssl/openssl](https://github.com/openssl/openssl) |
+| **LLVM (libclang)** | `bindgen` generates the LLM bindings | [llvm releases](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.0) |
+| **CMake ≥ 4.1** | Drives the LLM's C++ build | [cmake.org/download](https://cmake.org/download/#latest) |
+| **Perl + NASM** | Build OpenSSL from source | [Strawberry Perl](https://strawberryperl.com/) · [NASM](https://www.nasm.us/) |
+
+> Set up the [Windows native dependencies](#-windows-native-dependencies) (OpenSSL, LLVM, CMake) **before** running or testing the app.
+
+---
+
+## 🚀 Quick start
+
+```bash
+# 1. Clone
 git clone https://github.com/Vishnu373/medical-scribe.git
-```
-
-### 1. Install Bun
-
-Documentation: https://bun.com/docs/installation
-
-### 2. Navigate to the project folder
-
-```
 cd medical-scribe
-```
 
-### 3. Install frontend dependencies
-
-```
+# 2. Install frontend dependencies
 bun install
-```
 
-### 4. Install Rust and MSVC
-
-Documentation: https://rust-lang.org/tools/install/
-
-### 5. Run the app in development
-
-```
+# 3. Run the app in development (after the native deps below are set up)
 bun run tauri dev
 ```
 
-> If this fails with a Smart App Control error, see
-> [Troubleshooting](#troubleshooting) below, then run this step again.
+> If `bun run tauri dev` fails with a **Smart App Control** error, see [Troubleshooting](#-troubleshooting), then re-run it.
 
 ---
 
-## Development tooling
+## 🪟 Windows native dependencies
 
-`rustfmt` is the Rust code formatter; `clippy` is a compiler helper that acts as
-an automated code reviewer for Rust.
+The Rust backend compiles native code (encrypted DB + in-process LLM), so a few system libraries must be in place.
 
-### 6. Install rustfmt and clippy
+### OpenSSL — for the encrypted database
 
-```
-rustup component add rustfmt
-rustup component add clippy
-```
+The encrypted database (SQLCipher) links against OpenSSL, built from source on Windows.
 
-### 7. Check formatting
-
-```
-cargo fmt --check
-```
-
-If no output, the code is correctly formatted.
-
-### 8. Run the linter
-
-```
-cargo clippy
-```
-
-### 9. Build the frontend
-
-```
-bun run build
-```
-
----
-
-## Troubleshooting
-
-### Windows Smart App Control (SAC)
-
-**Turn SAC OFF:**
-
-1. Navigate:
-   `Settings -> Privacy & security -> Windows Security -> App & browser control -> Smart App Control (SAC)`
-2. Check if it's **ON**.
-3. Change it to **OFF**.
-
-**Turn SAC back ON:**
-
-- Search for **Registry Editor** in the Windows search bar.
-- Run as administrator.
-- Go to:
-  `HKEY_LOCAL_MACHINE -> SYSTEM -> CurrentControlSet -> Control -> CI -> Policy -> VerifiedAndReputablePolicyState`
-- In `VerifiedAndReputablePolicyState`, change the **Value** field to `1`.
-- Go back to the SAC options in Windows Settings; you should see it set to **ON**.
-
-> **Note:** There are trade-offs for turning OFF the SAC — please check before
-> taking action.
-
----
-
-## OpenSSL (Windows)
-
-The encrypted database (SQLCipher) links against OpenSSL, which is built from
-source on Windows. Documentation: https://github.com/openssl/openssl
-
-### Prerequisites
-
-Install both and ensure they're on your `PATH`:
+**Prerequisites** (both must be on your `PATH`):
 
 - **Perl** — https://strawberryperl.com/
-- **NASM** — https://www.nasm.us/
-  > Select the **win32 / x64** download → latest NASM version → download the
-  > `.exe` → install by running it as administrator.
+- **NASM** — https://www.nasm.us/ → select the **win32 / x64** download → latest version → run the `.exe` as administrator.
 
-### 10. Clone OpenSSL outside the project folder
+**Build & install** — open the **x64 Native Tools Command Prompt for VS** as administrator, clone OpenSSL *outside* the project folder, `cd` into it, then:
 
-```
+```bash
 git clone https://github.com/openssl/openssl.git
-```
-
-### 11. Build and install OpenSSL
-
-Open **x64 Native Tools Command Prompt for VS** as administrator, `cd` into the
-cloned `openssl` folder, then run:
-
-```
+# cd openssl
 perl Configure VC-WIN64A no-shared enable-static-vcruntime
 nmake
 nmake test
 nmake install
 ```
 
-> Change the target architecture (`VC-WIN64A`) if required — see the repo docs
-> for details.
+> Change the target architecture (`VC-WIN64A`) if required — see the OpenSSL repo docs.
 
-### 12. Set the OpenSSL environment variable
+**Point the build at it:**
 
-```
+```bash
 set OPENSSL_DIR=C:\Program Files\OpenSSL
 ```
 
----
+### LLVM (libclang) & CMake — for the LLM
 
-## libclang & CMake (Windows)
+The in-process note-generation engine (llama.cpp, via `llama-cpp-2`) is built from source. `bindgen` needs **libclang** (shipped with LLVM) to generate the Rust bindings, and **CMake** drives the C++ build.
 
-The local STT engine builds `whisper.cpp` from source. `bindgen` needs
-**libclang** (shipped with LLVM) to generate the Rust bindings, and **CMake**
-drives the C++ build.
-
-### 13. Install LLVM
-
-Documentation: https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.0
-
-Then point `bindgen` at libclang:
-
-```
+```bash
+# After installing LLVM, point bindgen at libclang:
 setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
 ```
 
-### 14. Install CMake
+This project requires **CMake ≥ 4.1** (older versions can't target the installed Visual Studio toolchain).
 
-Documentation: https://cmake.org/download/#latest
-
-This project requires **CMake >= 4.1** (older versions can't target the
-installed Visual Studio toolchain).
-
-> **Note:** Strawberry Perl ships its own, older `cmake`. Make sure
-> `C:\Program Files\CMake\bin` comes **above** `C:\Strawberry\c\bin` on your
-> `PATH`, otherwise the wrong `cmake` is picked up. Verify with:
->
-> ```
-> cmake --version
-> ```
+> **Note:** Strawberry Perl ships its own older `cmake`. Make sure `C:\Program Files\CMake\bin` comes **above** `C:\Strawberry\c\bin` on your `PATH`, or the wrong `cmake` is picked up. Verify with `cmake --version`.
 
 ---
 
-## Verify the build
+## 🧰 Development
 
-### 15. Run the tests
+```bash
+# Add the Rust formatter and linter (one-time)
+rustup component add rustfmt clippy
 
-From the project folder:
+# Format check (no output = correctly formatted)
+cargo fmt --check        # run inside src-tauri/
 
+# Lint
+cargo clippy             # run inside src-tauri/
+
+# Type-check & bundle the frontend
+bun run build
 ```
+
+`rustfmt` formats Rust code; `clippy` is the Rust linter that flags common mistakes.
+
+---
+
+## 🧪 Testing
+
+```bash
+# Backend (Rust) — from src-tauri/
 cd src-tauri
 cargo test
+
+# Frontend (Vitest) — from the project root
+bun test
 ```
+
+---
+
+## 🩹 Troubleshooting
+
+<details>
+<summary><b>Windows Smart App Control (SAC)</b></summary>
+
+**Turn SAC OFF:**
+
+1. Go to `Settings → Privacy & security → Windows Security → App & browser control → Smart App Control`.
+2. If it's **ON**, switch it to **OFF**.
+
+**Turn SAC back ON** (requires the Registry Editor):
+
+1. Search **Registry Editor**, run as administrator.
+2. Navigate to
+   `HKEY_LOCAL_MACHINE\SYSTEM\CurrentControlSet\Control\CI\Policy\VerifiedAndReputablePolicyState`.
+3. Set the **Value** of `VerifiedAndReputablePolicyState` to `1`.
+4. Re-check the SAC option in Windows Settings — it should now read **ON**.
+
+> ⚠️ Turning SAC **off** has security trade-offs — review them before changing it.
+
+</details>
+
+---
+
+## 📚 Project docs
+
+- [`design.md`](./design.md) — architecture and design decisions.
+- [`implementation.md`](./implementation.md) — phased build plan and progress log.

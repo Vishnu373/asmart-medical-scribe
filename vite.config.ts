@@ -1,4 +1,7 @@
-import { defineConfig } from "vite";
+// `defineConfig` from vitest/config is Vite's own plus the `test` field — one
+// config drives both the app build and the test runner, so the `@` alias and
+// plugins below are the single source of truth (no separate vitest.config to drift).
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 import tailwindcss from "@tailwindcss/vite";
 import { resolve } from "path";
@@ -31,5 +34,12 @@ export default defineConfig(async () => ({
     watch: {
       ignored: ["**/src-tauri/**"],
     },
+  },
+
+  // Frontend unit tests (jsdom). Native Tauri calls are mocked per-test.
+  test: {
+    environment: "jsdom",
+    globals: true,
+    setupFiles: ["./src/test/setup.ts"],
   },
 }));

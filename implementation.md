@@ -264,13 +264,13 @@ crash report payload asserted to contain no PHI fields.
 
 ## Frontend
 
-### Phase F1 — App shell & Tauri bridge  `[ ] not started`
+### Phase F1 — App shell & Tauri bridge  `[x] done`
 **Goal:** React shell with typed `invoke`/event wrappers and global app state.
 **Depends on:** B1
 **Tasks:**
-- [ ] `bridge/`: typed wrappers for all §9.4 commands and §9.5 event listeners.
-- [ ] `state/`: store slices (recording, transcript, notes, records, settings).
-- [ ] App layout/router for Recording / Records / Settings views; Tailwind theme.
+- [x] `bridge/`: typed wrappers for all §9.4 commands and §9.5 event listeners.
+- [x] `state/`: store slices (recording, transcript, notes, records, settings).
+- [x] App layout/router for Recording / Records / Settings views; Tailwind theme.
 **Deliverables:** `bridge/`, `state/`, shell layout.
 **Verification:** Vitest — bridge wrappers call `invoke` with correct args; shell
 renders; `ping` works through the typed bridge.
@@ -776,3 +776,38 @@ hotkey without focus steal and pastes the chosen section.
     recorded in Assumptions & Decisions above; whisper as a runtime option is
     deferred to a possible out-of-process-sidecar phase. The user's swap-residency +
     "expect a short delay" dialog idea would become that phase's UX, not a v1 change.
+
+- **2026-06-30 — F1 built (app shell & Tauri bridge).** Frontend foundation:
+  - `src/bridge/`: typed IPC surface in one place. `types.ts` mirrors the backend
+    serde shapes (`Record`/`RecordSummary`/`Note`/`Settings`, the five §9.5 event
+    payloads, `AppState`, `SoapSection`) in snake_case to match the wire format;
+    `commands.ts` wraps every §9.4 command (camelCase Tauri arg keys); `events.ts`
+    wraps the §9.5 listeners returning the `UnlistenFn` for cleanup; `index.ts`
+    re-exports. Views/state import only from `@/bridge`, never `@tauri-apps/api`.
+  - `src/state/`: one Zustand store (the "slices" pattern named in the design)
+    with recording / transcript / notes / records / settings slices + a small UI
+    slice for the active view. F1 sets shape + plain setters; F2–F6 wire events.
+  - Shell: `App.tsx` (header + bridge-liveness dot carried from B1, nav + view
+    switch), `components/NavBar.tsx`, and stub `views/{Recording,Records,Settings}View`
+    for F2/F5/F6 to flesh out. Simple view-state nav, no router dependency (3 tabs).
+  - Tooling: added `zustand`; added Vitest + Testing-Library + jsdom dev deps,
+    `vitest.config.ts`, `src/test/setup.ts`, and `test`/`test:watch` scripts. Tests:
+    `commands.test.ts` (every wrapper invokes the right command with the right args,
+    incl. the camelCase mapping), `store.test.ts` (defaults + setters), `App.test.tsx`
+    (shell renders, nav switches views). Test files excluded from the `tsc` build.
+  - **Divergence from design §9.4:** `get_settings`/`update_settings` are specified
+    but were never registered in the backend `invoke_handler` (only `settings::Settings`
+    + load/save exist). The bridge wrappers are written to the §9.4 contract so the
+    frontend is complete, but **these two backend commands must be added before F6
+    (Settings view) can round-trip.** Flagged here and inline in `bridge/commands.ts`.
+  - **Verification pending on Windows:** `bun install` then `bun test` (no Node/Bun
+    on the Linux dev box) and `bun run build` (`tsc && vite build`).
+
+- **2026-06-30 — Resolved the §9.4 settings-command gap (F1 follow-up).** Registered
+  `get_settings`/`update_settings` so the F1 bridge wrappers no longer reject at
+  runtime (they would have failed F6). Added `settings::SharedSettings` (a
+  `SharedStore`-style `Arc<Mutex<Settings>>` + path handle) managed in state; the
+  two commands read/persist through it. `update_settings` saves to disk first, then
+  updates the cache (a failed write leaves the in-memory copy intact), and takes the
+  full `Settings` object so internal keys survive the frontend round-trip. Verified
+  by a new `shared_settings_update_persists_and_caches` unit test (Windows `cargo test`).

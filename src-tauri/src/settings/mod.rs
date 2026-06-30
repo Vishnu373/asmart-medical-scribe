@@ -7,7 +7,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex};
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 // Fields are added per phase; missing keys in an older settings.json must fall
@@ -73,9 +74,55 @@ impl Settings {
     }
 }
 
+/// Thread-safe settings handle managed in Tauri state (mirrors `SharedStore`).
+/// Holds the live `Settings` plus the on-disk path so the `get_settings` /
+/// `update_settings` commands (§9.4) can read and persist without re-reading the
+/// file. Cloneable: every clone shares the same inner lock.
+#[derive(Clone)]
+pub struct SharedSettings {
+    path: PathBuf,
+    inner: Arc<Mutex<Settings>>,
+}
+
+impl SharedSettings {
+    pub fn new(settings: Settings, path: PathBuf) -> Self {
+        Self {
+            path,
+            inner: Arc::new(Mutex::new(settings)),
+        }
+    }
+
+    /// Snapshot of the current settings.
+    pub fn get(&self) -> Settings {
+        self.inner.lock().unwrap().clone()
+    }
+
+    /// Persist the new settings to disk, then update the in-memory copy. Writing
+    /// first means a failed save leaves the cached settings untouched.
+    pub fn update(&self, settings: Settings) -> Result<()> {
+        settings.save(&self.path)?;
+        *self.inner.lock().unwrap() = settings;
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn shared_settings_update_persists_and_caches() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        let shared = SharedSettings::new(Settings::default(), path.clone());
+
+        let mut next = Settings::default();
+        next.model_choice = "best".to_string();
+        shared.update(next.clone()).unwrap();
+
+        assert_eq!(shared.get(), next); // cached copy updated
+        assert_eq!(Settings::load(&path).unwrap(), next); // and persisted
+    }
 
     #[test]
     fn missing_file_yields_defaults() {

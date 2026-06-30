@@ -134,6 +134,11 @@ pub fn run() {
                     app_settings.paste_hotkey
                 );
             }
+
+            // Settings (§9.3) managed for the `get_settings`/`update_settings`
+            // commands (§9.4). Takes ownership of the (residency-resolved) settings
+            // and their path so the Settings view (F6) can read and persist them.
+            app.manage(settings::SharedSettings::new(app_settings, settings_path));
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
@@ -151,6 +156,8 @@ pub fn run() {
             commands::cancel_generation,
             commands::update_note,
             commands::revert_version,
+            commands::get_settings,
+            commands::update_settings,
             handoff::paste_section,
         ])
         .run(tauri::generate_context!())

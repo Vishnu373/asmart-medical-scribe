@@ -1,11 +1,10 @@
-import { invoke } from "@tauri-apps/api/core";
-
 /**
- * Typed wrappers around backend Tauri commands.
- * Expanded per phase; for B1 this proves the frontend↔backend bridge.
+ * The frontend↔backend bridge: typed `invoke` command wrappers (§9.4), typed
+ * event listeners (§9.5), and the shared payload types (§9.2–9.5). Views and
+ * state slices import from here, never from `@tauri-apps/api` directly, so the
+ * whole IPC surface stays in one typed place.
  */
 
-/** Round-trips a message through the backend to verify the bridge is wired. */
-export function ping(message: string): Promise<string> {
-  return invoke<string>("ping", { message });
-}
+export * from "@/bridge/types";
+export * from "@/bridge/commands";
+export * from "@/bridge/events";

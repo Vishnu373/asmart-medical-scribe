@@ -9,6 +9,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use crate::orchestrator::Coordinator;
+use crate::settings::{Settings, SharedSettings};
 use crate::store::{Record, RecordSummary, SharedStore};
 
 /// Echoes a message back to the frontend with a prefix, proving the bridge works.
@@ -142,6 +143,25 @@ pub fn revert_version(
         .lock()
         .set_active_note(&record_id, &note_id)
         .map_err(|e| e.to_string())
+}
+
+/// Read the current settings (§9.3/§9.4). The `state` handle is injected by type;
+/// no JS args.
+#[tauri::command]
+pub fn get_settings(state: State<'_, SharedSettings>) -> Settings {
+    state.get()
+}
+
+/// Persist patched settings (§9.3/§9.4). The frontend sends the full object
+/// (read-modify-write), so internal keys are preserved across the round-trip. The
+/// value param is named `settings` to match the `invoke("update_settings", { settings })`
+/// arg; the managed handle is the type-resolved `state` param.
+#[tauri::command]
+pub fn update_settings(
+    state: State<'_, SharedSettings>,
+    settings: Settings,
+) -> Result<(), String> {
+    state.update(settings).map_err(|e| e.to_string())
 }
 
 /// Load a record's transcript for generation, rejecting a missing record or an
