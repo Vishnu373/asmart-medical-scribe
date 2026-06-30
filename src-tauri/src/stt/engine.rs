@@ -1,5 +1,5 @@
 use std::panic::{catch_unwind, AssertUnwindSafe};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::thread::{self, JoinHandle};
@@ -24,6 +24,17 @@ use super::Transcriber;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ModelKind {
     Parakeet,
+}
+
+impl ModelKind {
+    /// On-disk name of the bundled model asset. Parakeet is a *directory* of ONNX
+    /// files (not a single file), resolved across the model dirs like the LLM
+    /// GGUFs (D1). This is the single source of truth the loader resolves against.
+    pub fn dir_name(self) -> &'static str {
+        match self {
+            ModelKind::Parakeet => "parakeet-tdt-0.6b-v3",
+        }
+    }
 }
 
 /// The engine we ship, behind an enum so a future engine slots in without
@@ -127,6 +138,25 @@ impl SttEngine {
         self.touch_activity(); // don't let the watcher unload a just-loaded model
         info!("Loaded STT model: {kind:?}");
         Ok(())
+    }
+
+    /// Ensure `kind` is loaded, resolving its asset across `model_dirs` in priority
+    /// order (the D1 resolver: download dir first, then bundled resource dir). A
+    /// no-op when that model is already loaded; this is what the orchestrator calls
+    /// before a recording so the bundled Parakeet model is actually wired in (it's
+    /// resolved from `resources/models/<dir_name>` rather than assumed loaded).
+    pub fn ensure_loaded(&self, kind: ModelKind, model_dirs: &[PathBuf]) -> Result<()> {
+        if self.current_model() == Some(kind) && self.is_loaded() {
+            return Ok(());
+        }
+        let dir = crate::models::resolve(kind.dir_name(), model_dirs).ok_or_else(|| {
+            anyhow!(
+                "STT model '{}' not found in {model_dirs:?} — the bundled Parakeet \
+                 model is missing from the installer",
+                kind.dir_name()
+            )
+        })?;
+        self.load(kind, &dir)
     }
 
     pub fn unload(&self) {

@@ -61,6 +61,12 @@ llama-cpp-2 = "0.1.122"
 # dependency. The no-activate overlay *window* is created on the frontend (F7).
 tauri-plugin-global-shortcut = "2"
 tauri-plugin-clipboard-manager = "2"
+# Optional-model download (§8.2, D1): the lightest LLM tier (Phi-3.5 Q4) is not
+# bundled — it's fetched on explicit doctor request. `ureq` is a small, pure-Rust
+# HTTPS client (rustls, no OpenSSL); `sha2` verifies the download. This is the only
+# network path in the app, gated behind the click — model weights, never PHI.
+ureq = "2"
+sha2 = "0.10"
 # Optional, off-by-default crash reporting (§10.3, B11). Disabled in the default
 # build so it stays fully offline (NFR-6); enable with `--features crash-reporting`
 # once a DSN exists. PHI is structurally excluded (see telemetry::scrub_event).

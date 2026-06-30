@@ -10,7 +10,7 @@ use tauri::{AppHandle, Emitter};
 use crate::audio_toolkit::{AudioRecorder, SileroVad, SmoothedVad};
 use crate::segment::{spawn_stt_worker, Segmenter, SegmenterConfig, SttWorkerHandle};
 use crate::store::SharedStore;
-use crate::stt::{SttEngine, Transcriber};
+use crate::stt::{ModelKind, SttEngine, Transcriber};
 
 use super::coordinator::{AppEvent, Pipeline};
 
@@ -33,6 +33,10 @@ pub struct RealPipeline {
     app: AppHandle,
     engine: Arc<SttEngine>,
     vad_model_path: PathBuf,
+    /// Model-file search dirs (D1 resolver order): the STT model is resolved from
+    /// these on each `start()` so the bundled Parakeet model is loaded before
+    /// capture begins, rather than assumed already loaded.
+    model_dirs: Vec<PathBuf>,
     store: SharedStore,
     /// App data dir; on a DB save failure the transcript is spilled here as a
     /// recoverable `.txt` so a finished consult is never lost (it lived only in
@@ -58,6 +62,7 @@ impl RealPipeline {
         app: AppHandle,
         engine: Arc<SttEngine>,
         vad_model_path: PathBuf,
+        model_dirs: Vec<PathBuf>,
         store: SharedStore,
         data_dir: PathBuf,
     ) -> Self {
@@ -65,6 +70,7 @@ impl RealPipeline {
             app,
             engine,
             vad_model_path,
+            model_dirs,
             store,
             data_dir,
             running: None,
@@ -84,6 +90,14 @@ impl RealPipeline {
 
 impl Pipeline for RealPipeline {
     fn start(&mut self) -> Result<()> {
+        // Ensure the STT model is loaded before capture starts, resolving the
+        // bundled Parakeet model from the model dirs (no-op if already warm). Fail
+        // here — before spinning up capture threads — so a missing model surfaces
+        // as a clean start error rather than a per-segment transcription failure.
+        self.engine
+            .ensure_loaded(ModelKind::Parakeet, &self.model_dirs)
+            .map_err(|e| anyhow!("failed to load STT model: {e}"))?;
+
         // Capture → segmenter queue → STT worker → UI.
         let (seg_tx, seg_rx) = std::sync::mpsc::channel();
         let segmenter = Arc::new(Mutex::new(Segmenter::new(

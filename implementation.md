@@ -338,7 +338,104 @@ no-activate Alt+P picker overlay is deferred; v1 hand-off is manual copy/paste.
 **Deliverables:** per-section Copy buttons in `SoapEditor`; `copy_to_clipboard` command.
 **Verification:** RTL — Copy invokes `copy_to_clipboard` with the section text.
 
+## Model Distribution
+
+### Phase D1 — Bundle core models & optional model download  `[x] implemented (Windows verify pending)`
+**Goal:** Ship the installer with the three core models embedded so the product
+works offline on first launch, and make the lightest LLM tier an **optional**
+download the doctor pulls on demand from the UI.
+**Depends on:** B5, B9, B10, F6 (all done).
+
+**What ships bundled (in the installer):**
+- **Parakeet TDT v3** — the only STT engine (§8.4); always required.
+- **Mistral-7B-Instruct-v0.3 Q4_K_M** — LLM "best" tier (≥16 GB machines, §8.2).
+- **Phi-3.5-mini-instruct Q8_0** — LLM "medium" tier (<16 GB machines, §8.2).
+
+**What is optional (downloaded on demand):**
+- **Phi-3.5-mini-instruct Q4_K_M** — LLM "okay" tier. Not bundled (keeps the
+  installer smaller). Exposed in Settings; if the doctor selects/clicks it and the
+  file is absent, a download is triggered, verified, and then the tier becomes
+  selectable.
+
+**Backend tasks:**
+- [x] `llm/engine.rs`: added `LlmModel::PhiQ4` ("okay") → file
+      `phi-3.5-mini-instruct-Q4_K_M-worthdoing.gguf`, `footprint` ~2.4 GB. Also
+      **corrected the two bundled filenames** to the real release names
+      (`Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`, `phi-3.5-mini-instruct-Q8_0-worthdoing.gguf`).
+      `from_tier`/`from_choice` map `model_choice` → model; startup now picks the
+      model from the chosen tier (RAM-fit fallback). `prompt.rs` treats PhiQ4 as the
+      Phi-3.5 family template.
+- [x] **Model path resolution:** `models::resolve(file, dirs)` searches
+      `app_data_dir/models/` (download dir) **first**, then `resource_dir/models/`
+      (bundled). `LlmEngine` now holds a dir search list; `ensure_loaded` resolves
+      through it. (STT loader is **not** yet wired to a model path — see divergence;
+      the resolver is ready for it.)
+- [x] **Bundle config:** the existing `resources/**/*` glob already bundles
+      anything dropped under `resources/models/`, so no `tauri.conf.json` change —
+      the three core files (Parakeet dir, Mistral, Phi Q8) are placed there before
+      `tauri build`. They stay git-ignored.
+- [x] `download_model` command — native Rust `ureq` (rustls, no OpenSSL) streaming,
+      not a shell script. Spawns a worker thread, streams to a `.part` temp in
+      `app_data_dir/models/`, hashes with `sha2`, verifies (when a SHA is pinned),
+      atomically renames into place. Emits throttled `model-download-progress
+      { tier, downloaded, total }` and terminal `model-download-done` /
+      `model-download-error`. The only network call in the app, gated on the click.
+- [x] `model_status` command → presence of each tier on disk (bundled + downloaded).
+
+**Frontend tasks:**
+- [x] `SettingsView`: loads `model_status`; the "okay" `<option>` is disabled and a
+      **Download** affordance (with live %, from `model-download-progress`) shows
+      when the tier is absent, becoming selectable after `model-download-done`; a
+      failed download toasts and reverts.
+- [x] Bridge wrappers (`modelStatus`, `downloadModel`) + event listeners
+      (`onModelDownloadProgress/Done/Error`) + `ModelStatus`/`ModelDownloadProgressEvent`
+      types.
+
+**Deliverables:** bundled core models in the installer; `download_model` +
+`model_status` commands; Settings optional-download UI.
+**Verification:** `cargo test` — path resolver prefers app-data over resource;
+SHA-256 mismatch rejects the file; `model_status` reflects presence. Manual Windows:
+fresh install transcribes + generates offline with no download; selecting "okay"
+downloads, verifies, then generates. RTL — picker shows Download when absent,
+selectable after `model-download-done`.
+**Follow-up:** `design.md` needs a matching update (§8.2 tiers: which are bundled
+vs optional; a model-distribution note; the single gated network call) — do via the
+`system-design-doc` skill after this phase is approved.
+
 ## Progress Log
+
+- **2026-06-30 — Phase D1 (model distribution) implemented; Windows verify pending.**
+  Ship-with-models + optional download. New `models` module: on-disk resolver
+  (download dir before bundled dir), `model_status`, and `download_model` (ureq +
+  rustls streaming → `.part` temp → sha2 verify → atomic rename, throttled progress
+  events). `llm/engine.rs`: added the PhiQ4 "okay" tier, **corrected the Mistral and
+  Phi-Q8 filenames** to the real release names (the old constants would never have
+  resolved), and made `model_choice` drive model selection via `from_choice`.
+  Frontend: Settings gates/Downloads the optional tier; bridge wrappers + events +
+  types added. New deps: `ureq`, `sha2`. Cannot `cargo test`/`bun run test` on the
+  Linux box — verify on Windows.
+  - **Divergence 1 — model selection now follows `model_choice`, not the RAM probe.**
+    §8.2 picks the model purely fit-to-machine; the SettingsView model picker now
+    overrides that. Side effect: the default tier `"medium"` means Phi-Q8 on *every*
+    machine (previously a ≥16 GB box auto-picked Mistral). If "auto by RAM" should be
+    a first-class tier/default, that's a small follow-up (seed `model_choice` from
+    `for_total_ram` on first run, or add an "Automatic" option).
+  - **Divergence 2 — residency still sizes for the RAM-fit model.**
+    `residency::default_llm_footprint` uses `for_total_ram`, so if the doctor picks a
+    model heavier than the RAM default, co-residency was sized for the lighter one.
+    The §8.4 load-time available-RAM guard still protects against OOM; flagged for a
+    later reconciliation (size residency from the *chosen* model).
+  - **Divergence 3 — STT model load wired into the pipeline (resolved 2026-06-30).**
+    Originally D1 was distribution only and the pipeline never called `SttEngine::load`.
+    Now `ModelKind::dir_name()` owns the bundled Parakeet directory name
+    (`parakeet-tdt-0.6b-v3`), `SttEngine::ensure_loaded(kind, &model_dirs)` resolves it
+    through the D1 resolver (download dir → bundled resource dir), and
+    `RealPipeline::start()` calls it before capture begins (no-op if already warm). A
+    missing model now fails Start cleanly instead of failing per-segment. `RealPipeline`
+    gained a `model_dirs` field, threaded from `lib.rs`.
+  - **Open item — pin the Phi-Q4 SHA-256.** `models::OPTIONAL[okay].sha256` is `None`,
+    so the download is integrity-checked only by HTTPS until the released file's hash
+    is captured and pinned.
 
 - 2026-06-26 — Plan drafted. STT phases (B3–B6) reframed to port-and-adapt from the
   `handy/` codebase per user instruction; non-STT phases built fresh per design.md.

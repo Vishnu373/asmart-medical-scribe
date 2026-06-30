@@ -32,8 +32,9 @@ pub fn build_prompt(model: LlmModel, transcript: &str) -> String {
         LlmModel::Mistral => {
             format!("<s>[INST] {SOAP_SYSTEM_PROMPT}\n\n{user} [/INST]")
         }
-        // Phi-3.5: explicit <|system|>/<|user|>/<|assistant|> turns.
-        LlmModel::Phi => format!(
+        // Phi-3.5 (Q8 and Q4 are the same family/template): explicit
+        // <|system|>/<|user|>/<|assistant|> turns.
+        LlmModel::Phi | LlmModel::PhiQ4 => format!(
             "<|system|>\n{SOAP_SYSTEM_PROMPT}<|end|>\n<|user|>\n{user}<|end|>\n<|assistant|>\n"
         ),
     }

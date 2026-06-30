@@ -55,6 +55,22 @@ export interface InputDevice {
   is_default: boolean;
 }
 
+/** On-disk presence of one model tier (design §8.2, D1). `models::ModelStatus`. */
+export interface ModelStatus {
+  /** The `model_choice` tier: `best` | `medium` | `okay`. */
+  tier: string;
+  present: boolean;
+  /** Whether this tier is an on-demand download (vs bundled). */
+  optional: boolean;
+}
+
+/** Progress for an in-flight optional-model download (D1). `total === 0` ⇒ unknown size. */
+export interface ModelDownloadProgressEvent {
+  tier: string;
+  downloaded: number;
+  total: number;
+}
+
 /** Backend → UI event payloads (design §9.5). */
 export interface TranscriptSegmentEvent {
   seq: number;

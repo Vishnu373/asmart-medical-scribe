@@ -9,6 +9,7 @@ mod commands;
 mod crypto;
 mod handoff;
 mod llm;
+mod models;
 mod orchestrator;
 mod residency;
 mod segment;
@@ -50,14 +51,14 @@ pub fn run() {
             // pipeline on each Start (design §6.6).
             let engine = Arc::new(SttEngine::new(STT_IDLE_TIMEOUT));
 
-            // Bundled VAD model lives under the app's resource dir. (STT model
-            // preload/asset bundling is wired in a later phase; until then a
-            // recording surfaces an `error` event rather than transcribing.)
+            // Bundled VAD model lives under the app's resource dir. (The STT
+            // model is resolved across the D1 model dirs and loaded by the
+            // pipeline on Start — see `RealPipeline::start`.)
             let vad_model_path = app
                 .path()
                 .resource_dir()?
                 .join("models")
-                .join("silero_vad.onnx");
+                .join("silero_vad_v4.onnx");
 
             // Encrypted PHI store: the AES-256 key is wrapped by Windows DPAPI and
             // never persisted in the clear (design §10.1). Both the pipeline (which
@@ -83,16 +84,21 @@ pub fn run() {
             }
             log::info!("model residency mode: {}", mode.as_str());
 
-            // In-process note-generation model (§8). The model is picked by the
-            // same RAM probe (§8.2); residency mode decides when it loads — warmed
-            // at startup when co-resident, loaded per generation when swapping.
-            let llm_model = LlmModel::for_total_ram(total_ram);
-            let models_dir = app.path().resource_dir()?.join("models");
+            // In-process note-generation model (§8). The doctor's `model_choice`
+            // tier picks the model (best/medium/okay → Mistral/Phi-Q8/Phi-Q4);
+            // when unset/unknown it falls back to the RAM-fit default (§8.2).
+            // Residency mode decides *when* it loads — warmed at startup when
+            // co-resident, loaded per generation when swapping. The model file is
+            // resolved across the download dir then the bundled resource dir (D1),
+            // so an optional tier the doctor pulled shadows the (absent) bundle.
+            let llm_model = LlmModel::from_choice(&app_settings.model_choice, total_ram);
+            let model_dirs = models::model_dirs(app.handle()).map_err(|e| e.to_string())?;
             let n_threads = std::thread::available_parallelism()
                 .map(|n| n.get() as i32)
                 .unwrap_or(4);
-            let llm_engine =
-                Arc::new(LlmEngine::new(llm_model, models_dir, n_threads).map_err(|e| e.to_string())?);
+            let llm_engine = Arc::new(
+                LlmEngine::new(llm_model, model_dirs.clone(), n_threads).map_err(|e| e.to_string())?,
+            );
             let swap_mode = mode == ResidencyMode::Swap;
             if !swap_mode {
                 // Co-resident: warm the model now so the first Generate is instant.
@@ -108,6 +114,7 @@ pub fn run() {
                 handle.clone(),
                 engine,
                 vad_model_path,
+                model_dirs,
                 store.clone(),
                 data_dir,
             );
@@ -157,6 +164,8 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::list_input_devices,
+            models::model_status,
+            models::download_model,
             handoff::paste_section,
             handoff::rebind_paste_hotkey,
             handoff::copy_to_clipboard,

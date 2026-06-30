@@ -14,6 +14,8 @@ vi.mock("@tauri-apps/api/core", () => ({
         return Promise.resolve("pong: ready");
       case "list_input_devices":
         return Promise.resolve([]);
+      case "model_status":
+        return Promise.resolve([]);
       case "get_settings":
         return Promise.resolve({
           model_choice: "medium",

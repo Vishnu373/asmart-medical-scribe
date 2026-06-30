@@ -25,14 +25,18 @@ use llama_cpp_2::sampling::LlamaSampler;
 
 use super::prompt::build_prompt;
 
-/// The note-generation model chosen for this machine (design §8.2). Selection is
-/// purely fit-to-machine on total RAM — all candidates cleared on quality.
+/// The note-generation model (design §8.2). The three doctor-facing tiers map
+/// here: `best`→Mistral, `medium`→Phi (Q8), `okay`→PhiQ4. When no tier is chosen
+/// the model is picked fit-to-machine on total RAM ([`for_total_ram`]). The first
+/// two ship bundled; PhiQ4 is the optional on-demand download (D1, `models`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmModel {
-    /// ≥16 GB RAM: Mistral-7B-Instruct-v0.3 Q4_K_M (~4.4 GB).
+    /// `best` (≥16 GB default): Mistral-7B-Instruct-v0.3 Q4_K_M (~4.4 GB). Bundled.
     Mistral,
-    /// <16 GB RAM: Phi-3.5-mini-instruct Q8_0 (~4.0 GB).
+    /// `medium` (<16 GB default): Phi-3.5-mini-instruct Q8_0 (~4.0 GB). Bundled.
     Phi,
+    /// `okay`: Phi-3.5-mini-instruct Q4_K_M (~2.4 GB). Optional, downloaded on demand.
+    PhiQ4,
 }
 
 const GIB: u64 = 1024 * 1024 * 1024;
@@ -45,12 +49,30 @@ const LLM_MODEL_THRESHOLD: u64 = 16 * GIB;
 
 impl LlmModel {
     /// The §8.2 selection rule, keyed on total RAM (the same probe that drives §7).
+    /// This is the default when the doctor hasn't picked a tier explicitly.
     pub fn for_total_ram(total_ram: u64) -> Self {
         if total_ram >= LLM_MODEL_THRESHOLD {
             LlmModel::Mistral
         } else {
             LlmModel::Phi
         }
+    }
+
+    /// Map a doctor-facing `model_choice` tier (§9.3) to a model, or `None` for an
+    /// unrecognized value so the caller can fall back to the automatic pick.
+    pub fn from_tier(choice: &str) -> Option<Self> {
+        match choice {
+            "best" => Some(LlmModel::Mistral),
+            "medium" => Some(LlmModel::Phi),
+            "okay" => Some(LlmModel::PhiQ4),
+            _ => None,
+        }
+    }
+
+    /// Resolve the model the engine should load: the explicitly chosen tier if it
+    /// is recognized, otherwise the fit-to-machine default ([`for_total_ram`]).
+    pub fn from_choice(choice: &str, total_ram: u64) -> Self {
+        LlmModel::from_tier(choice).unwrap_or_else(|| LlmModel::for_total_ram(total_ram))
     }
 
     /// Approximate resident RAM footprint of the loaded GGUF (design §8.2). The
@@ -61,15 +83,18 @@ impl LlmModel {
         match self {
             LlmModel::Mistral => 22 * GIB / 5, // ~4.4 GB (Q4_K_M)
             LlmModel::Phi => 4 * GIB,          // ~4.0 GB (Q8_0)
+            LlmModel::PhiQ4 => 12 * GIB / 5,   // ~2.4 GB (Q4_K_M)
         }
     }
 
-    /// The bundled GGUF filename under the models dir. (Asset bundling lands in a
-    /// later phase; until then a load surfaces an error, as STT does today.)
-    fn file_name(self) -> &'static str {
+    /// The GGUF filename resolved under the models search dirs (D1: app-data
+    /// download dir first, then the bundled resource dir). These literals are the
+    /// installer/download filenames; `models::OPTIONAL` keys off the same names.
+    pub fn file_name(self) -> &'static str {
         match self {
-            LlmModel::Mistral => "mistral-7b-instruct-v0.3.Q4_K_M.gguf",
-            LlmModel::Phi => "Phi-3.5-mini-instruct-Q8_0.gguf",
+            LlmModel::Mistral => "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
+            LlmModel::Phi => "phi-3.5-mini-instruct-Q8_0-worthdoing.gguf",
+            LlmModel::PhiQ4 => "phi-3.5-mini-instruct-Q4_K_M-worthdoing.gguf",
         }
     }
 }
@@ -88,21 +113,23 @@ pub struct LlmEngine {
     backend: LlamaBackend,
     model: Mutex<Option<LlamaModel>>,
     kind: LlmModel,
-    models_dir: PathBuf,
+    /// Model-file search dirs, in priority order (D1): the app-data download dir
+    /// first (optional models the doctor pulled), then the bundled resource dir.
+    model_dirs: Vec<PathBuf>,
     n_threads: i32,
 }
 
 impl LlmEngine {
-    /// Create the engine for `kind`, loading models from `models_dir`. The model
-    /// itself is not loaded until [`ensure_loaded`]; `n_threads` is scaled to the
-    /// machine's physical cores (design §8.2).
-    pub fn new(kind: LlmModel, models_dir: PathBuf, n_threads: i32) -> Result<Self> {
+    /// Create the engine for `kind`, resolving the model file across `model_dirs`
+    /// (first existing wins). The model itself is not loaded until [`ensure_loaded`];
+    /// `n_threads` is scaled to the machine's physical cores (design §8.2).
+    pub fn new(kind: LlmModel, model_dirs: Vec<PathBuf>, n_threads: i32) -> Result<Self> {
         let backend = LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
         Ok(Self {
             backend,
             model: Mutex::new(None),
             kind,
-            models_dir,
+            model_dirs,
             n_threads: n_threads.max(1),
         })
     }
@@ -123,7 +150,14 @@ impl LlmEngine {
         if self.is_loaded() {
             return Ok(());
         }
-        let path = self.models_dir.join(self.kind.file_name());
+        let file = self.kind.file_name();
+        let path = crate::models::resolve(file, &self.model_dirs).ok_or_else(|| {
+            anyhow!(
+                "model file {file} not found in {:?} — the bundled model is missing, \
+                 or (for the optional tier) it has not been downloaded yet",
+                self.model_dirs
+            )
+        })?;
         guard_available_ram(&path)?;
 
         let params = LlamaModelParams::default(); // mmap default; CPU-only build

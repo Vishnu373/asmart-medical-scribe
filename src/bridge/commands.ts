@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   InputDevice,
+  ModelStatus,
   Note,
   Record,
   RecordSummary,
@@ -102,6 +103,20 @@ export function updateSettings(settings: Settings): Promise<void> {
 /** Enumerate capture devices for the mic picker (§9.3, FR-12). */
 export function listInputDevices(): Promise<InputDevice[]> {
   return invoke<InputDevice[]>("list_input_devices");
+}
+
+// — Models (§8.2, D1). The "okay" tier is an on-demand download; the rest ship
+// bundled. `download_model` returns once the worker is spawned — progress and the
+// terminal result arrive as `model-download-*` events.
+
+/** Presence of each model tier on disk, so the UI can offer the optional download. */
+export function modelStatus(): Promise<ModelStatus[]> {
+  return invoke<ModelStatus[]>("model_status");
+}
+
+/** Begin downloading an optional model tier (currently only `okay`). */
+export function downloadModel(tier: string): Promise<void> {
+  return invoke("download_model", { tier });
 }
 
 // — Hand-off (§8.6)

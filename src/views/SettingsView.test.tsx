@@ -7,6 +7,8 @@ import { useAppStore } from "@/state";
 import type { Settings } from "@/bridge";
 
 vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn() }));
+// Settings now subscribes to model-download events; stub listen with a no-op unlisten.
+vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 const mockInvoke = vi.mocked(invoke);
 
 const settings: Settings = {
@@ -28,6 +30,12 @@ beforeEach(() => {
         return Promise.resolve(settings);
       case "list_input_devices":
         return Promise.resolve([{ name: "USB Mic", is_default: true }]);
+      case "model_status":
+        return Promise.resolve([
+          { tier: "best", present: true, optional: false },
+          { tier: "medium", present: true, optional: false },
+          { tier: "okay", present: false, optional: true },
+        ]);
       default:
         return Promise.resolve(undefined);
     }
@@ -54,5 +62,12 @@ describe("SettingsView", () => {
       settings: { ...settings, model_choice: "best" },
     });
     expect(await screen.findByText("Saved.")).toBeInTheDocument();
+  });
+
+  it("offers a download for the optional model tier when it is absent", async () => {
+    render(<SettingsView />);
+    const download = await screen.findByRole("button", { name: "Download" });
+    await userEvent.click(download);
+    expect(mockInvoke).toHaveBeenCalledWith("download_model", { tier: "okay" });
   });
 });

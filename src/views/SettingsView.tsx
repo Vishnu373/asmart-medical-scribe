@@ -1,6 +1,15 @@
 import { useEffect, useState } from "react";
-import { getSettings, listInputDevices, updateSettings } from "@/bridge";
-import type { InputDevice, Settings } from "@/bridge";
+import {
+  downloadModel,
+  getSettings,
+  listInputDevices,
+  modelStatus,
+  onModelDownloadDone,
+  onModelDownloadError,
+  onModelDownloadProgress,
+  updateSettings,
+} from "@/bridge";
+import type { InputDevice, ModelStatus, Settings } from "@/bridge";
 import { useAppStore } from "@/state";
 
 /** Doctor-facing model tiers (§9.3 `model_choice`). */
@@ -31,6 +40,9 @@ export default function SettingsView() {
   const pushToast = useAppStore((s) => s.pushToast);
 
   const [devices, setDevices] = useState<InputDevice[]>([]);
+  const [models, setModels] = useState<ModelStatus[]>([]);
+  // Download progress for the optional tier, 0–100; null when not downloading.
+  const [downloadPct, setDownloadPct] = useState<number | null>(null);
   // Local edit buffer; null until the initial load resolves.
   const [form, setForm] = useState<Settings | null>(settings);
   const [saved, setSaved] = useState(false);
@@ -45,8 +57,44 @@ export default function SettingsView() {
     listInputDevices()
       .then(setDevices)
       .catch((e) => pushToast(String(e), "error"));
+    modelStatus()
+      .then(setModels)
+      .catch((e) => pushToast(String(e), "error"));
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Subscribe to download progress/result events for the optional model (D1).
+  useEffect(() => {
+    const unlisten = Promise.all([
+      onModelDownloadProgress((p) => {
+        setDownloadPct(p.total > 0 ? Math.round((p.downloaded / p.total) * 100) : 0);
+      }),
+      onModelDownloadDone(() => {
+        setDownloadPct(null);
+        modelStatus().then(setModels).catch(() => {});
+        pushToast("Model downloaded.", "info");
+      }),
+      onModelDownloadError((e) => {
+        setDownloadPct(null);
+        pushToast(e.message, "error");
+      }),
+    ]);
+    return () => {
+      unlisten.then((fns) => fns.forEach((fn) => fn()));
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const okay = models.find((m) => m.tier === "okay");
+  const okayNeedsDownload = okay?.optional && !okay.present;
+
+  const onDownloadOkay = () => {
+    setDownloadPct(0);
+    downloadModel("okay").catch((e) => {
+      setDownloadPct(null);
+      pushToast(String(e), "error");
+    });
+  };
 
   if (!form) {
     return (
@@ -84,12 +132,35 @@ export default function SettingsView() {
           onChange={(e) => patch({ model_choice: e.target.value })}
           className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-600 focus:outline-none"
         >
-          {MODELS.map((m) => (
-            <option key={m.value} value={m.value}>
-              {m.label}
-            </option>
-          ))}
+          {MODELS.map((m) => {
+            // The optional "okay" tier can't be selected until it's downloaded.
+            const needsDownload = m.value === "okay" && okayNeedsDownload;
+            return (
+              <option key={m.value} value={m.value} disabled={needsDownload}>
+                {m.label}
+                {needsDownload ? " — download required" : ""}
+              </option>
+            );
+          })}
         </select>
+        {okayNeedsDownload && (
+          <div className="mt-1 flex items-center gap-3 text-sm text-neutral-400">
+            {downloadPct === null ? (
+              <>
+                <span>The “Okay” model isn’t installed.</span>
+                <button
+                  type="button"
+                  onClick={onDownloadOkay}
+                  className="rounded border border-neutral-700 px-2 py-0.5 text-xs hover:bg-neutral-800"
+                >
+                  Download
+                </button>
+              </>
+            ) : (
+              <span>Downloading… {downloadPct}%</span>
+            )}
+          </div>
+        )}
       </label>
 
       <label className="flex flex-col gap-1">

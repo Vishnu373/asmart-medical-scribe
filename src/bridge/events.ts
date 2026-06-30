@@ -9,6 +9,7 @@ import type {
   ErrorEvent,
   GenerationTokenEvent,
   InputLevelEvent,
+  ModelDownloadProgressEvent,
   StateChangedEvent,
   TranscriptSegmentEvent,
 } from "@/bridge/types";
@@ -39,4 +40,24 @@ export function onStateChanged(handler: (payload: StateChangedEvent) => void): P
 
 export function onError(handler: (payload: ErrorEvent) => void): Promise<UnlistenFn> {
   return on("error", handler);
+}
+
+// — Optional-model download (§8.2, D1).
+
+export function onModelDownloadProgress(
+  handler: (payload: ModelDownloadProgressEvent) => void,
+): Promise<UnlistenFn> {
+  return on("model-download-progress", handler);
+}
+
+export function onModelDownloadDone(
+  handler: (payload: { tier: string }) => void,
+): Promise<UnlistenFn> {
+  return on("model-download-done", handler);
+}
+
+export function onModelDownloadError(
+  handler: (payload: { tier: string; message: string }) => void,
+): Promise<UnlistenFn> {
+  return on("model-download-error", handler);
 }
