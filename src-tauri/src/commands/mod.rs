@@ -8,6 +8,7 @@ use std::sync::Arc;
 
 use tauri::State;
 
+use crate::llm::{LlmEngine, LlmModel};
 use crate::orchestrator::Coordinator;
 use crate::settings::{Settings, SharedSettings};
 use crate::store::{Note, Record, RecordSummary, SharedStore};
@@ -167,9 +168,21 @@ pub fn get_settings(state: State<'_, SharedSettings>) -> Settings {
 #[tauri::command]
 pub fn update_settings(
     state: State<'_, SharedSettings>,
+    engine: State<'_, Arc<LlmEngine>>,
     settings: Settings,
 ) -> Result<(), String> {
-    state.update(settings).map_err(|e| e.to_string())
+    // Retarget the live note-generation engine so a `model_choice` change takes
+    // effect without an app restart. `from_choice` resolves the tier the same way
+    // startup does (explicit tier, else the RAM-fit default); `set_model` is a no-op
+    // when unchanged and otherwise unloads the old model so the next note reloads
+    // the new one. Uses the cached RAM probe, falling back to a fresh probe.
+    let total_ram = settings
+        .observed_total_ram
+        .unwrap_or_else(crate::residency::probe_total_ram);
+    let kind = LlmModel::from_choice(&settings.model_choice, total_ram);
+    state.update(settings).map_err(|e| e.to_string())?;
+    engine.set_model(kind);
+    Ok(())
 }
 
 /// A microphone choice for the settings picker (FR-12). Display-only metadata —

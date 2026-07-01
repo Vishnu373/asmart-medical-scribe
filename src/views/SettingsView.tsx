@@ -13,11 +13,19 @@ import type { InputDevice, ModelStatus, Settings } from "@/bridge";
 import { useAppStore } from "@/state";
 
 /** Doctor-facing model tiers (§9.3 `model_choice`). */
-const MODELS: { value: string; label: string }[] = [
-  { value: "best", label: "Best — Mistral-7B (most accurate, needs the most RAM)" },
-  { value: "medium", label: "Medium — Phi-3.5 Q8" },
-  { value: "okay", label: "Okay — Phi-3.5 Q4 (lightest)" },
+const MODELS: { value: string; label: string; short: string }[] = [
+  { value: "", label: "Automatic — best model your device can run", short: "Automatic" },
+  { value: "best", label: "Best — Mistral-7B (most accurate, needs the most RAM)", short: "Best" },
+  { value: "medium", label: "Medium — Phi-3.5 Q8", short: "Medium" },
+  { value: "okay", label: "Okay — Phi-3.5 Q4 (lightest)", short: "Okay" },
 ];
+
+/** Remove one tier's entry from the per-tier download-progress map. */
+function dropTier(d: Record<string, number>, tier: string): Record<string, number> {
+  const next = { ...d };
+  delete next[tier];
+  return next;
+}
 
 /** Manual residency force (§7). `null` = use the automatic per-machine decision. */
 const RESIDENCY: { value: string; label: string }[] = [
@@ -41,8 +49,10 @@ export default function SettingsView() {
 
   const [devices, setDevices] = useState<InputDevice[]>([]);
   const [models, setModels] = useState<ModelStatus[]>([]);
-  // Download progress for the optional tier, 0–100; null when not downloading.
-  const [downloadPct, setDownloadPct] = useState<number | null>(null);
+  // In-flight download progress per tier, 0–100 (keyed by `model_choice` tier).
+  // A tier is absent from the map when it isn't downloading; both optional tiers
+  // (Phi Q8 "medium", Phi Q4 "okay") can be pulled, so this is keyed, not scalar.
+  const [downloads, setDownloads] = useState<Record<string, number>>({});
   // Local edit buffer; null until the initial load resolves.
   const [form, setForm] = useState<Settings | null>(settings);
   const [saved, setSaved] = useState(false);
@@ -67,15 +77,16 @@ export default function SettingsView() {
   useEffect(() => {
     const unlisten = Promise.all([
       onModelDownloadProgress((p) => {
-        setDownloadPct(p.total > 0 ? Math.round((p.downloaded / p.total) * 100) : 0);
+        const pct = p.total > 0 ? Math.round((p.downloaded / p.total) * 100) : 0;
+        setDownloads((d) => ({ ...d, [p.tier]: pct }));
       }),
-      onModelDownloadDone(() => {
-        setDownloadPct(null);
+      onModelDownloadDone((e) => {
+        setDownloads((d) => dropTier(d, e.tier));
         modelStatus().then(setModels).catch(() => {});
         pushToast("Model downloaded.", "info");
       }),
       onModelDownloadError((e) => {
-        setDownloadPct(null);
+        setDownloads((d) => dropTier(d, e.tier));
         pushToast(e.message, "error");
       }),
     ]);
@@ -85,13 +96,20 @@ export default function SettingsView() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
-  const okay = models.find((m) => m.tier === "okay");
-  const okayNeedsDownload = okay?.optional && !okay.present;
+  // Any tier absent from disk is unpickable (loading it would error). A tier is
+  // *downloadable* only if it's also optional — a tier this build neither bundles
+  // nor offers as a download (e.g. "best"/Mistral on a <16 GB build) is absent with
+  // no recourse, so it's disabled but shows no Download row rather than being left
+  // freely selectable and failing at generation time.
+  const isAbsent = (tier: string) =>
+    models.some((m) => m.tier === tier && !m.present);
+  const canDownload = (tier: string) =>
+    models.some((m) => m.tier === tier && m.optional && !m.present);
 
-  const onDownloadOkay = () => {
-    setDownloadPct(0);
-    downloadModel("okay").catch((e) => {
-      setDownloadPct(null);
+  const onDownload = (tier: string) => {
+    setDownloads((d) => ({ ...d, [tier]: 0 }));
+    downloadModel(tier).catch((e) => {
+      setDownloads((d) => dropTier(d, tier));
       pushToast(String(e), "error");
     });
   };
@@ -133,34 +151,48 @@ export default function SettingsView() {
           className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-600 focus:outline-none"
         >
           {MODELS.map((m) => {
-            // The optional "okay" tier can't be selected until it's downloaded.
-            const needsDownload = m.value === "okay" && okayNeedsDownload;
+            // Any absent tier is unpickable; the note distinguishes a tier you can
+            // download from one this build doesn't ship at all.
+            const absent = isAbsent(m.value);
+            const note = !absent
+              ? ""
+              : canDownload(m.value)
+                ? " — download required"
+                : " — not available in this version";
             return (
-              <option key={m.value} value={m.value} disabled={needsDownload}>
+              <option key={m.value} value={m.value} disabled={absent}>
                 {m.label}
-                {needsDownload ? " — download required" : ""}
+                {note}
               </option>
             );
           })}
         </select>
-        {okayNeedsDownload && (
-          <div className="mt-1 flex items-center gap-3 text-sm text-neutral-400">
-            {downloadPct === null ? (
-              <>
-                <span>The “Okay” model isn’t installed.</span>
-                <button
-                  type="button"
-                  onClick={onDownloadOkay}
-                  className="rounded border border-neutral-700 px-2 py-0.5 text-xs hover:bg-neutral-800"
-                >
-                  Download
-                </button>
-              </>
-            ) : (
-              <span>Downloading… {downloadPct}%</span>
-            )}
-          </div>
-        )}
+        {MODELS.filter((m) => canDownload(m.value)).map((m) => {
+          const pct = downloads[m.value];
+          return (
+            <div
+              key={m.value}
+              className="mt-1 flex items-center gap-3 text-sm text-neutral-400"
+            >
+              {pct === undefined ? (
+                <>
+                  <span>The “{m.short}” model isn’t installed.</span>
+                  <button
+                    type="button"
+                    onClick={() => onDownload(m.value)}
+                    className="rounded border border-neutral-700 px-2 py-0.5 text-xs hover:bg-neutral-800"
+                  >
+                    Download
+                  </button>
+                </>
+              ) : (
+                <span>
+                  Downloading {m.short}… {pct}%
+                </span>
+              )}
+            </div>
+          );
+        })}
       </label>
 
       <label className="flex flex-col gap-1">

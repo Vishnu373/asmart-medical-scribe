@@ -118,6 +118,10 @@ pub fn run() {
                 store.clone(),
                 data_dir,
             );
+            // Shared with the `update_settings` command so a `model_choice` change
+            // retargets the live engine (no restart): the generator and the command
+            // hold the same `Arc<LlmEngine>`.
+            app.manage(llm_engine.clone());
             let generator =
                 RealNoteGenerator::new(handle.clone(), llm_engine, store.clone(), swap_mode);
             let coordinator = Coordinator::new(
@@ -166,6 +170,8 @@ pub fn run() {
             commands::list_input_devices,
             models::model_status,
             models::download_model,
+            models::setup_status,
+            models::download_stt,
             handoff::paste_section,
             handoff::rebind_paste_hotkey,
             handoff::copy_to_clipboard,

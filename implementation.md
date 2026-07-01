@@ -402,7 +402,194 @@ selectable after `model-download-done`.
 vs optional; a model-distribution note; the single gated network call) — do via the
 `system-design-doc` skill after this phase is approved.
 
+### Phase D2 — Per-build bundling + both Phi tiers downloadable  `[x] implemented (Windows verify pending)`
+**Goal:** Refine D1's distribution per the confirmed decision: a build bundles
+Parakeet + **exactly one** RAM-fit LLM (not both LLMs), and **both** Phi tiers are
+on-demand downloads so a doctor can pull whichever their build didn't bundle.
+**Depends on:** D1 (done).
+
+**Distribution decision (locked):**
+- **≥16 GB build** bundles Parakeet + **Mistral-7B** ("best").
+- **<16 GB build** bundles Parakeet + **Phi-3.5 Q8** ("medium").
+- **Downloadable on either build:** Phi-3.5 Q8 ("medium") and Phi-3.5 Q4 ("okay").
+  On a <16 GB build Phi Q8 is already bundled, so `model_status` reports it present
+  and the UI never offers its download — the same generic UI serves both builds.
+- Which GGUF is bundled is a **packaging step** (place the right file under
+  `resources/models/` before `tauri build`); no runtime code enforces it.
+
+**Backend tasks:**
+- [x] `models/mod.rs`: `OPTIONAL` now lists **both** Phi tiers ("medium" Q8 +
+      "okay" Q4), each with its HF URL; `sha256` still `None` (TODO pin). Module doc
+      updated — one LLM bundled per build, both Phi tiers downloadable. No change to
+      `download_model`/`model_status` (already tier-generic).
+- [x] `llm/engine.rs`: enum doc updated so `Mistral` reads "bundled on ≥16 GB
+      builds", `Phi` "bundled on <16 GB builds; downloadable elsewhere". No logic
+      change — `for_total_ram`/`from_choice` already implement the RAM rule.
+
+**Frontend tasks:**
+- [x] `SettingsView`: the picker + Download affordance are now **generic over any
+      optional-and-absent tier** (was hardcoded to "okay"). Download progress is
+      tracked **per tier** (`Record<string, number>`) since both Phi tiers can be
+      pulled. Each absent optional tier renders its own Download row with live %.
+- [x] `bridge/commands.ts`: corrected the two "only `okay`" comments to name both
+      downloadable Phi tiers.
+
+**Verification:** `bun run test` — `SettingsView.test.tsx` gains a ≥16 GB-build case
+(both Phi tiers absent → two Download buttons; clicking Q8 invokes
+`download_model {tier:"medium"}`); the existing <16 GB case (Q8 bundled, only Q4
+offered) still passes. `cargo test` — `optional_catalog_filenames_match_the_loader`
+now also covers the "medium" entry. Manual Windows: on a ≥16 GB install both Phi
+downloads appear; on a <16 GB install only Q4 does.
+**Follow-up:** carries D1's open items — pin both Phi SHA-256s; update `design.md`
+§8.2 for the per-build bundling.
+
+### Phase D3 — First-run setup: download core models (lean installer)  `[x] implemented — Windows verify pending`
+**Goal:** Ship a lean installer that carries **no** large model weights, and download
+the core models **once** on first launch through a one-time Setup step. The app is
+**gated** until the required models are on disk; afterwards they are cached and reused
+every launch, fully offline. This **supersedes the D1/D2 bundling** of the LLM and STT
+weights — the installer ships only the app + VAD; the LLM and Parakeet are fetched at
+first run.
+**Depends on:** D1 (download infra), D2 (tier-generic catalog/UI). Reuses both.
+
+**What is downloaded on first run:**
+- **The RAM-fit default LLM** — Mistral-7B on ≥16 GB, Phi-3.5 Q8 on <16 GB (§8.2 rule;
+  already wired as downloadable in D1/D2). Single GGUF, reuses `download_model`.
+- **Parakeet TDT v3** (STT) — required for the app to function at all.
+
+**Parakeet download (the new capability D3 adds):**
+- Source: `https://blob.handy.computer/parakeet-v3-int8.tar.gz`, sha256
+  `43d37191602727524a7d8c6da0eef11c4ba24320f5b4730f1a2497befc2efa77`, ~456 MB.
+- **⚠ Third-party host risk:** this URL is an external host **we do not control**. For
+  a standalone product, relying on it for the core STT model is fragile (it can change
+  or disappear, and it is out of our trust boundary). **Rehost the tarball on our own
+  storage and swap the URL before release.** Using it as the interim default.
+- Parakeet is a **directory** model, so the download path differs from the single-file
+  GGUFs: stream the `.tar.gz` → `.part`, sha256-verify, then **extract** into
+  `app_data_dir/models/`. Needs new deps **`flate2` + `tar`** (not currently in
+  `Cargo.toml`); `download_to` streams a single file today.
+- Parakeet is STT (`ModelKind`), not an LLM tier — it needs its **own catalog entry +
+  download path**, separate from the `LlmModel`-tier `OPTIONAL`/`download_model`.
+
+**Backend tasks:**
+- [x] Add `flate2` + `tar` deps; a directory-download variant of `download_to` that
+      verifies the archive sha256 then extracts to the models dir. Done: refactored
+      the D1 stream/verify into a shared `stream_verified` helper; `download_stt_to`
+      reuses it then `extract_model_dir` unpacks to a staging dir and renames the
+      model root into place under `dir_name`.
+- [x] STT download entry (url + sha256 + expected dir name) and a command to trigger
+      it + report progress, mirroring the LLM events. Done: `models::STT` catalog +
+      `download_stt` command; emits the same `model-download-*` events keyed by tier
+      `"stt"`; shares the `IN_FLIGHT` guard.
+- [x] A `setup_status` reporting whether the **required** set — RAM-fit LLM +
+      Parakeet — is present, so the frontend can gate. Done: `setup_status` returns
+      `{ llm_tier, llm_present, stt_present, ready }` (`llm_tier` from
+      `LlmModel::for_total_ram(...).tier()`).
+
+**Frontend tasks:**
+- [x] First-run **Setup** view: on launch, if the required set is absent, show it,
+      trigger the download(s) with live progress, and only release into the app once
+      complete. Retry on failure. Skipped entirely when models are present. Done:
+      `SetupView` (auto-starts the missing downloads, per-model progress bars, Retry
+      on error, `onReady` when `setup_status.ready`); `App` gates on `setup_status`.
+
+**Open items / decisions:**
+- **Extracted dir name.** The loader resolves `parakeet-tdt-0.6b-v3`
+  (`ModelKind::dir_name`); the tarball's directory is `parakeet-tdt-0.6b-v3-int8`.
+  The extraction must land the files under the name the loader expects (rename on
+  extract, or align `dir_name`). Confirm the archive's internal layout on Windows.
+- **UX:** blocking Setup screen vs. background download with a progress banner; and
+  behavior if the user quits mid-download (resume from `.part`).
+- **Rehost Parakeet** (see risk above) before release.
+- Carries D1/D2 open items: pin the three LLM SHA-256s; update `design.md` §8.2 (now
+  "nothing bundled; core models downloaded on first run").
+
+**Verification (once built):** first launch with an empty models dir shows Setup;
+LLM + Parakeet download, verify (sha256), and extract; app reaches IDLE and
+transcribes + generates offline. Relaunch skips Setup. Mid-download quit resumes on
+next launch. `cargo test` covers the extraction/verify; `bun run test` covers gating.
+
 ## Progress Log
+
+- **2026-07-01 — Phase D3 (first-run setup / lean installer) implemented; Windows verify pending.**
+  Core models are now downloaded once on first launch and the app is gated until they
+  are present. **Backend:** added `flate2` + `tar`; refactored the D1 download so the
+  stream-hash-verify loop is a shared `stream_verified` helper (the LLM path renames
+  the `.part` into place; the STT path extracts it). New `models::STT` catalog entry
+  (Parakeet tarball URL + pinned sha256 + `dir_name`) and a `download_stt` command that
+  streams → verifies → `extract_model_dir` (unpacks to a `.staging` dir, picks the model
+  root via `single_subdir` — handling the archive's `…-int8` wrapper folder — and
+  renames it to the loader's `parakeet-tdt-0.6b-v3`); it emits the same
+  `model-download-*` events keyed by tier `"stt"` and shares the `IN_FLIGHT` guard.
+  Added `LlmModel::tier()` (inverse of `from_tier`) and a `setup_status` command
+  reporting `{ llm_tier, llm_present, stt_present, ready }`. Registered both commands.
+  Rust tests: STT `dir_name` matches the loader; `single_subdir` wrapper detection.
+  **Frontend:** new `SetupView` (auto-starts the missing required downloads, per-model
+  progress bars, Retry on error, calls `onReady` once `setup_status.ready`); `App` gates
+  the shell behind `setup_status`. Bridge: `SetupStatus` type, `setupStatus`/`downloadStt`
+  wrappers. Tests: `SetupView.test.tsx` (auto-start + already-present release); updated
+  `App.test.tsx` for the async gate. **Verified here:** `tsc` (my files clean — one
+  pre-existing `soap.ts` `replaceAll` error unrelated) and the full `vitest` suite (58
+  passing). **Not verified here:** `cargo test`/build (no Rust toolchain on the Linux box
+  — run on Windows).
+  - **⚠ Third-party host (carried).** The Parakeet URL is `blob.handy.computer` — an
+    external host we do not control. Rehost the tarball on our own storage and swap
+    `models::STT.url` before release.
+  - **Open — confirm the archive layout on Windows.** `extract_model_dir` assumes the
+    tarball either wraps its files in a single top-level folder or lays them at the
+    root; verify against the real archive (and that `ParakeetModel::load` finds the
+    ONNX files under `parakeet-tdt-0.6b-v3` after extraction).
+  - **Open — mid-download quit does not resume.** A failed/aborted STT download deletes
+    its `.part`; a retry re-downloads from zero (no HTTP range resume). Acceptable for
+    v1; revisit if the ~456 MB restart proves painful.
+  - **`design.md` §8.2 updated** to the "lean installer; required models downloaded once
+    on first-run Setup, verified, cached; offline thereafter" model (new *Model
+    distribution & first-run setup* block + a Distribution decision row). Consistent with
+    §6.4's existing "downloaded once on first selection and cached".
+  - **Open (carried) — pin the three LLM SHA-256s** (`models::OPTIONAL` still `sha256: None`).
+
+- **2026-07-01 — All three LLM tiers now downloadable (Mistral "best" wired); verify pending.**
+  Extended D2 so the download catalog covers every LLM tier, not just the two Phi
+  ones. `models/mod.rs` `OPTIONAL` gains a `"best"` entry (Mistral-7B GGUF URL from
+  `models.json`, `sha256: None` — TODO pin); doc comments in `models/mod.rs`,
+  `llm/engine.rs`, and `bridge/commands.ts` updated to "all three tiers downloadable;
+  each build bundles the RAM-fit default". No logic change — `download_model`/
+  `model_status`/`SettingsView` were already tier-generic, so Mistral's Download row
+  appears automatically when it's absent. Repurposed the former "not available in this
+  version" test into a <16 GB-build case (Phi Q8 bundled → Mistral + Q4 both offered);
+  note the `isAbsent`/`canDownload` split is now defensive only, since every *LLM*
+  tier is downloadable (an absent LLM tier is always downloadable).
+  - **Parakeet still bundle-only (not wired).** STT is a *directory* model: wiring its
+    download needs (1) a real `.tar.gz` URL for the int8 folder — `models.json`'s
+    `nvidia/parakeet-tdt-0.6b-v3` is a web page shipping a `.nemo`, wrong format;
+    (2) tar.gz **extraction** (`flate2`+`tar` deps, not present; `download_to` streams
+    a single file only); and (3) a **non-tier** download path (`OPTIONAL`/
+    `download_model`/`model_status` are keyed to `LlmModel` tiers; Parakeet is a
+    `ModelKind`). Blocked pending the archive URL.
+
+- **2026-07-01 — Phase D2 (per-build bundling + both Phi tiers downloadable) implemented; Windows verify pending.**
+  Refined D1's distribution: a build bundles Parakeet + one RAM-fit LLM (Mistral on
+  ≥16 GB, Phi Q8 on <16 GB), and **both** Phi tiers are downloadable. `models/mod.rs`
+  `OPTIONAL` now carries "medium" (Phi Q8) alongside "okay" (Phi Q4); backend
+  `download_model`/`model_status` were already tier-generic so no logic changed.
+  Frontend: `SettingsView` download UI generalized from a hardcoded "okay" to any
+  optional-and-absent tier, with per-tier progress — this was the real gap (the
+  backend offered Phi Q8 but the UI never surfaced its button). Doc comments in
+  `llm/engine.rs` and `bridge/commands.ts` updated to "one bundled per build, both
+  Phi tiers downloadable". Added a ≥16 GB-build test case to `SettingsView.test.tsx`.
+  No new deps. Cannot `cargo test`/`bun run test` on the Linux box — verify on Windows.
+  - **Follow-up fix (same day) — unpickable ≠ downloadable.** The picker disabled a
+    tier only on `optional && !present`, so a tier this build neither bundles nor
+    offers (e.g. Mistral "best" on a <16 GB build: `present:false, optional:false`)
+    stayed freely selectable and failed at generation. Split the conditions:
+    `isAbsent` (any `!present`) disables the option; `canDownload` (`optional &&
+    !present`) gates the Download row. Non-downloadable absent tiers now read "not
+    available in this version". Added a <16 GB-build test.
+  - **Open item — pin both Phi SHA-256s.** `models::OPTIONAL` has `sha256: None` for
+    "medium" and "okay"; downloads are integrity-checked only by HTTPS + the size
+    check until the released files' hashes are captured and pinned.
+  - **Open item — `design.md` §8.2** still describes D1's "two LLMs bundled"; needs a
+    per-build-bundling update (deferred with D1's follow-up).
 
 - **2026-06-30 — Phase D1 (model distribution) implemented; Windows verify pending.**
   Ship-with-models + optional download. New `models` module: on-disk resolver

@@ -70,4 +70,60 @@ describe("SettingsView", () => {
     await userEvent.click(download);
     expect(mockInvoke).toHaveBeenCalledWith("download_model", { tier: "okay" });
   });
+
+  it("offers Mistral + Q4 downloads on a <16 GB build (Phi Q8 bundled)", async () => {
+    // A <16 GB build bundles Phi Q8; both absent tiers (Mistral "best" and Phi Q4
+    // "okay") are downloadable, so each is disabled until pulled and gets a control.
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(settings);
+        case "list_input_devices":
+          return Promise.resolve([{ name: "USB Mic", is_default: true }]);
+        case "model_status":
+          return Promise.resolve([
+            { tier: "best", present: false, optional: true },
+            { tier: "medium", present: true, optional: false },
+            { tier: "okay", present: false, optional: true },
+          ]);
+        default:
+          return Promise.resolve(undefined);
+      }
+    });
+
+    render(<SettingsView />);
+    const best = await screen.findByRole("option", { name: /Best/ });
+    expect(best).toBeDisabled();
+    expect(best).toHaveTextContent(/download required/);
+    // Both absent optional tiers get a Download control; the bundled Phi Q8 does not.
+    const downloads = await screen.findAllByRole("button", { name: "Download" });
+    expect(downloads).toHaveLength(2);
+  });
+
+  it("offers a download for each absent optional tier (≥16 GB build: Q8 + Q4)", async () => {
+    // A ≥16 GB build bundles Mistral; both Phi tiers are absent and downloadable.
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "get_settings":
+          return Promise.resolve(settings);
+        case "list_input_devices":
+          return Promise.resolve([{ name: "USB Mic", is_default: true }]);
+        case "model_status":
+          return Promise.resolve([
+            { tier: "best", present: true, optional: false },
+            { tier: "medium", present: false, optional: true },
+            { tier: "okay", present: false, optional: true },
+          ]);
+        default:
+          return Promise.resolve(undefined);
+      }
+    });
+
+    render(<SettingsView />);
+    const downloads = await screen.findAllByRole("button", { name: "Download" });
+    expect(downloads).toHaveLength(2);
+    // The first control corresponds to "medium" (MODELS order: best, medium, okay).
+    await userEvent.click(downloads[0]);
+    expect(mockInvoke).toHaveBeenCalledWith("download_model", { tier: "medium" });
+  });
 });

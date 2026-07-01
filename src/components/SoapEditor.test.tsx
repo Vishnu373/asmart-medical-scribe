@@ -18,36 +18,25 @@ const note: Note = {
 beforeEach(() => mockInvoke.mockClear().mockResolvedValue(null));
 
 describe("SoapEditor", () => {
-  it("renders the four sections parsed from soap_data", () => {
+  it("renders the whole note in a single editable window", () => {
     render(<SoapEditor note={note} />);
-    expect(screen.getByRole("textbox", { name: "Subjective" })).toHaveValue("cough");
-    expect(screen.getByRole("textbox", { name: "Plan" })).toHaveValue("rest");
-    expect(screen.getByRole("textbox", { name: "Objective" })).toHaveValue("");
+    expect(screen.getByRole("textbox", { name: "SOAP note" })).toHaveValue(note.soap_data);
   });
 
-  it("debounce-saves edits via update_note with reassembled markdown", async () => {
+  it("debounce-saves edits via update_note with the verbatim note", async () => {
     vi.useFakeTimers();
     render(<SoapEditor note={note} />);
-    fireEvent.change(screen.getByRole("textbox", { name: "Objective" }), {
-      target: { value: "temp 38" },
+    const edited = note.soap_data.replace("## Objective\n", "## Objective\ntemp 38\n");
+    fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
+      target: { value: edited },
     });
     expect(mockInvoke).not.toHaveBeenCalled();
     await vi.advanceTimersByTimeAsync(600);
-    expect(mockInvoke).toHaveBeenCalledWith("update_note", {
-      id: "n1",
-      soapData: "## Subjective\ncough\n\n## Objective\ntemp 38\n\n## Assessment\n\n## Plan\nrest",
-    });
+    expect(mockInvoke).toHaveBeenCalledWith("update_note", { id: "n1", soapData: edited });
     vi.useRealTimers();
   });
 
-  it("copies a section's text to the clipboard for manual paste", () => {
-    render(<SoapEditor note={note} />);
-    // Buttons are in S/O/A/P order; the first (Subjective) has text, so it's enabled.
-    fireEvent.click(screen.getAllByRole("button", { name: "Copy" })[0]);
-    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", { text: "cough" });
-  });
-
-  it("strips markdown on copy so the EMR gets plain text", () => {
+  it("copies the whole note as plain text for manual paste", () => {
     const md: Note = {
       ...note,
       soap_data:
@@ -56,21 +45,19 @@ describe("SoapEditor", () => {
         "## Assessment\n\n## Plan\n",
     };
     render(<SoapEditor note={md} />);
-    const buttons = screen.getAllByRole("button", { name: "Copy" });
-    fireEvent.click(buttons[0]); // Subjective: bold stripped
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
     expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
-      text: "Patient reports a sore throat for 3 days.",
-    });
-    fireEvent.click(buttons[1]); // Objective: bullet markers stripped
-    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
-      text: "Temp 38.1 C\nThroat erythematous",
+      text:
+        "## Subjective\nPatient reports a sore throat for 3 days.\n\n" +
+        "## Objective\nTemp 38.1 C\nThroat erythematous\n\n" +
+        "## Assessment\n\n## Plan",
     });
   });
 
   it("flushes a pending edit on unmount", () => {
     render(<SoapEditor note={note} />);
-    fireEvent.change(screen.getByRole("textbox", { name: "Plan" }), {
-      target: { value: "follow up" },
+    fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
+      target: { value: note.soap_data + "\nfollow up" },
     });
     cleanup();
     expect(mockInvoke).toHaveBeenCalledWith(

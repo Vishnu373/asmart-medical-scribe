@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ping } from "@/bridge";
+import { ping, setupStatus } from "@/bridge";
 import { useAppStore } from "@/state";
 import { useBackendEvents } from "@/hooks/useBackendEvents";
 import NavBar from "@/components/NavBar";
@@ -7,6 +7,7 @@ import Toaster from "@/components/Toaster";
 import RecordingView from "@/views/RecordingView";
 import RecordsView from "@/views/RecordsView";
 import SettingsView from "@/views/SettingsView";
+import SetupView from "@/views/SetupView";
 
 function ActiveView() {
   const view = useAppStore((s) => s.view);
@@ -22,6 +23,9 @@ function ActiveView() {
 
 function App() {
   const [bridgeOk, setBridgeOk] = useState<boolean | null>(null);
+  // First-run gate (D3): `null` while checking, `false` until the required models
+  // are downloaded (show Setup), `true` once the app can run.
+  const [setupReady, setSetupReady] = useState<boolean | null>(null);
 
   // Wire backend → UI events (§9.5) into the store, once, at the root.
   useBackendEvents();
@@ -32,6 +36,20 @@ function App() {
       .then(() => setBridgeOk(true))
       .catch(() => setBridgeOk(false));
   }, []);
+
+  // Are the required models present? If not, Setup downloads them first (D3).
+  useEffect(() => {
+    setupStatus()
+      .then((s) => setSetupReady(s.ready))
+      .catch(() => setSetupReady(true)); // don't hard-block if the check fails
+  }, []);
+
+  if (setupReady === null) {
+    return <div className="h-screen bg-neutral-950" aria-label="loading" />;
+  }
+  if (!setupReady) {
+    return <SetupView onReady={() => setSetupReady(true)} />;
+  }
 
   return (
     <div className="flex h-screen flex-col bg-neutral-950 text-neutral-100">

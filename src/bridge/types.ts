@@ -64,6 +64,16 @@ export interface ModelStatus {
   optional: boolean;
 }
 
+/** Whether the required models are on disk so the app can start (D3 first-run gate). `models::SetupStatus`. */
+export interface SetupStatus {
+  /** The RAM-fit LLM tier this machine needs (`best` | `medium`) — what Setup downloads. */
+  llm_tier: string;
+  llm_present: boolean;
+  stt_present: boolean;
+  /** Both required models present — the app can leave Setup. */
+  ready: boolean;
+}
+
 /** Progress for an in-flight optional-model download (D1). `total === 0` ⇒ unknown size. */
 export interface ModelDownloadProgressEvent {
   tier: string;

@@ -589,6 +589,13 @@ A single threshold at 16 GB governs the choice. Below it, Phi defaults to the hi
 
 **Execution model.** The selected GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6).
 
+**Model distribution & first-run setup.** The installer ships **no** model weights — it carries only the application (and the small VAD model), keeping the download lean. The models the app needs are fetched **once, on first launch**, through a one-time **Setup** step, then cached on disk and reused every launch — fully offline thereafter (matching the STT lifecycle in §6.4, "downloaded once on first selection and cached"). Setup downloads exactly the models this machine requires: the **RAM-fit note-generation model** chosen by the rule above (Mistral-7B on ≥16 GB, Phi-3.5 Q8 on <16 GB) and the **Parakeet STT model**. Beyond that required pair, the other note-generation tiers remain available as on-demand downloads from Settings, so the clinician can switch model later.
+
+- **Gated until ready.** On launch the app checks whether the required models are present; if not, it shows the Setup screen and does not proceed into recording/generation until both are downloaded and verified. Once present, Setup is skipped entirely.
+- **Integrity-checked.** Each download is verified against a known checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
+- **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function (§4 deployment model 1).
+- **On-disk resolution.** Downloaded models live in the app's writable data directory; the loader resolves each model by name there, so a model the clinician later downloads is picked up automatically on the next load.
+
 **Tuning notes (recorded, set at implementation via benchmarking — not architectural decisions):**
 
 - **Thread count** — scaled to the machine's physical core count.
@@ -603,6 +610,7 @@ A single threshold at 16 GB governs the choice. Below it, Phi defaults to the hi
 | Model selection | ≥16 GB → Mistral-7B Q4_K_M; <16 GB → Phi-3.5-mini Q8_0 | Fit-to-machine; all candidates cleared on quality |
 | Quant override (<16 GB) | Default Q8_0; user may drop to Q4_K_M | Reclaim RAM / speed if generation feels slow |
 | Decision timing | At the §7 startup probe; model size feeds §7's footprint calc | One probe drives both model choice and residency mode |
+| Distribution | Lean installer (no bundled weights); required models downloaded once on first-run Setup, verified, cached | Small installer; models fetched to fit the machine and integrity-checked; offline after Setup |
 | Execution | `llama-cpp-2`, in-process, no server/network | Fully on-device; satisfies NFR-6 |
 | Runtime tuning | Threads, context cap, sampling, memory levers | Deferred to implementation benchmarking, not design-time |
 

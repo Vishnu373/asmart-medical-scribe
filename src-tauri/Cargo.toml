@@ -67,6 +67,12 @@ tauri-plugin-clipboard-manager = "2"
 # network path in the app, gated behind the click — model weights, never PHI.
 ureq = "2"
 sha2 = "0.10"
+# First-run STT download (D3): Parakeet ships as a gzipped tar of a directory of
+# ONNX files (not a single GGUF), so the download is verified then extracted.
+# `flate2` (miniz_oxide backend — pure Rust, no zlib) inflates the gzip; `tar`
+# unpacks the archive.
+flate2 = "1"
+tar = "0.4"
 # Optional, off-by-default crash reporting (§10.3, B11). Disabled in the default
 # build so it stays fully offline (NFR-6); enable with `--features crash-reporting`
 # once a DSN exists. PHI is structurally excluded (see telemetry::scrub_event).

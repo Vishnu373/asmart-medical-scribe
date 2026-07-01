@@ -144,7 +144,7 @@ impl SttEngine {
     /// order (the D1 resolver: download dir first, then bundled resource dir). A
     /// no-op when that model is already loaded; this is what the orchestrator calls
     /// before a recording so the bundled Parakeet model is actually wired in (it's
-    /// resolved from `resources/models/<dir_name>` rather than assumed loaded).
+    /// resolved from `<resource_dir>/models/<dir_name>` rather than assumed loaded).
     pub fn ensure_loaded(&self, kind: ModelKind, model_dirs: &[PathBuf]) -> Result<()> {
         if self.current_model() == Some(kind) && self.is_loaded() {
             return Ok(());

@@ -27,15 +27,18 @@ use super::prompt::build_prompt;
 
 /// The note-generation model (design §8.2). The three doctor-facing tiers map
 /// here: `best`→Mistral, `medium`→Phi (Q8), `okay`→PhiQ4. When no tier is chosen
-/// the model is picked fit-to-machine on total RAM ([`for_total_ram`]). The first
-/// two ship bundled; PhiQ4 is the optional on-demand download (D1, `models`).
+/// the model is picked fit-to-machine on total RAM ([`for_total_ram`]). Each build
+/// bundles exactly one LLM (the RAM-fit default); all three tiers are also
+/// downloadable on demand (D1, `models`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmModel {
-    /// `best` (≥16 GB default): Mistral-7B-Instruct-v0.3 Q4_K_M (~4.4 GB). Bundled.
+    /// `best` (≥16 GB default): Mistral-7B-Instruct-v0.3 Q4_K_M (~4.4 GB). Bundled
+    /// on ≥16 GB builds; downloadable elsewhere.
     Mistral,
-    /// `medium` (<16 GB default): Phi-3.5-mini-instruct Q8_0 (~4.0 GB). Bundled.
+    /// `medium` (<16 GB default): Phi-3.5-mini-instruct Q8_0 (~4.0 GB). Bundled on
+    /// <16 GB builds; downloadable elsewhere.
     Phi,
-    /// `okay`: Phi-3.5-mini-instruct Q4_K_M (~2.4 GB). Optional, downloaded on demand.
+    /// `okay`: Phi-3.5-mini-instruct Q4_K_M (~2.4 GB). Downloaded on demand.
     PhiQ4,
 }
 
@@ -66,6 +69,17 @@ impl LlmModel {
             "medium" => Some(LlmModel::Phi),
             "okay" => Some(LlmModel::PhiQ4),
             _ => None,
+        }
+    }
+
+    /// The doctor-facing `model_choice` tier for this model — the inverse of
+    /// [`from_tier`]. Used by the first-run setup (D3) to name the RAM-fit LLM it
+    /// must download.
+    pub fn tier(self) -> &'static str {
+        match self {
+            LlmModel::Mistral => "best",
+            LlmModel::Phi => "medium",
+            LlmModel::PhiQ4 => "okay",
         }
     }
 
@@ -112,7 +126,11 @@ const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hal
 pub struct LlmEngine {
     backend: LlamaBackend,
     model: Mutex<Option<LlamaModel>>,
-    kind: LlmModel,
+    /// The tier the engine should load. Mutable so a `model_choice` change in
+    /// Settings takes effect live ([`set_model`]) without an app restart; guarded
+    /// separately from `model` and never held across a load, so the two locks
+    /// don't nest.
+    kind: Mutex<LlmModel>,
     /// Model-file search dirs, in priority order (D1): the app-data download dir
     /// first (optional models the doctor pulled), then the bundled resource dir.
     model_dirs: Vec<PathBuf>,
@@ -128,14 +146,35 @@ impl LlmEngine {
         Ok(Self {
             backend,
             model: Mutex::new(None),
-            kind,
+            kind: Mutex::new(kind),
             model_dirs,
             n_threads: n_threads.max(1),
         })
     }
 
     pub fn model_kind(&self) -> LlmModel {
-        self.kind
+        *self.kind.lock().unwrap()
+    }
+
+    /// Point the engine at `kind` (the doctor's `model_choice`, resolved to a tier).
+    /// When the tier actually changes, drop any loaded model so the next
+    /// [`ensure_loaded`]/[`generate`] loads the new one — this is what makes a
+    /// Settings model change take effect without restarting the app. A no-op when
+    /// the tier is unchanged, so callers can invoke it on every settings save.
+    pub fn set_model(&self, kind: LlmModel) {
+        let changed = {
+            let mut cur = self.kind.lock().unwrap();
+            if *cur == kind {
+                false
+            } else {
+                *cur = kind;
+                true
+            }
+        };
+        if changed {
+            self.unload();
+            info!("LLM target model changed to {:?}", kind);
+        }
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -150,7 +189,8 @@ impl LlmEngine {
         if self.is_loaded() {
             return Ok(());
         }
-        let file = self.kind.file_name();
+        let kind = self.model_kind();
+        let file = kind.file_name();
         let path = crate::models::resolve(file, &self.model_dirs).ok_or_else(|| {
             anyhow!(
                 "model file {file} not found in {:?} — the bundled model is missing, \
@@ -164,7 +204,7 @@ impl LlmEngine {
         let model = LlamaModel::load_from_file(&self.backend, &path, &params)
             .map_err(|e| anyhow!("failed to load LLM model {}: {e}", path.display()))?;
         *self.lock_model() = Some(model);
-        info!("Loaded LLM model: {:?}", self.kind);
+        info!("Loaded LLM model: {:?}", kind);
 
         // Warmup: the first inference after a load is slow (cold weights/buffers);
         // a tiny throwaway pass keeps the clinician's first real note at full
@@ -189,14 +229,14 @@ impl LlmEngine {
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>> {
         self.ensure_loaded()?;
-        let prompt = build_prompt(self.kind, transcript);
+        let prompt = build_prompt(self.model_kind(), transcript);
         self.run(&prompt, MAX_OUTPUT_TOKENS, on_token, cancel)
     }
 
     /// A throwaway generation right after load to warm caches; output discarded.
     fn warmup(&self) -> Result<()> {
         let never = Arc::new(AtomicBool::new(false));
-        let _ = self.run(&build_prompt(self.kind, "warmup"), 1, &|_| {}, &never)?;
+        let _ = self.run(&build_prompt(self.model_kind(), "warmup"), 1, &|_| {}, &never)?;
         Ok(())
     }
 

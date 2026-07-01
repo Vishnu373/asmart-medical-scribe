@@ -16,6 +16,13 @@ vi.mock("@tauri-apps/api/core", () => ({
         return Promise.resolve([]);
       case "model_status":
         return Promise.resolve([]);
+      case "setup_status":
+        return Promise.resolve({
+          llm_tier: "medium",
+          llm_present: true,
+          stt_present: true,
+          ready: true,
+        });
       case "get_settings":
         return Promise.resolve({
           model_choice: "medium",
@@ -38,21 +45,22 @@ vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() =
 beforeEach(() => useAppStore.setState({ view: "recording" }));
 
 describe("App shell", () => {
-  it("renders the header and primary nav", () => {
+  it("renders the header and primary nav", async () => {
     render(<App />);
-    expect(screen.getByRole("heading", { name: "Medical Scribe" })).toBeInTheDocument();
+    // Setup gate (D3) resolves ready → the shell mounts after the status check.
+    expect(await screen.findByRole("heading", { name: "Medical Scribe" })).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Recording" })).toBeInTheDocument();
   });
 
-  it("shows the Recording view by default", () => {
+  it("shows the Recording view by default", async () => {
     render(<App />);
-    expect(screen.getByRole("region", { name: "Recording" })).toBeInTheDocument();
+    expect(await screen.findByRole("region", { name: "Recording" })).toBeInTheDocument();
   });
 
   it("switches view when a nav item is clicked", async () => {
     render(<App />);
-    await userEvent.click(screen.getByRole("button", { name: "Settings" }));
+    await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     expect(screen.getByRole("region", { name: "Settings" })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
   });

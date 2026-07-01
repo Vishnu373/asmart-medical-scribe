@@ -15,7 +15,9 @@ use std::sync::{Arc, Mutex};
 // back to defaults (config-only, no PHI) rather than fail to parse.
 #[serde(default)]
 pub struct Settings {
-    /// Doctor-facing: `best` / `medium` / `okay` (§7).
+    /// Doctor-facing: `best` / `medium` / `okay`, or `""` = automatic (§7). Empty
+    /// means "no tier chosen", so the engine and first-run setup both fall back to
+    /// the RAM-fit default ([`LlmModel::from_choice`] → [`LlmModel::for_total_ram`]).
     pub model_choice: String,
     /// Doctor-facing: selected input device, `None` = system default.
     pub mic_device: Option<String>,
@@ -40,7 +42,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model_choice: "medium".to_string(),
+            model_choice: String::new(), // "" = automatic: pick the RAM-fit tier
             mic_device: None,
             paste_hotkey: "Alt+P".to_string(),
             residency_mode: None,

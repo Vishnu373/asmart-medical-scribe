@@ -42,7 +42,7 @@ describe("NotePanel", () => {
     await userEvent.click(screen.getByRole("button", { name: "Generate note" }));
     expect(mockInvoke).toHaveBeenCalledWith("generate_note", { recordId: "r1" });
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("list_notes", { recordId: "r1" }));
-    expect(await screen.findByRole("textbox", { name: "Subjective" })).toBeInTheDocument();
+    expect(await screen.findByRole("textbox", { name: "SOAP note" })).toBeInTheDocument();
   });
 
   it("shows the streaming view and a Cancel button during GENERATING", async () => {
