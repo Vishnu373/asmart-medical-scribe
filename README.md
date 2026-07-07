@@ -12,7 +12,8 @@ Built with **Tauri 2** (Rust backend + React / TypeScript frontend), fully offli
 | **Note generation** | llama.cpp (GGUF, in-process) |
 | **Storage** | SQLCipher (encrypted) + Windows DPAPI-wrapped key |
 
-📐 Architecture → [`design.md`](./design.md) · 🛠️ Build plan & progress → [`implementation.md`](./implementation.md)
+- 📐 Architecture → [`design.md`](./design.md) 
+- 🛠️ Build plan & progress → [`implementation.md`](./implementation.md)
 
 ---
 
@@ -163,8 +164,3 @@ bun run test
 </details>
 
 ---
-
-## 📚 Project docs
-
-- [`design.md`](./design.md) — architecture and design decisions.
-- [`implementation.md`](./implementation.md) — phased build plan and progress log.
