@@ -509,6 +509,128 @@ LLM + Parakeet download, verify (sha256), and extract; app reaches IDLE and
 transcribes + generates offline. Relaunch skips Setup. Mid-download quit resumes on
 next launch. `cargo test` covers the extraction/verify; `bun run test` covers gating.
 
+## Transcript Correction
+
+### Phase E1 — Post-ASR correction suggestions  `[ ] planned`
+**Goal:** After Stop, automatically propose contextual transcript fixes — the
+mishearings that deterministic word-fixing (`stt/text.rs`) can't catch because every
+word is valid but the phrase is wrong (e.g. *"right side, right down beforehand"* →
+*"right side of forehead"*). Suggestions are **streamed** into the UI as **inline,
+non-blocking popups** next to each flagged phrase; the clinician **accepts/rejects**
+each one. Accepted fixes patch the transcript. The pass **reuses the resident
+note-generation LLM** and is **sequenced before** Generate (never concurrent), so it
+adds no second model and no CPU contention. Design: **§6.7**.
+**Depends on:** B7/B10 (state machine + resident LLM engine), F3 (transcript editor),
+F4 (streaming/cancel pattern to mirror).
+
+**Design invariants (from §6.7):**
+- **Suggest, never rewrite** — the transcript changes only on an explicit Accept.
+  This human gate is the safety property (mirrors the §8.3 anti-fabrication rule);
+  no silent alteration of what was said.
+- **Output is a replacement of an existing span only** — not free text — so a
+  suggestion can't become an invention.
+- **Sequenced, not concurrent** with note generation — correction finishes before
+  Generate is available; the two never run at once.
+
+**Backend tasks:**
+- [ ] Correction command (e.g. `suggest_corrections`) that runs on the resident LLM
+      over the current transcript, driven from the orchestrator's Stop→review slot
+      (§6.6/§8.1). Reuses the loaded model per residency (§7) — no new model load.
+- [ ] A correction prompt (new `llm/` prompt path, kept unit-testable like
+      `llm/prompt.rs`) instructing the model to emit **one parseable record per line**,
+      each `{ original_span, replacement }`, spans copied verbatim from the transcript.
+- [ ] Stream + parse-as-you-go: emit each completed record as a `correction-suggestion`
+      event (mirroring `generation-token`); terminal `correction-done` /
+      `correction-error`. Cancelable via the existing generation-cancel path.
+- [ ] Guard: drop any suggestion whose `original_span` is not found in the transcript
+      (enforces the span-only invariant server-side, not just by prompt).
+
+**Frontend tasks:**
+- [ ] On Stop, auto-invoke the correction command; subscribe to `correction-*` events.
+- [ ] Inline **non-blocking popup** anchored to the flagged phrase (does not obscure
+      surrounding text), with Accept / Reject in place. Accept patches that span and
+      rides the existing debounced `update_transcript` save (§6.5); Reject dismisses.
+- [ ] **Duplicate spans** → apply to the **first not-yet-accepted** occurrence.
+- [ ] **No suggestions** → nothing shown, Generate simply becomes available (no modal).
+- [ ] **Cancel** path to skip the pass and go straight to editing/Generate; a model
+      error leaves a plain editable transcript. Feature is strictly additive — it
+      never blocks note generation.
+- [ ] Gate the **Generate** button so note-gen starts only after the correction pass
+      has ended (streamed/cancelled/failed), preserving the sequencing invariant.
+
+**Open items / decisions:**
+- **Span anchoring in the editor** — how to locate/highlight the popup at the right
+  offset in an editable document as it changes (character offsets vs. marker); confirm
+  it survives concurrent manual edits.
+- **First-token latency** on long transcripts / slow CPUs — if the wait proves too
+  long, revisit the §6.7 chunked-input alternative (per-segment windows).
+- **Prompt robustness** — malformed/partial lines mid-stream must be skipped, not
+  crash the parser.
+
+**Verification (once built):** unit — the correction prompt builds per model template;
+the not-in-transcript guard drops phantom spans; the per-line parser tolerates partial
+lines. RTL — streamed `correction-suggestion` events render inline popups; Accept
+patches the transcript and calls `update_transcript`; Reject dismisses; empty stream
+enables Generate with no popup; Generate is disabled until the pass ends. `cargo test`
++ `bun run test`.
+
+## Note Generation Tuning
+
+### Phase E2 — SOAP-R prompt tightening (one-shot + prompt caching)  `[ ] planned`
+**Goal:** Tighten note quality by moving from the zero-shot 4-section prompt to a
+**one-shot, 5-section SOAP-R** prompt that emits **concise bullets** (not prose), with
+explicit per-section placement rules. One shared technique for both models — the
+worked example teaches the format, so nothing model-specific is stated; only the
+existing instruct-template wrapper differs. The example is a **fixed prefix**,
+**prompt-cached** so it adds ~one-time (not per-note) prefill latency. Design: **§8.3**
+(prompt/output), **§8.2** (prompt caching), **§8.1** (Response definition).
+**Depends on:** B10 (LLM generation + `llm/prompt.rs`), F4.
+
+**Sections (SOAP-R):** Subjective (patient-reported), Objective (measured/observed
+only), Assessment (clinician's interpretation, transcript-supported), Plan (concrete
+next steps), **Response** (interval response to prior treatment; first visit stated
+explicitly). Empty section → "Not discussed" under the header. Headers stay **plain**
+(`## Subjective` … `## Response`), not lettered, to minimize parser ripple.
+
+**Backend tasks:**
+- [ ] Rewrite `SOAP_SYSTEM_PROMPT` → the concise SOAP-R instruction (5 sections,
+      placement rules, bullets/shorthand, anti-fabrication, "Not discussed" /
+      first-visit-Response rules, one-pass no-questions).
+- [ ] Add the **one-shot example** (raw messy transcript + ideal bulleted SOAP-R note,
+      showing garbled-ASR resolution) as a shared constant; embed it in `build_prompt`
+      before the transcript for **both** model templates (Mistral `[INST]`, Phi turns).
+- [ ] **Prompt caching:** order the prompt `[system + example] → [transcript] →
+      [assistant]`; prefill the static prefix once at warmup and reuse its KV cache
+      across generations — trim KV back to the prefix boundary between notes (or state
+      save/restore). Confirm the `llama-cpp-2` binding exposes KV-trim / state APIs;
+      **fallback:** warm the prefix once and only append transcript tokens. (Shared
+      fixed-prefix lever with E1 §6.7.)
+- [ ] Update `llm/prompt.rs` tests: five headers present, example present, both
+      templates wrap correctly.
+
+**Downstream ripple (the 5th section):**
+- [ ] `src/lib/soap.ts` — add `response` to `SoapSection`/`SOAP_ORDER`/`LABEL`
+      parse/serialize. (Editor display is already a single scrollable raw-markdown
+      window, so no per-section UI change — but the parse/serialize + `soap.test.ts`
+      must cover Response.)
+- [ ] Backend EMR hand-off parser (`handoff::parser`) and any section-split/strip
+      logic + tests — extend from four sections to five.
+- [ ] Fix the existing test that asserts exactly four headers.
+
+**Open items / decisions:**
+- **Prompt-cache API availability** in `llama-cpp-2` — determines clean KV-trim vs the
+  warm-and-append fallback. Verify on Windows.
+- **Eval material** — needs a few sample transcripts (+ target notes) to confirm the
+  one-shot prompt actually improved placement/format before/after; few-shot stays a
+  deferred lever if one example is insufficient.
+- Header style kept **plain** (not `## S – …`) to avoid rewriting the parser; revisit
+  only if lettered headers are wanted.
+
+**Verification (once built):** unit — `build_prompt` yields all five `##` headers + the
+example for both model templates; the four-header assertion is updated; `soap.ts`
+round-trips five sections. Manual — generate against sample transcripts and eyeball
+placement/bulleting. `cargo test` + `bun run test`.
+
 ## Progress Log
 
 - **2026-07-01 — Phase D3 (first-run setup / lean installer) implemented; Windows verify pending.**

@@ -85,7 +85,7 @@ export default function NotePanel() {
       {generating ? (
         <pre
           aria-label="Streaming note"
-          className="max-h-80 overflow-auto whitespace-pre-wrap rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm text-neutral-300"
+          className="whitespace-pre-wrap rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm text-neutral-300"
         >
           {streamingNote || "Generating…"}
         </pre>

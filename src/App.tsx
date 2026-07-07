@@ -64,7 +64,7 @@ function App() {
       </header>
       <div className="flex flex-1 overflow-hidden">
         <NavBar />
-        <main className="flex flex-1 overflow-auto">
+        <main className="flex-1 overflow-y-auto">
           <ActiveView />
         </main>
       </div>

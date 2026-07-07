@@ -482,6 +482,45 @@ The model is **not** unloaded here in v1 — it is left warm, and the idle-watch
 | Model on Stop | Stays warm; idle-watcher unloads later; PROCESSING is the phase-two LLM hook | Fast re-record between patients; clean seam for note generation |
 | Failure handling | Panic in any thread → coordinator recovers to Idle + surfaces error | No wedged or orphaned state |
 
+### 6.7 Post-ASR correction suggestions
+
+This stage answers: **how do we help the clinician catch the mishearings that fuzzy word-fixing (§6.3) can't — errors that only a reader who understands the sentence would spot?** Deterministic cleanup corrects a single garbled word against a known list; it cannot repair a phrase that was transcribed as fluent-but-wrong English. A real example: *"right side, right down beforehand"* was actually *"right side of forehead"* — every word is a valid word, so only meaning reveals the error.
+
+**Suggest, never rewrite.** The correction pass proposes edits; it does **not** change the transcript on its own. Each suggestion is surfaced in the UI and applied only if the clinician **accepts** it. This is the property that keeps the feature safe: the machine never silently alters what was said, so it cannot introduce a clinical fact the clinician didn't approve. It is the same anti-fabrication discipline as note generation (§8.3), enforced here by a human-in-the-loop gate rather than by a prompt alone.
+
+**When it runs — sequenced, on Stop, before Generate.** The pass is triggered automatically when recording stops, and slots into the review step of §8.1 (between Stop and Generate):
+
+```
+Stop ─► correction suggestions (auto) ─► clinician accepts/rejects ─► clicks Generate ─► note
+```
+
+It runs **before**, not concurrently with, note generation. The two never execute at once, so they never contend for the CPU. The transcript stays fully editable throughout — suggestions augment the manual review, they don't replace it.
+
+**Reuses the resident model.** Correction uses the **same note-generation LLM** already governed by the residency strategy (§7) — no second model is downloaded, hosted, or kept warm. Structurally the pass mirrors note generation: a streamed inference driven by a backend command and delivered to the UI by event. The cost is one extra inference over the transcript; because it is **prefill-heavy but decode-light** (long input, short structured output), it is meaningfully cheaper than the note itself, and it overlaps the clinician's own reading, so its latency is largely hidden.
+
+**Streamed, parse-as-you-go.** The model emits suggestions as a stream of small, independently-parseable units (one structured record per line), each naming an **original span** and its **replacement**. The UI shows each suggestion the instant its record completes, rather than waiting for the whole pass — so the first corrections appear early and perceived latency drops. Constraining the output to *replacements of spans that exist in the transcript* (not free-form text) is what keeps a "suggestion" from becoming an invention.
+
+**Inline, non-blocking presentation.** A suggestion appears as a popup anchored **next to the flagged phrase**, without obscuring the surrounding transcript, with Accept / Reject in place. Accepting patches that span in the editor and rides the existing debounced autosave (§6.5); rejecting dismisses it. The clinician can also ignore the whole pass — a **Cancel** path (reusing the generation cancel mechanism) lets them skip straight to editing and Generate.
+
+**Behavioral rules.**
+
+- **Duplicate spans** — if the same original phrase occurs more than once, a suggestion applies to the **first not-yet-accepted** occurrence. (Rare; a simple, predictable rule.)
+- **No suggestions** — if the pass finds nothing, nothing pops up and Generate simply becomes available. No error, no modal.
+- **Failure/cancel** — a model error or a Cancel returns to a plain editable transcript; the feature is strictly additive and never blocks note generation.
+
+**Decisions:**
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| Safety model | Suggest-and-approve; never auto-apply | Human gate prevents fabricated/altered clinical content (mirrors §8.3) |
+| Trigger | Auto on Stop, **sequenced before** Generate | Assists review without CPU contention with note generation |
+| Model | Reuse the resident note-generation LLM (§7) | No second model to source, host, download, or keep warm |
+| Delivery | Streamed, one parseable record per line, shown as each completes | Cuts perceived latency; corrections appear early |
+| Output shape | Replacement of an existing transcript span only | Constrains output so a suggestion can't become an invention |
+| Presentation | Inline popup by the phrase, non-blocking, Accept/Reject in place | Keeps transcript readable; edit applied via existing autosave (§6.5) |
+| Duplicates | Apply to first not-yet-accepted occurrence | Simple, predictable |
+| Empty / cancel | No suggestions → silently enable Generate; Cancel → plain transcript | Strictly additive; never blocks the note path |
+
 ---
 
 ## 7. Model Residency Strategy
@@ -548,7 +587,7 @@ Phase two turns a verified transcript into a structured clinical note. This sect
 Note generation is **manual and explicit**, not automatic on Stop. The sequence is:
 
 1. **Stop** finalizes the transcript. In-flight audio is flushed and the last segments land in the transcript (the Processing→Idle drain described in §6.6). The complete transcript is shown in the UI and the machine is back at rest — no model is running.
-2. **The clinician reviews and edits the transcript.** They correct mishearings, names, medications, etc. This happens entirely in the app with no LLM active.
+2. **The clinician reviews and edits the transcript**, assisted by the post-ASR correction suggestions that ran automatically on Stop (§6.7). They accept or reject the proposed fixes and make any further manual corrections — names, medications, mishearings. The correction pass has finished by the time Generate is pressed; no LLM is running during the note-generation trigger itself.
 3. **The clinician clicks Generate.** *This* is the trigger that starts note generation, operating on the transcript exactly as the user left it.
 
 Making generation an explicit, post-review action is a deliberate clinical-safety choice: the clinician verifies the source text before a note is built from it, and the expensive LLM step is decoupled from recording.
@@ -602,6 +641,7 @@ A single threshold at 16 GB governs the choice. Below it, Phi defaults to the hi
 - **Context window** — capped to a working size covering the longest realistic transcript + prompt + generated note, rather than the model's full maximum (Mistral 32k / Phi 128k), to avoid reserving RAM the §7 budget needs.
 - **Sampling** — low temperature for near-deterministic, low-hallucination clinical output (finalized alongside the prompt in §8.3).
 - **Memory levers** — mmap vs full load, and KV-cache precision, available as RAM/latency trade-offs during tuning.
+- **Prompt caching (fixed prefix reuse).** The system prompt + the one-shot example (§8.3) are byte-identical every generation; only the transcript varies. Ordered as `[system + example] → [transcript] → [assistant]`, the static prefix is prefilled **once** (at warmup) and its KV cache reused across notes — so the example's prefill cost is paid once, not per note. Implemented by holding the context and trimming the KV cache back to the prefix boundary between generations (or state save/restore), subject to what the `llama-cpp-2` binding exposes; the fallback is to warm the prefix once and only append transcript tokens. Only content **before the first differing token** is reusable, which is why the example must precede the transcript. The same fixed-prefix lever is shared by the correction pass (§6.7).
 
 **Decisions:**
 
@@ -616,7 +656,7 @@ A single threshold at 16 GB governs the choice. Below it, Phi defaults to the hi
 
 ### 8.3 Prompt & output structure
 
-**Output format — markdown.** The model emits the note as **markdown** with four fixed section headers (`## Subjective`, `## Objective`, `## Assessment`, `## Plan`). Markdown is the single representation used everywhere:
+**Output format — markdown.** The model emits the note as **markdown** with five fixed section headers (`## Subjective`, `## Objective`, `## Assessment`, `## Plan`, `## Response`) — the SOAP-R structure (§8.1 defines Response: how the patient has responded since the last visit to prior treatment). Markdown is the single representation used everywhere:
 
 - **Display** — rendered as a formatted document in the UI (like a markdown preview), so the clinician sees an ordinary-looking note rather than raw `##`/`**` markers.
 - **Edit** — the clinician edits in-app (§8.1); the note stays markdown throughout.
@@ -627,24 +667,27 @@ Choosing markdown over JSON/GBNF keeps generation robust (no broken-JSON failure
 
 **Input — whole transcript, single prompt.** The full transcript is passed in one prompt with no context-handling layer (no chunking or pipeline); structured SOAP output comes from prompt engineering alone, since the window (Mistral 32k / Phi 128k) far exceeds a realistic consult (~6–8k tokens).
 
-**Scope — four sections.** v1 produces the standard **S / O / A / P** sections only. No chief-complaint block, vitals extraction, or coding hints in v1.
+**Scope — five sections (SOAP-R).** v1 produces **Subjective / Objective / Assessment / Plan / Response**. Response captures how the patient has responded since the last visit to prior treatment (symptom change, side effects, adherence). No chief-complaint block, vitals extraction, or coding hints in v1.
 
-**Anti-hallucination.** The system prompt instructs the model to use **only facts present in the transcript** and to invent nothing — no assumed findings, diagnoses, or values not stated. This is the single most important safety property of the note: in a clinical record, a fabricated symptom is the worst failure mode. Low sampling temperature (§8.2) reinforces this.
+**Bulleted, concise output.** Sections are written as **concise bullet points, not paragraphs**, in clinical shorthand where natural (pt, c/o, BP, hx) — a scannable note the clinician can sign with minimal editing, rather than prose that restates the transcript.
 
-**Empty sections.** A section the transcript has no material for (e.g. no exam in a phone follow-up) is rendered as the **header alone with an empty body** — the `## Objective` header is present with nothing under it. The section is never dropped, keeping structure consistent for rendering and EMR splitting; the clinician fills it in if appropriate (the note is editable).
+**Anti-hallucination.** The system prompt instructs the model to use **only facts present in the transcript** and to invent nothing — no assumed findings, diagnoses, or values not stated. This is the single most important safety property of the note: in a clinical record, a fabricated symptom is the worst failure mode. Low sampling temperature (§8.2) reinforces this. Placement rules per section (e.g. Objective excludes anything the patient merely reported; Assessment must be supported by the transcript) keep content in the right section without inviting invention.
 
-**Prompting approach.** v1 starts **zero-shot** — instructions only, no worked example in the prompt. One- or few-shot examples are a **deferred lever**: if testing shows format drift or quality gaps, a single example can be added to lock the structure, at the cost of context budget. The decision is left to post-implementation testing.
+**Empty sections.** A section the transcript has no material for is written as **"Not discussed"** under its header rather than left blank — the section is never dropped, keeping structure consistent for rendering and EMR splitting. For **Response** specifically, a first visit with no prior treatment is stated explicitly (e.g. "First visit — no prior treatment") rather than marked "Not discussed".
+
+**Prompting approach — one-shot.** The prompt carries **one worked example** (a raw, messy consult transcript and its ideal bulleted SOAP-R note). This locks structure and style far more reliably than instructions alone, and the example deliberately shows the model resolving a garbled ASR phrase from context (e.g. "right down beforehand" → "right side of forehead") rather than copying it verbatim. **Few-shot** (a handful of examples) remains a deferred lever if one example proves insufficient. The one-shot example is a **fixed prefix**, prompt-cached (§8.2) so it adds negligible per-note latency.
 
 **Decisions:**
 
 | Decision | Choice | Rationale |
 |----------|--------|-----------|
-| Output format | Markdown, four fixed `##` SOAP headers | Robust (no broken-JSON failure), natural document, still splittable deterministically |
+| Output format | Markdown, five fixed `##` SOAP-R headers | Robust (no broken-JSON failure), natural document, still splittable deterministically |
 | Post-processing | Deterministic parse/strip only; no AI, no grammar | Headers are predictable; plain string work suffices |
-| Scope | S/O/A/P only | v1 simplicity |
-| Anti-hallucination | Prompt restricts model to transcript facts only | Fabricated clinical content is the worst failure |
-| Empty section | Header kept, body empty | Consistent structure; clinician completes if needed |
-| Few-shot | Zero-shot for v1; few-shot deferred | Test first; add an example only if format/quality needs it |
+| Scope | S/O/A/P/R (adds Response) | Captures interval response to prior treatment |
+| Style | Concise bullets, clinical shorthand | Scannable, sign-ready note; not prose restating the transcript |
+| Anti-hallucination | Prompt restricts model to transcript facts only; per-section placement rules | Fabricated clinical content is the worst failure |
+| Empty section | "Not discussed" under header (Response: state first-visit explicitly) | Consistent structure; clinician completes if needed |
+| Prompting | One-shot (worked example); few-shot deferred | One example locks format/style; example prompt-cached so latency cost is one-time (§8.2) |
 
 ### 8.4 Lifecycle & orchestration
 
@@ -781,7 +824,7 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 |--------|------|-------|
 | `id` | TEXT (UUID) | Primary key |
 | `record_id` | TEXT (UUID) | FK → `records.id` |
-| `soap_data` | TEXT | SOAP note, markdown with the four `##` headers (§8.3) |
+| `soap_data` | TEXT | SOAP-R note, markdown with the five `##` headers (§8.3) |
 | `created_at` | INTEGER | Unix timestamp |
 | `is_active` | INTEGER | 1 for the current note; exactly one active per record |
 

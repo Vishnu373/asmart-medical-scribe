@@ -1,6 +1,7 @@
 import { useEffect, useRef } from "react";
 import { updateTranscript } from "@/bridge";
 import { useAppStore } from "@/state";
+import { useAutoGrow } from "@/hooks/useAutoGrow";
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -22,6 +23,11 @@ export default function TranscriptEditor() {
   // let an incoming segment overwrite the clinician's keystrokes. Editing is only
   // allowed once streaming has stopped (record → stop → edit flow, FR-5).
   const readOnly = recordingState === "RECORDING";
+
+  const ref = useRef<HTMLTextAreaElement>(null);
+  // Grow with content so the transcript is never squeezed as the note panel
+  // expands below it; the page scrolls instead.
+  useAutoGrow(ref, transcript);
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   // The not-yet-saved edit, so unmount can flush it instead of dropping it.
@@ -53,12 +59,13 @@ export default function TranscriptEditor() {
 
   return (
     <textarea
+      ref={ref}
       aria-label="Transcript"
       value={transcript}
       onChange={(e) => onChange(e.target.value)}
       readOnly={readOnly}
       placeholder="The live transcript appears here as you record."
-      className="flex-1 resize-none rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm leading-relaxed text-neutral-100 placeholder:text-neutral-600 read-only:text-neutral-300 focus:border-neutral-600 focus:outline-none"
+      className="min-h-40 resize-none overflow-hidden rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm leading-relaxed text-neutral-100 placeholder:text-neutral-600 read-only:text-neutral-300 focus:border-neutral-600 focus:outline-none"
     />
   );
 }

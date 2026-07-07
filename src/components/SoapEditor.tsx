@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import { copyToClipboard, updateNote, type Note } from "@/bridge";
 import { useAppStore } from "@/state";
 import { stripMarkdown } from "@/lib/soap";
+import { useAutoGrow } from "@/hooks/useAutoGrow";
 
 const SAVE_DEBOUNCE_MS = 600;
 
@@ -14,6 +15,10 @@ const SAVE_DEBOUNCE_MS = 600;
 export default function SoapEditor({ note }: { note: Note }) {
   const pushToast = useAppStore((s) => s.pushToast);
   const [text, setText] = useState(note.soap_data);
+
+  const ref = useRef<HTMLTextAreaElement>(null);
+  // Grow with content so the note is never a squeezed scroll-box; the page scrolls.
+  useAutoGrow(ref, text);
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pending = useRef<{ id: string; data: string } | null>(null);
@@ -70,10 +75,11 @@ export default function SoapEditor({ note }: { note: Note }) {
         </button>
       </div>
       <textarea
+        ref={ref}
         aria-label="SOAP note"
         value={text}
         onChange={(e) => onEdit(e.target.value)}
-        className="h-96 resize-none overflow-auto rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm leading-relaxed text-neutral-100 focus:border-neutral-600 focus:outline-none"
+        className="min-h-64 resize-none overflow-hidden rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm leading-relaxed text-neutral-100 focus:border-neutral-600 focus:outline-none"
       />
     </div>
   );
