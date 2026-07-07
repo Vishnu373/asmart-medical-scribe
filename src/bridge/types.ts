@@ -47,7 +47,7 @@ export interface Settings {
 }
 
 /** The four SOAP sections handed off to the EMR (design §8.6). */
-export type SoapSection = "subjective" | "objective" | "assessment" | "plan";
+export type SoapSection = "subjective" | "objective" | "assessment" | "plan" | "response";
 
 /** A selectable microphone for the settings picker. `commands::InputDevice`. */
 export interface InputDevice {

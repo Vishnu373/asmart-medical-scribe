@@ -641,7 +641,7 @@ A single threshold at 16 GB governs the choice. Below it, Phi defaults to the hi
 - **Context window** — capped to a working size covering the longest realistic transcript + prompt + generated note, rather than the model's full maximum (Mistral 32k / Phi 128k), to avoid reserving RAM the §7 budget needs.
 - **Sampling** — low temperature for near-deterministic, low-hallucination clinical output (finalized alongside the prompt in §8.3).
 - **Memory levers** — mmap vs full load, and KV-cache precision, available as RAM/latency trade-offs during tuning.
-- **Prompt caching (fixed prefix reuse).** The system prompt + the one-shot example (§8.3) are byte-identical every generation; only the transcript varies. Ordered as `[system + example] → [transcript] → [assistant]`, the static prefix is prefilled **once** (at warmup) and its KV cache reused across notes — so the example's prefill cost is paid once, not per note. Implemented by holding the context and trimming the KV cache back to the prefix boundary between generations (or state save/restore), subject to what the `llama-cpp-2` binding exposes; the fallback is to warm the prefix once and only append transcript tokens. Only content **before the first differing token** is reusable, which is why the example must precede the transcript. The same fixed-prefix lever is shared by the correction pass (§6.7).
+- **Prompt caching (fixed prefix reuse).** The system prompt + one-shot example (§8.3) are byte-identical every generation; ordering them ahead of the transcript lets their KV cache be prefilled once and reused across notes instead of re-read each time. Full design in **§8.7**.
 
 **Decisions:**
 
@@ -791,6 +791,45 @@ v1 has no direct EMR integration, and the automated paste **hotkey is deferred t
 | One-key hotkey paste | Deferred to Future Considerations (§13) | Needs native Windows no-activate + global-key work best built/verified on Windows |
 | Field auto-mapping | Deferred to Future Considerations (§13) | Out of scope for v1 |
 
+### 8.7 Prompt-prefix caching (KV-cache reuse)
+
+The one-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of every generation: the system instruction plus the worked example. Only the transcript at the tail changes. Today that whole prefix is re-read (re-*prefilled*) on every note — the model redoes the same math over the same tokens each time, and few-shot (§8.3) would make the wasted work larger. This section is the plan to prefill that prefix **once** and reuse it. It promotes the §8.2 tuning note into a concrete design; §8.2's summary line stays as the pointer.
+
+**What is being cached.** When the model reads tokens it produces per-token intermediate state (the attention **KV cache**) that generation then reads from. The prefix's KV entries depend only on the prefix tokens, so once computed they are valid for *any* transcript that follows — provided the prefix tokens are unchanged and sit at the same positions. That is the whole reason §8.3 orders the prompt `[system + example] → [transcript] → [assistant]`: **only the run of tokens before the first differing token is reusable**, so the fixed part must come first.
+
+**Mechanism (save the prefix's state once, restore it per note).** The prefix is prefilled a single time, and the *result* of that prefill — the model's computed KV state — is snapshotted and reused. The heavy work (running the prefix through every layer) happens once; every later note pastes the snapshot back instead of redoing it.
+
+1. **Prefill once, snapshot the state.** On load/warmup the engine tokenizes the fixed prefix (system + example + template scaffolding up to where the transcript begins), decodes it once into a context, then serializes the KV state **for that one sequence** into an in-memory byte buffer. It also records the **prefix token sequence**. The context is dropped. Using the *sequence-scoped* save (not the whole-context one) sizes the snapshot to the cells the prefix actually used (tens of MB), avoiding a transient ~1 GB allocation for the full N_CTX cache right after the model load — which would spike RAM exactly at the §7 residency threshold.
+2. **Per note — restore, don't recompute.** Build a fresh context, load the snapshot into it (a memory copy of the prefix KV — no transformer math), then decode only the transcript tail at positions after the prefix and generate. The prefix is never re-prefilled.
+3. **Reset is automatic.** The snapshot bytes are never mutated and each note uses its own throwaway context, so there is nothing to trim between notes — the next note simply restores the same snapshot again. A cancelled or errored note drops its context with no effect on the cache.
+
+**Byte-identical to the fallback.** A tokenizer can merge tokens across the prefix/tail boundary, so `tokenize(prefix) ++ tokenize(tail)` is not always `tokenize(prefix + tail)`. To keep a cached note identical to an uncached one, each generation tokenizes the **whole** prompt (exactly as the fallback does) and only restores the snapshot when that full token sequence **begins with the saved prefix tokens**. If the boundary merged, the check fails and the note falls back to a full decode — correct, just uncached.
+
+**Correctness invariants.**
+
+- **Prefix must be truly fixed.** If anything in the prefix changes, the snapshot is stale and must be rebuilt. The triggers are: a **model change** (Settings switches tier → different tokenizer/template, §8.2) and any **prompt edit** (system prompt or example). On either, the snapshot is dropped with the model (`unload`) and re-primed on the next load. The saved-prefix-tokens check also prevents restoring one model's state under another.
+- **No accumulation.** Because every note uses a fresh context, transcript+note tokens never persist across notes, so nothing can accumulate toward the context window (§8.2) — the property the persistent-context alternative would have needed an explicit KV trim to hold.
+- **Single-flight.** Generation is already serialized behind the model lock (§8.4); the snapshot is guarded the same way, so two notes never share/mutate it concurrently.
+
+**Interaction with residency (§7).** This helps **co-resident** mode only. In **swap** mode the model is unloaded after each generation to free RAM for STT (§8.4), which destroys the context and its cached prefix — so the next note re-prefills from cold regardless. That is acceptable: swap mode is the RAM-constrained path where keeping a model (and context) warm isn't affordable anyway. Caching is therefore a co-resident optimization; swap mode falls back to per-note prefill with no code-path difference visible to the clinician.
+
+**Dependency & fallback.** Reuse needs the `llama-cpp-2` binding to expose **sequence-scoped state save/restore** (`state_seq_get_size_ext` / `state_seq_get_data_ext` / `state_seq_set_data_ext`), confirmed present in the pinned version (0.1.150). The sequence-scoped variants (over the whole-context `get_state_size` / `copy_state_data`) are what keep the snapshot sized to the prefix's cells rather than the full N_CTX cache. The binding *also* exposes KV-cache trim (`clear_kv_cache_seq`), which the persistent-context alternative would have used — but the save/restore path is what we build (see the trade-off below). The **fallback** is the current behavior — prefill the full prompt per note — and it is entered automatically whenever the snapshot is missing (not yet primed, or after `unload`) or the boundary check fails, so the feature degrades to "correct but not cached" rather than breaking generation. The same fixed-prefix lever is shared by the correction pass (§6.7), so both benefit from one implementation.
+
+**Non-goals.** No cross-*session* (on-disk) cache — the prefix is cheap to prefill once per app run, and persisting KV state to disk adds complexity and a versioning/staleness surface for no material gain. No caching of the transcript or generated tokens (they are unique per note).
+
+**Decisions:**
+
+| Decision | Choice | Rationale |
+|----------|--------|-----------|
+| What to cache | The fixed prefix (system + one-shot example) KV only | It is byte-identical every note; the transcript/note are unique |
+| How | Snapshot the prefix's KV state once (save/restore); restore it into a **fresh context per note**, then decode only the transcript tail | Skips re-prefilling the prefix without needing a long-lived context (see trade-off) |
+| **Save/restore vs persistent context + trim** | **Chosen: save/restore into a fresh context** (over a persistent `LlamaContext` + KV trim) | Persistent context would be a self-referential borrow of the owned model; save/restore gets the same win with simpler, safer code. Full trade-off in **§11** |
+| Invalidation | Rebuild on model change or any prompt/example edit; a saved-prefix-tokens check guards cross-model restores | A changed prefix makes the snapshot stale |
+| Residency | Co-resident only; swap mode re-prefills cold | Swap unloads the model (and drops the snapshot) after each note by design |
+| Binding dependency | Uses `llama-cpp-2` context state save/restore (present in 0.1.150); else fall back to per-note full prefill | Feature degrades to correct-but-uncached, never broken |
+| Persistence | In-memory per app run; no on-disk KV cache | Prefill-once is cheap; disk KV adds versioning/staleness cost for no gain |
+| Shared with | The §6.7 correction pass (same fixed prefix) | One mechanism serves both |
+
 ## 9. Data Model & Interfaces
 
 This section consolidates what the app persists and the Tauri command/event contracts that cross the React ↔ Rust boundary. It gathers contracts introduced piecewise in §6 and §8 into one reference.
@@ -925,7 +964,15 @@ The clinic/clinician is the **custodian** of the health information; the app is 
 
 ## 11. Trade-offs & Alternatives
 
-_TBD._
+### Prompt-prefix caching: state save/restore vs a persistent context (§8.7)
+
+- **Decision:** How to reuse the fixed prompt prefix's KV so it isn't re-prefilled on every note.
+- **Options:**
+  1. **Persistent context + KV trim** — hold one long-lived `LlamaContext` in the engine, prefill the prefix into it once, append each transcript, and trim the KV cache back to the prefix boundary between notes. This is what §8.7 originally planned.
+  2. **State save/restore into a fresh context** — prefill the prefix once, snapshot its KV state to an in-memory buffer, and restore that snapshot into a fresh throwaway context per note before decoding the transcript tail.
+- **Chosen:** Option 2 (save/restore).
+- **Rationale:** In `llama-cpp-2`, a `LlamaContext` borrows the loaded `LlamaModel`, so storing a persistent context beside the owned model in the engine struct is **self-referential** — safe Rust won't allow it without `unsafe`/lifetime hacks or an extra self-referencing crate. Both options skip the same expensive step (running the prefix through every model layer — seconds of CPU), which is the entire point of the feature. Option 2 reuses the fresh-context-per-note path the engine already had, so it needs no new lifetime machinery; it also makes reset-to-boundary and cancel/error cleanup **automatic** (the snapshot is never mutated and each note's context is discarded), removing the mandatory-trim invariant Option 1 carries. Its only extra cost is a per-note memory copy of the snapshot — **milliseconds against the seconds saved** — so the win is effectively identical while the code stays simpler and safer. The binding exposes both APIs (0.1.150), so this is a design choice, not a capability limit.
+- **Revisit if:** profiling on Windows shows the per-note snapshot restore is a meaningful share of latency (it shouldn't be), or the prefix grows large enough (e.g. few-shot, §8.3) that the snapshot's memory/copy cost matters — then reconsider a persistent context via a self-referential wrapper.
 
 ## 12. Pricing
 

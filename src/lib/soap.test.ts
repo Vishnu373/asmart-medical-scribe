@@ -11,19 +11,25 @@ Temp 37.8.
 Likely viral URI.
 
 ## Plan
-Rest and fluids.`;
+Rest and fluids.
+
+## Response
+Cough improved on prior antibiotics.`;
 
 describe("parseSoap", () => {
-  it("splits markdown into the four sections", () => {
+  it("splits markdown into the five sections", () => {
     const s = parseSoap(SAMPLE);
     expect(s.subjective).toBe("Patient reports a cough for three days.");
     expect(s.objective).toBe("Temp 37.8.");
     expect(s.assessment).toBe("Likely viral URI.");
     expect(s.plan).toBe("Rest and fluids.");
+    expect(s.response).toBe("Cough improved on prior antibiotics.");
   });
 
   it("yields empty strings for a bare header", () => {
-    expect(parseSoap("## Subjective\n## Objective\n## Assessment\n## Plan").subjective).toBe("");
+    expect(
+      parseSoap("## Subjective\n## Objective\n## Assessment\n## Plan\n## Response").subjective,
+    ).toBe("");
   });
 
   it("keeps an unrecognized ## line as body text instead of dropping it", () => {
@@ -41,7 +47,15 @@ describe("serializeSoap", () => {
   });
 
   it("keeps an empty section as a bare header", () => {
-    const md = serializeSoap({ subjective: "x", objective: "", assessment: "", plan: "y" });
-    expect(md).toBe("## Subjective\nx\n\n## Objective\n\n## Assessment\n\n## Plan\ny");
+    const md = serializeSoap({
+      subjective: "x",
+      objective: "",
+      assessment: "",
+      plan: "y",
+      response: "",
+    });
+    expect(md).toBe(
+      "## Subjective\nx\n\n## Objective\n\n## Assessment\n\n## Plan\ny\n\n## Response",
+    );
   });
 });

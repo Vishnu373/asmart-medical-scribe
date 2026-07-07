@@ -576,7 +576,7 @@ enables Generate with no popup; Generate is disabled until the pass ends. `cargo
 
 ## Note Generation Tuning
 
-### Phase E2 — SOAP-R prompt tightening (one-shot + prompt caching)  `[ ] planned`
+### Phase E2 — SOAP-R prompt tightening (one-shot + prompt caching)  `[~] prompt done; KV-cache reuse deferred`
 **Goal:** Tighten note quality by moving from the zero-shot 4-section prompt to a
 **one-shot, 5-section SOAP-R** prompt that emits **concise bullets** (not prose), with
 explicit per-section placement rules. One shared technique for both models — the
@@ -593,29 +593,32 @@ explicitly). Empty section → "Not discussed" under the header. Headers stay **
 (`## Subjective` … `## Response`), not lettered, to minimize parser ripple.
 
 **Backend tasks:**
-- [ ] Rewrite `SOAP_SYSTEM_PROMPT` → the concise SOAP-R instruction (5 sections,
+- [x] Rewrite `SOAP_SYSTEM_PROMPT` → the concise SOAP-R instruction (5 sections,
       placement rules, bullets/shorthand, anti-fabrication, "Not discussed" /
       first-visit-Response rules, one-pass no-questions).
-- [ ] Add the **one-shot example** (raw messy transcript + ideal bulleted SOAP-R note,
-      showing garbled-ASR resolution) as a shared constant; embed it in `build_prompt`
-      before the transcript for **both** model templates (Mistral `[INST]`, Phi turns).
-- [ ] **Prompt caching:** order the prompt `[system + example] → [transcript] →
-      [assistant]`; prefill the static prefix once at warmup and reuse its KV cache
-      across generations — trim KV back to the prefix boundary between notes (or state
-      save/restore). Confirm the `llama-cpp-2` binding exposes KV-trim / state APIs;
-      **fallback:** warm the prefix once and only append transcript tokens. (Shared
-      fixed-prefix lever with E1 §6.7.)
-- [ ] Update `llm/prompt.rs` tests: five headers present, example present, both
-      templates wrap correctly.
+- [x] Add the **one-shot example** (raw messy transcript + ideal bulleted SOAP-R note,
+      showing garbled-ASR resolution `right down beforehand → right side of forehead`)
+      as shared `EXAMPLE_TRANSCRIPT`/`EXAMPLE_NOTE` constants; embed in `build_prompt`
+      before the real transcript for **both** model templates (Mistral multi-turn
+      `[INST]…[/INST] note</s>[INST]`, Phi completed `<|user|>/<|assistant|>` pair).
+- [~] **Prompt caching:** the prompt is now ordered `[system + example] → [transcript]
+      → [assistant]` (the fixed prefix comes first — the *prerequisite* for caching).
+      The actual **KV-cache reuse is deferred**: `engine.rs::run` builds a fresh
+      `LlamaContext` per generation, so reuse needs the context to persist across notes
+      plus KV-trim/state APIs — a runtime change that can't be built or verified on the
+      Linux box and is a flagged open item. Prefix ordering alone changes nothing at
+      runtime yet, so it's safe to land now; the reuse itself is a separate Windows-gated
+      task. (Shared fixed-prefix lever with E1 §6.7.)
+- [x] Update `llm/prompt.rs` tests: five headers present, example present + ASR-repair,
+      both templates wrap correctly. (Written; runs on Windows — no Rust toolchain here.)
 
 **Downstream ripple (the 5th section):**
-- [ ] `src/lib/soap.ts` — add `response` to `SoapSection`/`SOAP_ORDER`/`LABEL`
-      parse/serialize. (Editor display is already a single scrollable raw-markdown
-      window, so no per-section UI change — but the parse/serialize + `soap.test.ts`
-      must cover Response.)
-- [ ] Backend EMR hand-off parser (`handoff::parser`) and any section-split/strip
-      logic + tests — extend from four sections to five.
-- [ ] Fix the existing test that asserts exactly four headers.
+- [x] `src/lib/soap.ts` + `SoapSection` type — added `response` to the type /
+      `SOAP_ORDER` / `LABEL` and the parse/serialize buffers; `soap.test.ts` now covers
+      the fifth section (split, bare-header, round-trip).
+- [x] Backend EMR hand-off parser (`handoff::parser`) — `SoapSection` enum extended to
+      five (`ALL`, `header`, `key`), test note + assertions cover Response.
+- [x] Fixed the four-header assertion in `prompt.rs` (now five).
 
 **Open items / decisions:**
 - **Prompt-cache API availability** in `llama-cpp-2` — determines clean KV-trim vs the
@@ -631,7 +634,118 @@ example for both model templates; the four-header assertion is updated; `soap.ts
 round-trips five sections. Manual — generate against sample transcripts and eyeball
 placement/bulleting. `cargo test` + `bun run test`.
 
+### Phase E3 — Prompt-prefix caching (KV-cache reuse)  `[~] coded via state save/restore; Windows build/verify pending`
+**Goal:** Stop re-reading the fixed prefix (system + one-shot example, §8.3) on every
+note. Prefill it **once** into a persistent context and reuse its KV cache across
+generations, trimming the cache back to the prefix boundary between notes. This turns
+on the reuse that E2 only laid the groundwork for (E2 ordered the prompt
+`[system + example] → [transcript] → [assistant]`; the ordering is a no-op at runtime
+until this phase uses it). Design: **§8.7** (mechanism, invariants, fallback), **§8.2**
+(pointer). Backend-only, native `llama-cpp-2` — **built and verified on Windows** (no
+Rust toolchain on the Linux box).
+**Depends on:** E2 (prompt ordering + fixed-prefix constants), B10 (`llm/engine.rs`).
+
+**Precondition — confirm the binding API (do this first).** ✅ Confirmed in pinned
+`llama-cpp-2` **0.1.150** (checked the vendored source): both a KV-cache trim
+(`clear_kv_cache_seq`) **and** in-memory state save/restore — used the
+**sequence-scoped** variants (`state_seq_get_size_ext` / `state_seq_get_data_ext` /
+`state_seq_set_data_ext`) so the snapshot sizes to the prefix, not the N_CTX max. **Chose save/restore**
+— a persistent `LlamaContext` borrows the owned `LlamaModel` (self-referential struct,
+unsafe/awkward in Rust); save/restore reuses the fresh-context-per-note path the engine
+already had and gets the same win. Design §8.7 updated to match (mechanism + trade-off).
+
+**Backend tasks (`llm/engine.rs`, `llm/prompt.rs`):**
+- [x] Split `build_prompt` into `prefix(model)` + `transcript_tail(model, transcript)`
+      (boundary at the fixed user lead-in); `build_prompt` = `prefix + tail`. Unit test
+      `prefix_plus_tail_equals_build_prompt` guards the split for every model.
+- [x] Snapshot the prefix state (not a persistent context): `warmup` now decodes the
+      prefix once, then `state_seq_get_data_ext` (sequence 0) into an in-memory
+      `PrefixCache { kind, prefix_tokens, state }`. Sequence-scoped (not whole-context
+      `get_state_size`/`copy_state_data`) so the snapshot is sized to the prefix's cells
+      (~tens of MB), not the N_CTX max (~1 GB) — no transient spike after model load (§7).
+      Replaces the old throwaway full-prompt warmup.
+- [x] Rework `generate`: tokenize the **full** prompt (same tokens as fallback),
+      restore the snapshot when those tokens begin with the saved prefix tokens
+      (`restore_prefix` → `set_state_data`), then decode only `tokens[start..]` and
+      generate via shared `decode_and_generate`. Same `on_token`/`cancel` behavior.
+- [x] **Reset-to-boundary** is automatic: each note uses a fresh throwaway context and
+      the snapshot bytes are never mutated, so cancel/error leaves nothing stale.
+- [x] **Invalidation:** `unload` drops the snapshot (fires on `set_model` change); the
+      saved-prefix-tokens + `kind` check also blocks a cross-model restore.
+- [x] **Swap-mode:** `unload` after each note clears the snapshot, so the next note
+      re-primes cold — no assumption the snapshot outlives an `unload`.
+- [x] **Fallback:** a cache miss (not primed, post-`unload`, boundary merge, or a failed
+      `set_state_data`) decodes the full prompt from position 0 — never broken, only uncached.
+- [x] Added `prompt.rs` prefix/tail split test. (`engine.rs` has no test module — native
+      path, exercised by `cargo test`/manual on Windows.)
+
+**Open items / decisions:**
+- **Binding API availability** — ✅ resolved above (0.1.150 has save/restore). Still
+  **build + run `cargo test` on Windows** — no Rust toolchain on the Linux dev box, so
+  this code has not been compiled here.
+- **N_CTX budget unchanged** — prefix + transcript + note still must fit `N_CTX` (§8.2);
+  the trim keeps the cache from accumulating across notes.
+- **No cross-session cache** (§8.7 non-goal) — in-memory per app run only; do not persist
+  KV state to disk.
+- **Measure the win** — time first-token/prefill with vs without caching (co-resident) to
+  confirm the optimization is worth the persistent-context complexity; if negligible,
+  keep the fallback and close the phase.
+
+**Verification (once built):** unit — `prefix + tail == build_prompt` per model; the
+split constants are byte-identical to E2's prompt. Manual (Windows) — generate several
+notes back-to-back in co-resident mode and confirm identical output to the fallback path
+(caching must not change the note) and reduced per-note prefill latency; cancel mid-note
+then generate again and confirm the next note is clean (reset-to-boundary works); switch
+model in Settings and confirm the context rebuilds. `cargo test` + `bun run test`.
+
 ## Progress Log
+
+- **2026-07-07 — Phase E3 (prompt-prefix caching) coded via state save/restore; Windows build/verify pending.**
+  Turned on the KV-cache reuse E2 laid groundwork for. **Precondition resolved:** pinned
+  `llama-cpp-2` **0.1.150** exposes both KV-trim (`clear_kv_cache_seq`) and in-memory state
+  save/restore (`get_state_size`/`copy_state_data`/`set_state_data`). **Chose save/restore
+  into a fresh context per note** over the plan's persistent-context+trim: a persistent
+  `LlamaContext` borrows the owned `LlamaModel` (self-referential struct, unsafe in Rust);
+  save/restore reuses the fresh-context path the engine already had and skips the same
+  prefix prefill. **`llm/prompt.rs`:** split `build_prompt` into `prefix(model)` +
+  `transcript_tail(model, transcript)` (boundary at the fixed `Consultation transcript:\n\n`
+  lead-in), `build_prompt = prefix + tail`; added `prefix_plus_tail_equals_build_prompt`
+  test. **`llm/engine.rs`:** new `PrefixCache { kind, prefix_tokens, state }`; `warmup`
+  now prefills the prefix once and snapshots its state (sequence-scoped
+  `state_seq_get_data_ext`, sized to the prefix's cells — not the ~1 GB N_CTX max — to
+  avoid a transient RAM spike after model load, §7); `generate` tokenizes the **full**
+  prompt (identical tokens to the fallback), restores the snapshot only when those tokens
+  begin with the saved prefix tokens (`restore_prefix`), then decodes `tokens[start..]` via
+  a shared `decode_and_generate`. Byte-identical to the uncached path by construction; a
+  boundary token-merge, missing snapshot, or failed restore falls back to a full decode.
+  `unload` drops the snapshot (invalidation on model change + swap-mode cold re-prime).
+  Design **§8.7** updated (mechanism + save/restore-vs-trim trade-off). **Not verified here:**
+  no Rust toolchain on Linux — needs `cargo test` + manual back-to-back / cancel / model-switch
+  checks on Windows to confirm identical output and reduced per-note prefill latency.
+- **2026-07-07 — Phase E2 (SOAP-R one-shot prompt) implemented; KV-cache reuse deferred; Windows verify pending.**
+  Moved note generation from the zero-shot 4-section prompt to a **one-shot, 5-section
+  SOAP-R** prompt. **Backend (`llm/prompt.rs`):** rewrote `SOAP_SYSTEM_PROMPT` (five
+  headers, per-section placement rules, concise-bullets + shorthand, anti-fabrication,
+  garbled-ASR-repair permission, "Not discussed" / first-visit-Response wording,
+  one-pass no-questions); added `EXAMPLE_TRANSCRIPT` (raw messy consult, keeps
+  `right down beforehand`) + `EXAMPLE_NOTE` (ideal bulleted note, resolves it to
+  `right side of forehead`) and wove the example in as a completed turn before the real
+  transcript in both templates (Mistral multi-turn, Phi user/assistant pair). The layout
+  is now `[system + example] → [transcript] → [assistant]` so the fixed prefix is
+  cache-ready. **`handoff::parser`:** `SoapSection` extended to five variants; test note +
+  assertions cover Response. **Frontend:** `SoapSection` type + `soap.ts`
+  (`SOAP_ORDER`/`LABEL`/parse/serialize) gained `response`; `soap.test.ts` covers the
+  fifth section. **Verified here:** `vitest` (57 passing), `tsc` (my files clean; the
+  lone error is the pre-existing `soap.ts` `replaceAll`/es2021-lib issue in `stripMarkdown`,
+  untouched). **Not verified here:** `cargo test`/build (no Rust toolchain — run on Windows).
+  - **⚠ KV-cache reuse deferred (carried).** Only the cache-friendly prompt *ordering*
+    landed. Real reuse needs `engine.rs::run` to stop rebuilding a `LlamaContext` per
+    generation and to trim/save-restore KV back to the prefix boundary — a runtime change
+    best built and verified on Windows. Fallback if the binding lacks KV-trim: warm the
+    prefix once, append only transcript tokens.
+  - **Eval material still needed.** Confirm the one-shot prompt actually improved
+    placement/bulleting on a few sample transcripts before/after; few-shot stays the
+    deferred lever if one example is insufficient.
 
 - **2026-07-01 — Phase D3 (first-run setup / lean installer) implemented; Windows verify pending.**
   Core models are now downloaded once on first launch and the app is gated until they

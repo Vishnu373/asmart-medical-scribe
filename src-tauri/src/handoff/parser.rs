@@ -1,25 +1,28 @@
 //! Deterministic SOAP-section parser for EMR hand-off (design §8.6 / §8.3).
 //!
-//! The note's four fixed `## ` headers let us split it into per-section bodies
+//! The note's five fixed `## ` headers let us split it into per-section bodies
 //! with plain string work — no AI, no grammar constraint. Markdown markers are
 //! stripped so the EMR field (a plain-text box) receives clean text. Pure and
 //! unit-tested; the native paste path in `mod.rs` calls into it.
 
-/// The four SOAP sections, in note order.
+/// The five SOAP-R sections, in note order (§8.3; Response = interval response to
+/// prior treatment).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum SoapSection {
     Subjective,
     Objective,
     Assessment,
     Plan,
+    Response,
 }
 
 impl SoapSection {
-    pub const ALL: [SoapSection; 4] = [
+    pub const ALL: [SoapSection; 5] = [
         SoapSection::Subjective,
         SoapSection::Objective,
         SoapSection::Assessment,
         SoapSection::Plan,
+        SoapSection::Response,
     ];
 
     /// The exact markdown header the generator emits (§8.3).
@@ -29,6 +32,7 @@ impl SoapSection {
             SoapSection::Objective => "## Objective",
             SoapSection::Assessment => "## Assessment",
             SoapSection::Plan => "## Plan",
+            SoapSection::Response => "## Response",
         }
     }
 
@@ -40,6 +44,7 @@ impl SoapSection {
             SoapSection::Objective => "objective",
             SoapSection::Assessment => "assessment",
             SoapSection::Plan => "plan",
+            SoapSection::Response => "response",
         }
     }
 
@@ -104,7 +109,9 @@ mod tests {
         Likely viral pharyngitis.\n\
         ## Plan\n\
         1. Rest and fluids\n\
-        2. Recheck if worse";
+        2. Recheck if worse\n\
+        ## Response\n\
+        - Cough improved on prior antibiotics";
 
     #[test]
     fn keys_round_trip() {
@@ -129,10 +136,15 @@ mod tests {
             section_body(NOTE, SoapSection::Assessment),
             "Likely viral pharyngitis."
         );
-        // Numbered prefixes are clinical content and kept.
+        // Numbered prefixes are clinical content and kept; Plan stops at Response.
         assert_eq!(
             section_body(NOTE, SoapSection::Plan),
             "1. Rest and fluids\n2. Recheck if worse"
+        );
+        // The fifth section (SOAP-R) is extracted like the rest.
+        assert_eq!(
+            section_body(NOTE, SoapSection::Response),
+            "Cough improved on prior antibiotics"
         );
     }
 
