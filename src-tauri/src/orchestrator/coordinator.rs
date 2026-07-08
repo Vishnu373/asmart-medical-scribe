@@ -12,6 +12,10 @@ pub enum RecordingState {
     Idle,
     Recording,
     Processing,
+    /// The §6.7 post-ASR correction pass. Reachable only from `IDLE` and, like
+    /// `Generating`, it blocks note generation — the two never run at once, so
+    /// correction is always sequenced *before* Generate.
+    Correcting,
     Generating,
 }
 
@@ -23,6 +27,7 @@ impl RecordingState {
             RecordingState::Idle => "IDLE",
             RecordingState::Recording => "RECORDING",
             RecordingState::Processing => "PROCESSING",
+            RecordingState::Correcting => "CORRECTING",
             RecordingState::Generating => "GENERATING",
         }
     }
@@ -79,6 +84,21 @@ pub trait NoteGenerator: Send + Sync {
     ) -> Result<Option<String>>;
 }
 
+/// Runs the §6.7 post-ASR correction pass over a finalized transcript. Abstracted
+/// behind a trait so the `CORRECTING` state machine is unit-testable with a mock,
+/// while production wires the resident LLM (`RealCorrectionSuggester`).
+///
+/// Like `NoteGenerator::generate`, `suggest` is long-running and synchronous; the
+/// coordinator calls it with the state lock released so a concurrent
+/// `cancel_generation` can flip `cancel`. The implementation streams
+/// `correction-suggestion` events and the terminal `correction-done` /
+/// `correction-error` itself, returning `Some(())` when the pass completed, `None`
+/// if it was cancelled. The feature is additive, so a completed and a cancelled pass
+/// are both non-errors to the coordinator.
+pub trait CorrectionSuggester: Send + Sync {
+    fn suggest(&self, transcript: &str, cancel: Arc<AtomicBool>) -> Result<Option<()>>;
+}
+
 struct Inner {
     state: RecordingState,
     paused: bool,
@@ -98,6 +118,7 @@ struct Inner {
 pub struct Coordinator {
     inner: Mutex<Inner>,
     generator: Box<dyn NoteGenerator>,
+    suggester: Box<dyn CorrectionSuggester>,
     emit: EmitFn,
 }
 
@@ -105,6 +126,7 @@ impl Coordinator {
     pub fn new(
         pipeline: Box<dyn Pipeline>,
         generator: Box<dyn NoteGenerator>,
+        suggester: Box<dyn CorrectionSuggester>,
         emit: EmitFn,
     ) -> Self {
         Self {
@@ -115,6 +137,7 @@ impl Coordinator {
                 cancel: None,
             }),
             generator,
+            suggester,
             emit,
         }
     }
@@ -251,12 +274,55 @@ impl Coordinator {
         }
     }
 
-    /// Signal the in-flight generation to stop; the partial note is discarded and
-    /// the machine returns to IDLE on its own (design §8.4). Rejected unless
-    /// GENERATING. Only flips the flag — the generator observes it and unwinds.
+    /// IDLE → CORRECTING → IDLE: run the §6.7 post-ASR correction pass over
+    /// `transcript`, streaming `correction-suggestion` events. Rejected unless IDLE,
+    /// so it can't run mid-recording and note generation is blocked until it ends —
+    /// the "sequenced, never concurrent with Generate" invariant. Mirrors
+    /// `generate_note`: the lock is released for the blocking pass (so a concurrent
+    /// `cancel_generation` can flip the flag) and reacquired to emit IDLE atomically.
+    /// The pass is additive — a completed or cancelled run both resolve `Ok`; only a
+    /// model error surfaces as `Err`.
+    pub fn suggest_corrections(&self, transcript: &str) -> Result<(), String> {
+        let mut inner = self.lock();
+        if inner.state != RecordingState::Idle {
+            return Err(reject("suggest_corrections", inner.state));
+        }
+        let cancel = Arc::new(AtomicBool::new(false));
+        inner.state = RecordingState::Correcting;
+        inner.cancel = Some(cancel.clone());
+        (self.emit)(AppEvent::StateChanged(RecordingState::Correcting));
+        drop(inner);
+
+        let result = self.suggester.suggest(transcript, cancel);
+
+        let mut inner = self.lock();
+        inner.state = RecordingState::Idle;
+        inner.cancel = None;
+        (self.emit)(AppEvent::StateChanged(RecordingState::Idle));
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                // Correction is strictly additive (§6.7): a failure leaves a plain,
+                // editable transcript. Log it, but do NOT emit the global `error`
+                // AppEvent — that would surface a toast for a feature meant to fail
+                // silently. The suggester has already emitted `correction-error`,
+                // which the UI ignores.
+                let msg = e.to_string();
+                log::error!("correction_failed: {msg}");
+                Err(msg)
+            }
+        }
+    }
+
+    /// Signal the in-flight generation *or* correction pass to stop; it returns to
+    /// IDLE on its own (design §8.4/§6.7). Rejected unless GENERATING or CORRECTING.
+    /// Only flips the shared flag — the running pass observes it and unwinds; a
+    /// cancelled note discards its partial, a cancelled correction leaves the
+    /// transcript plain. Shared cancel path per §6.7 ("cancelable via the existing
+    /// generation-cancel path").
     pub fn cancel_generation(&self) -> Result<(), String> {
         let inner = self.lock();
-        if inner.state != RecordingState::Generating {
+        if inner.state != RecordingState::Generating && inner.state != RecordingState::Correcting {
             return Err(reject("cancel_generation", inner.state));
         }
         if let Some(cancel) = &inner.cancel {
@@ -381,21 +447,55 @@ mod tests {
         }
     }
 
+    /// A correction suggester with configurable behavior, mirroring `MockGenerator`.
+    /// By default it completes immediately; `block_until_cancel` spins until
+    /// cancelled (to test the shared cancel path), and `fail` makes it error.
+    #[derive(Default)]
+    struct MockSuggester {
+        block_until_cancel: bool,
+        fail: bool,
+    }
+
+    impl CorrectionSuggester for MockSuggester {
+        fn suggest(&self, _transcript: &str, cancel: Arc<AtomicBool>) -> Result<Option<()>> {
+            if self.fail {
+                anyhow::bail!("correction model failed");
+            }
+            if self.block_until_cancel {
+                for _ in 0..10_000 {
+                    if cancel.load(Ordering::Relaxed) {
+                        return Ok(None); // cancelled: transcript stays plain
+                    }
+                    std::thread::sleep(std::time::Duration::from_millis(1));
+                }
+                panic!("cancel was never signalled");
+            }
+            Ok(Some(()))
+        }
+    }
+
     /// Build a coordinator plus handles to inspect the pipeline calls and the
-    /// emitted events. Uses a no-op generator unless `build_with` is used.
+    /// emitted events. Uses a no-op generator/suggester unless a `build_with*`
+    /// variant is used.
     fn build(pipeline: MockPipeline) -> (Coordinator, Arc<Mutex<Vec<AppEvent>>>) {
-        build_with(pipeline, MockGenerator::saved())
+        build_with(pipeline, MockGenerator::saved(), MockSuggester::default())
     }
 
     fn build_with(
         pipeline: MockPipeline,
         generator: MockGenerator,
+        suggester: MockSuggester,
     ) -> (Coordinator, Arc<Mutex<Vec<AppEvent>>>) {
         let events = Arc::new(Mutex::new(Vec::new()));
         let sink = events.clone();
         let emit: EmitFn = Box::new(move |ev| sink.lock().unwrap().push(ev));
         (
-            Coordinator::new(Box::new(pipeline), Box::new(generator), emit),
+            Coordinator::new(
+                Box::new(pipeline),
+                Box::new(generator),
+                Box::new(suggester),
+                emit,
+            ),
             events,
         )
     }
@@ -554,7 +654,7 @@ mod tests {
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut g = MockGenerator::saved();
         g.fail = true;
-        let (co, events) = build_with(MockPipeline::new(calls), g);
+        let (co, events) = build_with(MockPipeline::new(calls), g, MockSuggester::default());
 
         assert!(co.generate_note("rec-1", "t").is_err());
         assert_eq!(co.state(), RecordingState::Idle); // recovered, not wedged
@@ -579,13 +679,75 @@ mod tests {
     }
 
     #[test]
+    fn correction_walks_idle_correcting_idle() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let (co, events) = build(MockPipeline::new(calls));
+
+        co.suggest_corrections("patient reports a headache").unwrap();
+        assert_eq!(co.state(), RecordingState::Idle);
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                AppEvent::StateChanged(RecordingState::Correcting),
+                AppEvent::StateChanged(RecordingState::Idle),
+            ]
+        );
+    }
+
+    #[test]
+    fn generate_is_blocked_while_correcting() {
+        // The "sequenced, never concurrent" invariant (§6.7): a Generate arriving
+        // mid-correction is rejected because the machine is CORRECTING, not IDLE.
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut s = MockSuggester::default();
+        s.block_until_cancel = true;
+        let (co, _events) = build_with(MockPipeline::new(calls), MockGenerator::saved(), s);
+        let co = Arc::new(co);
+
+        let worker = {
+            let co = co.clone();
+            std::thread::spawn(move || co.suggest_corrections("t"))
+        };
+        while co.state() != RecordingState::Correcting {
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        assert!(co.generate_note("rec-1", "t").is_err()); // blocked: not IDLE
+
+        // The shared cancel path unwinds the correction pass back to IDLE.
+        co.cancel_generation().unwrap();
+        worker.join().unwrap().unwrap();
+        assert_eq!(co.state(), RecordingState::Idle);
+    }
+
+    #[test]
+    fn correction_failure_returns_to_idle_without_a_global_error_event() {
+        let calls = Arc::new(Mutex::new(Calls::default()));
+        let mut s = MockSuggester::default();
+        s.fail = true;
+        let (co, events) = build_with(MockPipeline::new(calls), MockGenerator::saved(), s);
+
+        assert!(co.suggest_corrections("t").is_err());
+        assert_eq!(co.state(), RecordingState::Idle); // recovered, not wedged
+        // Strictly additive (§6.7): no global `error` AppEvent, so no UI toast — only
+        // the state walk back to IDLE. The suggester's own `correction-error` (ignored
+        // by the UI) is the sole failure signal.
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                AppEvent::StateChanged(RecordingState::Correcting),
+                AppEvent::StateChanged(RecordingState::Idle),
+            ]
+        );
+    }
+
+    #[test]
     fn cancel_generation_signals_the_running_generation() {
         // Concurrency: generate_note blocks in the generator (lock released) while
         // cancel_generation runs on the main thread and flips the flag.
         let calls = Arc::new(Mutex::new(Calls::default()));
         let mut g = MockGenerator::saved();
         g.block_until_cancel = true;
-        let (co, _events) = build_with(MockPipeline::new(calls), g);
+        let (co, _events) = build_with(MockPipeline::new(calls), g, MockSuggester::default());
         let co = Arc::new(co);
 
         let worker = {

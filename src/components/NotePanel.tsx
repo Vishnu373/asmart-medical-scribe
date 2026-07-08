@@ -25,8 +25,12 @@ export default function NotePanel() {
   const pushToast = useAppStore((s) => s.pushToast);
 
   const generating = recordingState === "GENERATING";
+  // Hold Generate until the §6.7 correction pass has ended (streamed/cancelled/
+  // failed) — the machine leaves CORRECTING back to IDLE — preserving the
+  // "sequenced, never concurrent" invariant on the UI side too.
+  const correcting = recordingState === "CORRECTING";
   const active = notes.find((n) => n.is_active) ?? notes[0] ?? null;
-  const ready = recordId !== null && !generating;
+  const ready = recordId !== null && !generating && !correcting;
 
   const refresh = () =>
     recordId &&

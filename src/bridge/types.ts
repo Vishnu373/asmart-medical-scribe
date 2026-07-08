@@ -5,7 +5,7 @@
  */
 
 /** Recording/generation state machine (design §6.6). Matches `RecordingState::as_str`. */
-export type AppState = "IDLE" | "RECORDING" | "PROCESSING" | "GENERATING";
+export type AppState = "IDLE" | "RECORDING" | "PROCESSING" | "CORRECTING" | "GENERATING";
 
 /** A recorded encounter with its editable transcript (no audio). `store::Record`. */
 export interface Record {
@@ -92,6 +92,13 @@ export interface InputLevelEvent {
 }
 export interface GenerationTokenEvent {
   text: string;
+}
+/** One post-ASR correction suggestion (design §6.7). `correction-suggestion` payload;
+ * matches `llm::correction::Suggestion`. `original` is copied verbatim from the
+ * transcript so the UI can locate the span to replace. */
+export interface CorrectionSuggestion {
+  original: string;
+  replacement: string;
 }
 export interface StateChangedEvent {
   state: AppState;

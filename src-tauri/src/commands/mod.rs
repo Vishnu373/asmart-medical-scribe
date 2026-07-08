@@ -122,7 +122,27 @@ pub async fn regenerate_note(
         .map_err(|e| e.to_string())?
 }
 
-/// Cancel the in-flight generation; the partial note is discarded (§8.4).
+/// IDLE → CORRECTING → IDLE: run the post-ASR correction pass over the record's
+/// finalized transcript (design §6.7). Auto-invoked by the UI on Stop. Streams
+/// `correction-suggestion` events and a terminal `correction-done`/`correction-error`;
+/// resolves once the pass ends. Blocks note generation until it does (the sequencing
+/// invariant). Like `generate_note`, runs on a blocking thread so the IPC thread stays
+/// free to dispatch `cancel_generation`.
+#[tauri::command]
+pub async fn suggest_corrections(
+    coordinator: State<'_, Arc<Coordinator>>,
+    store: State<'_, SharedStore>,
+    record_id: String,
+) -> Result<(), String> {
+    let transcript = load_transcript(&store, &record_id)?;
+    let coordinator = coordinator.inner().clone();
+    tauri::async_runtime::spawn_blocking(move || coordinator.suggest_corrections(&transcript))
+        .await
+        .map_err(|e| e.to_string())?
+}
+
+/// Cancel the in-flight generation *or* correction pass; a partial note is discarded,
+/// a cancelled correction leaves the transcript plain (§8.4/§6.7).
 #[tauri::command]
 pub fn cancel_generation(coordinator: State<'_, Arc<Coordinator>>) -> Result<(), String> {
     coordinator.cancel_generation()

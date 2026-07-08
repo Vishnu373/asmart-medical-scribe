@@ -23,7 +23,7 @@ use std::time::Duration;
 
 use tauri::Manager;
 
-use llm::{LlmEngine, LlmModel, RealNoteGenerator};
+use llm::{LlmEngine, LlmModel, RealCorrectionSuggester, RealNoteGenerator};
 use orchestrator::{emit_app_event, Coordinator, RealPipeline};
 use residency::ResidencyMode;
 use settings::Settings;
@@ -122,11 +122,16 @@ pub fn run() {
             // retargets the live engine (no restart): the generator and the command
             // hold the same `Arc<LlmEngine>`.
             app.manage(llm_engine.clone());
+            // Correction (§6.7) reuses the same resident engine; it holds its own
+            // clone so it and the note generator share one loaded model.
+            let suggester =
+                RealCorrectionSuggester::new(handle.clone(), llm_engine.clone(), swap_mode);
             let generator =
                 RealNoteGenerator::new(handle.clone(), llm_engine, store.clone(), swap_mode);
             let coordinator = Coordinator::new(
                 Box::new(pipeline),
                 Box::new(generator),
+                Box::new(suggester),
                 Box::new(move |event| emit_app_event(&handle, event)),
             );
             // Managed as an `Arc` so the async `generate_note` command can move an
@@ -162,6 +167,7 @@ pub fn run() {
             commands::delete_record,
             commands::generate_note,
             commands::regenerate_note,
+            commands::suggest_corrections,
             commands::cancel_generation,
             commands::update_note,
             commands::revert_version,

@@ -511,7 +511,7 @@ next launch. `cargo test` covers the extraction/verify; `bun run test` covers ga
 
 ## Transcript Correction
 
-### Phase E1 — Post-ASR correction suggestions  `[ ] planned`
+### Phase E1 — Post-ASR correction suggestions  `[~] coded; frontend green, Rust build/verify on Windows pending`
 **Goal:** After Stop, automatically propose contextual transcript fixes — the
 mishearings that deterministic word-fixing (`stt/text.rs`) can't catch because every
 word is valid but the phrase is wrong (e.g. *"right side, right down beforehand"* →
@@ -533,46 +533,57 @@ F4 (streaming/cancel pattern to mirror).
   Generate is available; the two never run at once.
 
 **Backend tasks:**
-- [ ] Correction command (e.g. `suggest_corrections`) that runs on the resident LLM
-      over the current transcript, driven from the orchestrator's Stop→review slot
-      (§6.6/§8.1). Reuses the loaded model per residency (§7) — no new model load.
-- [ ] A correction prompt (new `llm/` prompt path, kept unit-testable like
-      `llm/prompt.rs`) instructing the model to emit **one parseable record per line**,
-      each `{ original_span, replacement }`, spans copied verbatim from the transcript.
-- [ ] Stream + parse-as-you-go: emit each completed record as a `correction-suggestion`
-      event (mirroring `generation-token`); terminal `correction-done` /
-      `correction-error`. Cancelable via the existing generation-cancel path.
-- [ ] Guard: drop any suggestion whose `original_span` is not found in the transcript
-      (enforces the span-only invariant server-side, not just by prompt).
+- [x] Correction command `suggest_corrections` (async + `spawn_blocking`, mirrors
+      `generate_note`) that runs on the resident LLM over the record's transcript.
+      Driven from the UI's Stop handler; a new coordinator `CORRECTING` state (peer of
+      `GENERATING`) gates it so `generate_note` is rejected until it ends — the
+      sequencing invariant enforced server-side. Reuses the loaded model (§7) via a
+      shared `Arc<LlmEngine>` clone; no new model load.
+- [x] Correction prompt in `llm/correction.rs` (pure, unit-tested like `llm/prompt.rs`):
+      per-model instruct template + one-shot example, instructing the model to emit
+      **one JSON record per line** — `{"original","replacement"}` — spans copied verbatim.
+      `engine::suggest_corrections` runs the shared streaming decode (from position 0 —
+      the correction prompt is not the SOAP prefix, so the §8.7 cache never applies).
+- [x] Stream + parse-as-you-go: `RealCorrectionSuggester` buffers the token stream,
+      flushes one record per newline as `correction-suggestion` (mirroring
+      `generation-token`); terminal `correction-done` / `correction-error`. Cancelable
+      via the existing generation-cancel path (`cancel_generation` now covers CORRECTING).
+- [x] Guard: `correction::parse_line` skips blank/partial/malformed lines and empty
+      spans; the suggester drops any record whose `original` isn't found verbatim in the
+      transcript (span-only invariant enforced server-side, not just by prompt).
 
 **Frontend tasks:**
-- [ ] On Stop, auto-invoke the correction command; subscribe to `correction-*` events.
-- [ ] Inline **non-blocking popup** anchored to the flagged phrase (does not obscure
-      surrounding text), with Accept / Reject in place. Accept patches that span and
-      rides the existing debounced `update_transcript` save (§6.5); Reject dismisses.
-- [ ] **Duplicate spans** → apply to the **first not-yet-accepted** occurrence.
-- [ ] **No suggestions** → nothing shown, Generate simply becomes available (no modal).
-- [ ] **Cancel** path to skip the pass and go straight to editing/Generate; a model
-      error leaves a plain editable transcript. Feature is strictly additive — it
-      never blocks note generation.
-- [ ] Gate the **Generate** button so note-gen starts only after the correction pass
-      has ended (streamed/cancelled/failed), preserving the sequencing invariant.
+- [x] On Stop, `RecordingControls` auto-invokes `suggestCorrections(id)` (fire-and-forget,
+      additive); `useBackendEvents` subscribes `correction-suggestion` into a store slice.
+- [x] **Review list beside the transcript** (`CorrectionSuggestions.tsx`), not an inline
+      anchored popup — the transcript is a plain `<textarea>`, which can't host overlays
+      at character offsets, and a list sidesteps the offset-survival problem entirely
+      (see the §6.7 presentation note + §11 trade-off). Each row shows original →
+      replacement with Accept / Reject; Accept replaces the span in place and rides the
+      debounced `update_transcript` save (§6.5); Reject dismisses.
+- [x] **Duplicate spans** → `String.replace` patches the **first** occurrence per Accept.
+- [x] **No suggestions** → the panel renders nothing; Generate simply becomes available.
+- [x] **Cancel** in the panel (shared `cancel_generation`) skips the pass; a model error
+      is swallowed (no toast) leaving a plain transcript. Strictly additive.
+- [x] Gate **Generate** while `recordingState === "CORRECTING"` (peer of GENERATING), so
+      note-gen only starts once the pass ends (streamed/cancelled/failed).
 
 **Open items / decisions:**
-- **Span anchoring in the editor** — how to locate/highlight the popup at the right
-  offset in an editable document as it changes (character offsets vs. marker); confirm
-  it survives concurrent manual edits.
-- **First-token latency** on long transcripts / slow CPUs — if the wait proves too
-  long, revisit the §6.7 chunked-input alternative (per-segment windows).
-- **Prompt robustness** — malformed/partial lines mid-stream must be skipped, not
-  crash the parser.
+- **Span anchoring** — *resolved:* chose a review list beside the transcript over inline
+  offset-anchored popups, so there are no character offsets to keep valid across manual
+  edits. Design §6.7 updated + trade-off recorded in §11.
+- **First-token latency** on long transcripts / slow CPUs — still open; if the wait
+  proves too long, revisit the §6.7 chunked-input alternative (per-segment windows).
+- **Prompt robustness** — handled: `parse_line` is tolerant (skips partial/malformed
+  lines mid-stream); covered by a unit test.
 
-**Verification (once built):** unit — the correction prompt builds per model template;
-the not-in-transcript guard drops phantom spans; the per-line parser tolerates partial
-lines. RTL — streamed `correction-suggestion` events render inline popups; Accept
-patches the transcript and calls `update_transcript`; Reject dismisses; empty stream
-enables Generate with no popup; Generate is disabled until the pass ends. `cargo test`
-+ `bun run test`.
+**Verification:** frontend green — `CorrectionSuggestions` (render-nothing when idle,
+scanning hint + Cancel while CORRECTING, Accept patches + saves, Reject dismisses,
+missing-span drops silently), `useBackendEvents` (suggestion → store), command wrapper.
+`vitest run` = 14 files / 63 tests pass. **Rust unverified here** (no toolchain on Linux):
+still **build + `cargo test` on Windows** — `correction.rs` prompt/parser tests and the
+new `coordinator.rs` CORRECTING tests. Manual: back-to-back Stop shows suggestions, Accept
+patches the transcript, Generate is held until the pass ends, Cancel skips it.
 
 ## Note Generation Tuning
 
@@ -699,6 +710,35 @@ then generate again and confirm the next note is clean (reset-to-boundary works)
 model in Settings and confirm the context rebuilds. `cargo test` + `bun run test`.
 
 ## Progress Log
+
+- **2026-07-07 — Phase E1 (post-ASR correction suggestions) coded; frontend green, Rust build/verify on Windows pending.**
+  After Stop, an automatic pass over the finalized transcript proposes contextual mishearings
+  (fluent-but-wrong phrases the deterministic word-fixer can't catch, e.g. "right down beforehand"
+  → "right side of forehead"). Suggest-only — the transcript changes only on an explicit Accept.
+  **Backend:** new `llm/correction.rs` (pure, unit-tested) — per-model instruct-template prompt +
+  one-shot example asking for **one JSON record per line** `{"original","replacement"}`, plus a
+  tolerant `parse_line` (skips blank/partial/malformed lines and empty spans) and the `Suggestion`
+  wire type. `engine::suggest_corrections` runs the shared streaming decode from position 0 (the
+  correction prompt is not the SOAP prefix, so the §8.7 cache never false-matches). New coordinator
+  **`CORRECTING`** state (peer of `GENERATING`) + `CorrectionSuggester` trait: `suggest_corrections`
+  walks IDLE→CORRECTING→IDLE, so `generate_note` is rejected until the pass ends (the "sequenced,
+  never concurrent" invariant, server-side); `cancel_generation` now also unwinds a correction.
+  `RealCorrectionSuggester` buffers the token stream, flushes one `correction-suggestion` per
+  newline, drops any span not found verbatim in the transcript (guard), and emits terminal
+  `correction-done`/`correction-error`. Reuses the resident model via a shared `Arc<LlmEngine>`
+  clone — no second model; in **swap mode** it unloads the LLM after the pass (same discipline as
+  note-gen, §8.4) so an auto-on-Stop pass can't co-reside the LLM with the still-warm STT model on
+  the low-RAM machine §7 protects. **Frontend:** `suggestCorrections` command + `correction-*` events + a
+  store `suggestions` slice; `RecordingControls` fire-and-forgets the pass on Stop; the review is a
+  **list beside the transcript** (`CorrectionSuggestions.tsx`), **not** an inline anchored popup —
+  the transcript is a plain `<textarea>` that can't host offset overlays, and a list avoids keeping
+  character offsets valid across manual edits (design §6.7 presentation note + §11 trade-off). Accept
+  patches the first span occurrence and rides the debounced `update_transcript` save; Reject dismisses;
+  Generate is held while CORRECTING. Additive throughout — no suggestions shows nothing, a model error
+  is swallowed. **Verified here:** `vitest run` = 14 files / 63 tests (new: `CorrectionSuggestions`,
+  the `useBackendEvents` suggestion wiring, the command wrapper). **Not verified here:** no Rust
+  toolchain on Linux — needs `cargo test` on Windows (`correction.rs` prompt/parser + `coordinator.rs`
+  CORRECTING tests) and manual back-to-back Stop → Accept → Generate-gating checks.
 
 - **2026-07-07 — Phase E3 (prompt-prefix caching) coded via state save/restore; Windows build/verify pending.**
   Turned on the KV-cache reuse E2 laid groundwork for. **Precondition resolved:** pinned

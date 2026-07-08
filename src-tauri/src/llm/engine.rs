@@ -26,6 +26,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::LlamaStateSeqFlags;
 
+use super::correction;
 use super::prompt;
 
 /// The note-generation model (design §8.2). The three doctor-facing tiers map
@@ -121,6 +122,7 @@ impl LlmModel {
 // §7 budget needs.
 const N_CTX: u32 = 8192; // prompt + transcript + note; well under the model maxima
 const MAX_OUTPUT_TOKENS: i32 = 1536; // generous ceiling for a SOAP note
+const MAX_CORRECTION_TOKENS: i32 = 512; // JSON-lines suggestions are short; decode-light (§6.7)
 const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hallucination
 
 /// Serialized KV state of the fixed prompt prefix (system + one-shot example, §8.3)
@@ -293,6 +295,46 @@ impl LlmEngine {
         // tokens; otherwise start from position 0 (full decode, the fallback).
         let start = self.restore_prefix(&mut ctx, kind, &tokens);
         self.decode_and_generate(&mut ctx, model, &tokens, start, MAX_OUTPUT_TOKENS, on_token, cancel)
+    }
+
+    /// Run the post-ASR correction pass (design §6.7) over `transcript` on the
+    /// resident model, streaming each decoded piece to `on_token` (the caller
+    /// splits the stream into JSON-lines records) and polling `cancel`. Returns the
+    /// full raw output, or `None` if cancelled.
+    ///
+    /// Reuses the same streaming decode as [`generate`] but with the correction
+    /// prompt and a smaller token cap (suggestions are short). The correction prompt
+    /// is not the SOAP prefix, so the prefix cache (§8.7) can't apply — the whole
+    /// prompt is decoded from position 0.
+    pub fn suggest_corrections(
+        &self,
+        transcript: &str,
+        on_token: &dyn Fn(&str),
+        cancel: &Arc<AtomicBool>,
+    ) -> Result<Option<String>> {
+        self.ensure_loaded()?;
+        let kind = self.model_kind();
+        let prompt = correction::build_prompt(kind, transcript);
+
+        let guard = self.lock_model();
+        let model = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LLM model is not loaded"))?;
+
+        let tokens = model
+            .str_to_token(&prompt, AddBos::Always)
+            .map_err(|e| anyhow!("failed to tokenize correction prompt: {e}"))?;
+        let prompt_budget = N_CTX as i32 - MAX_CORRECTION_TOKENS;
+        if tokens.len() as i32 >= prompt_budget {
+            return Err(anyhow!(
+                "transcript is too long for the correction pass ({} tokens; the prompt must \
+                 stay under {prompt_budget} within the {N_CTX} context)",
+                tokens.len()
+            ));
+        }
+
+        let mut ctx = self.new_context(model)?;
+        self.decode_and_generate(&mut ctx, model, &tokens, 0, MAX_CORRECTION_TOKENS, on_token, cancel)
     }
 
     /// Prime the prefix cache (§8.7): decode the fixed prefix once and serialize the

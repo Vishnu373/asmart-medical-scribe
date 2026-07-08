@@ -4,6 +4,7 @@ const LABELS: Record<AppState, string> = {
   IDLE: "Idle",
   RECORDING: "Recording",
   PROCESSING: "Processing",
+  CORRECTING: "Reviewing",
   GENERATING: "Generating",
 };
 
@@ -11,6 +12,7 @@ const DOT: Record<AppState, string> = {
   IDLE: "bg-neutral-500",
   RECORDING: "bg-red-500",
   PROCESSING: "bg-amber-400",
+  CORRECTING: "bg-sky-400",
   GENERATING: "bg-teal-400",
 };
 

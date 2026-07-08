@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
+  onCorrectionSuggestion,
   onError,
   onGenerationToken,
   onInputLevel,
@@ -19,6 +20,7 @@ export function useBackendEvents() {
   const setInputLevel = useAppStore((s) => s.setInputLevel);
   const addSegment = useAppStore((s) => s.addSegment);
   const appendStreamingToken = useAppStore((s) => s.appendStreamingToken);
+  const addSuggestion = useAppStore((s) => s.addSuggestion);
   const pushToast = useAppStore((s) => s.pushToast);
 
   useEffect(() => {
@@ -35,6 +37,10 @@ export function useBackendEvents() {
       onInputLevel((p) => setInputLevel(p.level)),
       onTranscriptSegment((p) => addSegment(p)),
       onGenerationToken((p) => appendStreamingToken(p.text)),
+      // Post-ASR correction (§6.7): each streamed record joins the pending list;
+      // the terminal done/error just returns the machine to IDLE (via state-changed),
+      // which is the additive, non-blocking behavior — no toast on failure.
+      onCorrectionSuggestion((p) => addSuggestion(p)),
       onError((p) => pushToast(p.message, "error")),
     ]).then((fns) => {
       // If the component unmounted before the listeners registered, drop them.
@@ -46,5 +52,5 @@ export function useBackendEvents() {
       active = false;
       unsubs.forEach((f) => f());
     };
-  }, [setRecordingState, setInputLevel, addSegment, appendStreamingToken, pushToast]);
+  }, [setRecordingState, setInputLevel, addSegment, appendStreamingToken, addSuggestion, pushToast]);
 }

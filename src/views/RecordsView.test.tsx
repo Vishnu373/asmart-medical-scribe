@@ -43,6 +43,7 @@ beforeEach(() => {
     currentRecordId: null,
     transcript: "",
     notes: [],
+    suggestions: [],
   });
 });
 
@@ -65,6 +66,15 @@ describe("RecordsView", () => {
       expect(s.transcript).toBe("patient reports a cough");
       expect(s.view).toBe("recording");
     });
+  });
+
+  it("clears prior-consult suggestions when opening a record", async () => {
+    // Stale suggestions belong to a different transcript; opening a record must drop
+    // them so Accept can't patch the wrong record (§6.7).
+    useAppStore.setState({ suggestions: [{ original: "cough", replacement: "wheeze" }] });
+    render(<RecordsView />);
+    await userEvent.click((await screen.findAllByRole("button", { name: "Open" }))[0]);
+    await waitFor(() => expect(useAppStore.getState().suggestions).toHaveLength(0));
   });
 
   it("deletes only after an inline confirm", async () => {

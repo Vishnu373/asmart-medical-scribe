@@ -500,7 +500,7 @@ It runs **before**, not concurrently with, note generation. The two never execut
 
 **Streamed, parse-as-you-go.** The model emits suggestions as a stream of small, independently-parseable units (one structured record per line), each naming an **original span** and its **replacement**. The UI shows each suggestion the instant its record completes, rather than waiting for the whole pass — so the first corrections appear early and perceived latency drops. Constraining the output to *replacements of spans that exist in the transcript* (not free-form text) is what keeps a "suggestion" from becoming an invention.
 
-**Inline, non-blocking presentation.** A suggestion appears as a popup anchored **next to the flagged phrase**, without obscuring the surrounding transcript, with Accept / Reject in place. Accepting patches that span in the editor and rides the existing debounced autosave (§6.5); rejecting dismisses it. The clinician can also ignore the whole pass — a **Cancel** path (reusing the generation cancel mechanism) lets them skip straight to editing and Generate.
+**Non-blocking presentation — a review list beside the transcript.** Suggestions appear as a **list next to the transcript**, each row showing the flagged phrase and its proposed replacement with Accept / Reject in place, without obscuring the transcript. Accepting replaces that span in the editor and rides the existing debounced autosave (§6.5); rejecting dismisses it. The clinician can also ignore the whole pass — a **Cancel** path (reusing the generation cancel mechanism) lets them skip straight to editing and Generate. (An earlier design anchored each suggestion as an inline popup at its phrase; because the transcript is a plain text area with no way to anchor overlays at character offsets that survive concurrent edits, the equivalent-safety review list was chosen instead — see the §11 trade-off.)
 
 **Behavioral rules.**
 
@@ -517,7 +517,7 @@ It runs **before**, not concurrently with, note generation. The two never execut
 | Model | Reuse the resident note-generation LLM (§7) | No second model to source, host, download, or keep warm |
 | Delivery | Streamed, one parseable record per line, shown as each completes | Cuts perceived latency; corrections appear early |
 | Output shape | Replacement of an existing transcript span only | Constrains output so a suggestion can't become an invention |
-| Presentation | Inline popup by the phrase, non-blocking, Accept/Reject in place | Keeps transcript readable; edit applied via existing autosave (§6.5) |
+| Presentation | Review list beside the transcript, non-blocking, Accept/Reject in place (§11 trade-off) | Keeps transcript readable; no fragile character-offset anchoring; edit applied via existing autosave (§6.5) |
 | Duplicates | Apply to first not-yet-accepted occurrence | Simple, predictable |
 | Empty / cancel | No suggestions → silently enable Generate; Cancel → plain transcript | Strictly additive; never blocks the note path |
 
@@ -973,6 +973,16 @@ The clinic/clinician is the **custodian** of the health information; the app is 
 - **Chosen:** Option 2 (save/restore).
 - **Rationale:** In `llama-cpp-2`, a `LlamaContext` borrows the loaded `LlamaModel`, so storing a persistent context beside the owned model in the engine struct is **self-referential** — safe Rust won't allow it without `unsafe`/lifetime hacks or an extra self-referencing crate. Both options skip the same expensive step (running the prefix through every model layer — seconds of CPU), which is the entire point of the feature. Option 2 reuses the fresh-context-per-note path the engine already had, so it needs no new lifetime machinery; it also makes reset-to-boundary and cancel/error cleanup **automatic** (the snapshot is never mutated and each note's context is discarded), removing the mandatory-trim invariant Option 1 carries. Its only extra cost is a per-note memory copy of the snapshot — **milliseconds against the seconds saved** — so the win is effectively identical while the code stays simpler and safer. The binding exposes both APIs (0.1.150), so this is a design choice, not a capability limit.
 - **Revisit if:** profiling on Windows shows the per-note snapshot restore is a meaningful share of latency (it shouldn't be), or the prefix grows large enough (e.g. few-shot, §8.3) that the snapshot's memory/copy cost matters — then reconsider a persistent context via a self-referential wrapper.
+
+### Correction suggestions: review list vs inline anchored popups (§6.7)
+
+- **Decision:** How to present streamed post-ASR correction suggestions over the editable transcript.
+- **Options:**
+  1. **Inline anchored popups** — anchor each suggestion as a non-blocking popup next to its flagged phrase, exactly where the mishearing sits in the text. This is what §6.7 originally described.
+  2. **Review list beside the transcript** — show the suggestions as a list next to the transcript, each row `original → replacement` with Accept / Reject; Accept patches the span in place.
+- **Chosen:** Option 2 (review list).
+- **Rationale:** The transcript editor is a plain `<textarea>`. A textarea cannot host overlay elements at arbitrary character offsets — Option 1 would require replacing it with a mirror-overlay or `contentEditable` surface and tracking each suggestion's character offset as the clinician edits the text underneath it (the offsets shift on every insertion/deletion, and a stale offset anchors the popup to the wrong span). That offset-bookkeeping is exactly the fragility flagged as the phase's open risk. The review list carries **no offsets**: a suggestion is `{original, replacement}`, and Accept simply replaces the first occurrence of `original` in the current transcript — correct regardless of intervening edits, and if the span is gone the suggestion is silently dropped. Both options are equally *suggest-only* and non-blocking (the safety property is unchanged); the list trades literal spatial adjacency for robustness and a far smaller, testable implementation. The streamed, parse-as-you-go delivery (§6.7) is identical either way — only the anchoring differs.
+- **Revisit if:** clinicians find the list hard to correlate with the phrase in a long transcript — then add lightweight highlighting (scroll-to / transient mark on hover) or move to a rich-text editor where true inline anchoring, with proper offset-mapping, becomes affordable.
 
 ## 12. Pricing
 

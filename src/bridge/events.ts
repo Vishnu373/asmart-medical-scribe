@@ -6,6 +6,7 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
+  CorrectionSuggestion,
   ErrorEvent,
   GenerationTokenEvent,
   InputLevelEvent,
@@ -36,6 +37,18 @@ export function onGenerationToken(
 
 export function onStateChanged(handler: (payload: StateChangedEvent) => void): Promise<UnlistenFn> {
   return on("state-changed", handler);
+}
+
+// — Post-ASR correction (§6.7). `correction-suggestion` streams one record as each
+// completes. The terminal `correction-done`/`correction-error` emits carry no UI
+// state of their own — the pass ends by returning the machine to IDLE, which the UI
+// already observes via `state-changed` (that's what ungates Generate) — so they have
+// no listener here by design; a failure is additive and silent.
+
+export function onCorrectionSuggestion(
+  handler: (payload: CorrectionSuggestion) => void,
+): Promise<UnlistenFn> {
+  return on("correction-suggestion", handler);
 }
 
 export function onError(handler: (payload: ErrorEvent) => void): Promise<UnlistenFn> {

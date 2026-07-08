@@ -10,6 +10,7 @@ const captured = vi.hoisted(() => {
     level?: (p: { level: number[] }) => void;
     segment?: (p: { seq: number; text: string }) => void;
     token?: (p: { text: string }) => void;
+    suggestion?: (p: { original: string; replacement: string }) => void;
     error?: (p: { code: string; message: string }) => void;
   };
 });
@@ -31,6 +32,10 @@ vi.mock("@/bridge", () => ({
     captured.token = h;
     return Promise.resolve(() => {});
   },
+  onCorrectionSuggestion: (h: (p: { original: string; replacement: string }) => void) => {
+    captured.suggestion = h;
+    return Promise.resolve(() => {});
+  },
   onError: (h: (p: { code: string; message: string }) => void) => {
     captured.error = h;
     return Promise.resolve(() => {});
@@ -49,6 +54,7 @@ beforeEach(() =>
     segments: [],
     transcript: "",
     streamingNote: "",
+    suggestions: [],
     toasts: [],
   }),
 );
@@ -85,6 +91,14 @@ describe("useBackendEvents wires §9.5 events into the store", () => {
     act(() => captured.token!({ text: "## Sub" }));
     act(() => captured.token!({ text: "jective" }));
     expect(useAppStore.getState().streamingNote).toBe("## Subjective");
+  });
+
+  it("correction-suggestion appends to the pending suggestions", () => {
+    render(<Probe />);
+    act(() => captured.suggestion!({ original: "tie the null", replacement: "Tylenol" }));
+    expect(useAppStore.getState().suggestions).toEqual([
+      { original: "tie the null", replacement: "Tylenol" },
+    ]);
   });
 
   it("error pushes a toast", () => {

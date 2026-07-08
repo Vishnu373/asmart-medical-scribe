@@ -62,6 +62,12 @@ export function cancelGeneration(): Promise<void> {
   return invoke("cancel_generation");
 }
 
+/** Run the post-ASR correction pass over the record's transcript (§6.7). Auto-invoked
+ * on Stop; streams `correction-suggestion` events, resolves when the pass ends. */
+export function suggestCorrections(recordId: string): Promise<void> {
+  return invoke("suggest_corrections", { recordId });
+}
+
 export function updateNote(id: string, soapData: string): Promise<void> {
   return invoke("update_note", { id, soapData });
 }
