@@ -1,6 +1,6 @@
 # Medical Scribe — System Design
 
-> An on-device application that records doctor–patient conversations, transcribes them locally, and generates structured SOAP clinical notes — with no patient data ever leaving the clinician's Windows device.
+> An on-device application that records doctor–patient conversations, transcribes them locally, and generates structured SOAP-R clinical notes — with no patient data ever leaving the clinician's Windows device.
 
 ## Table of Contents
 
@@ -17,6 +17,7 @@
 11. [Trade-offs & Alternatives](#11-trade-offs--alternatives)
 12. [Pricing](#12-pricing)
 13. [Future Considerations](#13-future-considerations)
+14. [Distribution, Updates & Telemetry](#14-distribution-updates--telemetry)
 
 ---
 
@@ -26,29 +27,25 @@
 
 Clinicians lose significant time to documentation — writing up each encounter during or after the visit pulls attention away from the patient and extends the working day. Existing AI scribe products are cloud-based, which raises privacy/compliance concerns under Canadian law (PHIPA/PIPEDA) and locks small clinics into recurring per-seat subscriptions.
 
-This product lets the doctor focus on **one thing — treating the patient** — while the application handles documentation. It is **cost-effective** (no per-seat cloud subscription) and **fully private**: all audio capture, transcription, and note generation run on the clinician's own device. A single-tenant VPS dedicated to one clinic is offered as a secondary deployment option for clinics that prefer it, with no shared multi-tenant cloud at any point.
+This product lets the doctor focus on **one thing — treating the patient** — while the application handles documentation. It is **cost-effective** (no per-seat cloud subscription) and **fully private**: all audio capture, transcription, and note generation run on the clinician's own device.
 
 ### Goals (in scope for v1)
 
 - Capture doctor–patient conversation audio on the clinician's Windows device for **in-person** consults.
-- Transcribe the conversation locally (speech-to-text), supporting **English and French** (Canada).
-- Generate a structured **SOAP clinical note** from the transcript, fully on-device.
+- Transcribe the conversation locally (speech-to-text).
+- Generate a structured **SOAP-R clinical note** from the transcript, fully on-device.
 - Keep the transcript locally so the doctor can revisit it; the doctor can delete transcripts at any time.
-- Run entirely on commodity clinician hardware: **Windows 11, 16–32 GB RAM, no GPU (CPU-only inference)**.
+- Run entirely on commodity clinician hardware: **Windows 11, 16 GB RAM or less, no GPU (CPU-only inference)**.
 
 ### Non-goals (explicitly out of scope for v1)
 
 - **No EMR/EHR integration** — the doctor copies the note manually into their chart.
 - **No billing codes, ICD-10-CA codes, orders, or referrals** — deferred to a future phase.
 - **No online/telehealth consults** — v1 captures in-person visits only (loopback/system-audio capture deferred to a future phase).
-- No clinical decision support, diagnosis, or treatment advice — the tool documents, it does not advise.
-- No shared multi-tenant cloud, cross-device sync, or central admin console.
-- No languages beyond English and French.
 
 ### Key assumptions & constraints
 
-- **Single clinician per device**, one encounter at a time (no parallel rooms on one machine).
-- Target hardware: **Windows 11, 16–32 GB RAM, CPU-only** (no dedicated GPU). This is the binding constraint on model selection and on whether transcription is real-time vs. post-encounter.
+- Target hardware: **Windows 11, 16 RAM or less, CPU-only**. This is the binding constraint on model selection and on whether transcription is real-time vs. post-encounter.
 - In-person capture uses a **single microphone** picking up both doctor and patient in the same room.
 - **Human-in-the-loop:** the doctor reviews and edits every note; the tool never auto-files anything.
 - **Audio is processed, not permanently retained**; the **transcript is retained locally** until the doctor deletes it.
@@ -58,65 +55,49 @@ This product lets the doctor focus on **one thing — treating the patient** —
 
 ## 2. Functional Requirements
 
-The system works like a dictation tool tuned for a clinical visit. While the doctor records, the app transcribes **incrementally**: each time the speaker pauses, the just-spoken segment is transcribed and appended to the on-screen transcript, which the doctor can correct inline at any time (they speak and edit at different moments, never simultaneously). The core loop: **record → see text appear segment-by-segment, editing as needed → Stop → final transcript review → click Generate → review/edit the SOAP note → export → clear**. Note generation is **explicit (on click)**, after the doctor is happy with the transcript. Capabilities are prioritized P0 (must-have for v1), P1 (should-have), P2 (deferred/future).
+The system works like a dictation tool tuned for a clinical visit. While the doctor records, the app transcribes **incrementally**: each time the speaker pauses, the just-spoken segment is transcribed and appended to the on-screen transcript, which the doctor can correct inline at any time (they speak and edit at different moments, never simultaneously). The core loop: **record → see text appear segment-by-segment, → Stop → final transcript review → edit if needed -> click Generate → review/edit the notes → save**. Note generation is **explicit (on click)**, after the doctor is happy with the transcript. Capabilities are prioritized P0 (must-have for v1), P1 (should-have), P2 (deferred/future).
 
 ### Capabilities
 
 | # | Capability | Priority | Actor | Trigger | Behavior | Success outcome |
 |---|-----------|----------|-------|---------|----------|-----------------|
 | FR-1 | **Start/stop recording** | P0 | Doctor | Clicks "Record" at visit start, "Stop" at end | Continuously captures microphone audio for the in-person encounter; shows elapsed time and a recording indicator | A live, growing transcript and a final transcript on Stop |
-| FR-2 | **Incremental (segmented) transcription** | P0 | System | Doctor pauses speaking (silence/VAD-detected gap) | Transcribes the just-spoken segment locally and **appends it to the on-screen transcript immediately**, then continues listening for the next segment. Auto-detects English or French | Doctor sees captured text appear segment-by-segment during the visit, with no perceptible wait |
-| FR-3 | **Inline transcript editing during capture** | P0 | Doctor | Doctor edits displayed text while not speaking | Doctor can correct any already-captured text inline; the correction is treated as final. New speech is **appended after** existing text and never overwrites a manual edit | Doctor's corrections persist; transcript stays accurate as the visit proceeds |
-| FR-4 | **Pause/resume recording** | P1 | Doctor | Clicks "Pause" mid-visit | Suspends capture (e.g. patient steps out, private moment) and resumes into the same transcript | Audio excludes paused segments; single continuous transcript |
-| FR-5 | **Language auto-detect + override** | P0 | System / Doctor | On each segment | Detects spoken language (EN/FR) automatically; doctor can override if mis-detected | Transcript and note produced in the correct language |
-| FR-6 | **Final transcript review & edit** | P0 | Doctor | After Stop, before generating | Doctor sees the full assembled transcript as a single paragraph and may do a final edit | A doctor-approved transcript ready for note generation |
-| FR-7 | **Generate SOAP note (on click)** | P0 | Doctor / System | Doctor clicks "Generate Note" | Local LLM produces a structured note with Subjective / Objective / Assessment / Plan sections from the (possibly edited) transcript | A clean, correctly-sectioned SOAP note in the encounter's language |
-| FR-8 | **Review & edit note** | P0 | Doctor | Note displayed | Doctor reads and freely edits any section before use (human-in-the-loop; nothing is auto-filed). May go back, edit the transcript, and regenerate if the note is badly wrong | Doctor-approved note text |
-| FR-9 | **Copy to clipboard** | P0 | Doctor | Clicks "Copy" | Copies the formatted SOAP note as text for pasting into any EHR | Note on clipboard, ready to paste |
-| FR-10 | **Export PDF / TXT** | P0 | Doctor | Clicks "Export" | Saves the note (and optionally the transcript) as a PDF or plain-text file to a local path the doctor chooses | File written locally, owned by the doctor |
-| FR-11 | **Print note** | P1 | Doctor | Clicks "Print" | Sends the formatted note to the system print dialog | Printed note |
-| FR-12 | **Mic device selection & level check** | P1 | Doctor | Before/at recording | Choose input device and see a live input-level meter to confirm audio is being captured | Confidence that the right mic is working before the visit |
-| FR-13 | **Browse & reopen saved encounters** | P1 | Doctor | Opens the saved-encounters list | Lists previously saved encounters (timestamp/label) and lets the doctor reopen a transcript/note to view, edit, re-export, or delete | Doctor can return to past notes without an external system |
+| FR-2 | **Incremental (segmented) transcription** | P0 | System | Doctor pauses speaking (silence/VAD-detected gap) | Transcribes the just-spoken segment locally and **appends it to the on-screen transcript immediately**, then continues listening for the next segment. | Doctor sees captured text appear segment-by-segment during the visit, with no perceptible wait |
+| FR-3 | **Pause/resume recording** | P1 | Doctor | Clicks "Pause" mid-visit | Suspends capture (e.g. patient steps out, private moment) and resumes into the same transcript | Audio excludes paused segments; single continuous transcript |
+| FR-4 | **Final transcript review & edit** | P0 | Doctor | After Stop, before generating | Doctor sees the full assembled transcript as a single paragraph and may do a final edit | A doctor-approved transcript ready for note generation |
+| FR-5 | **Generate SOAP-R note (on click)** | P0 | Doctor / System | Doctor clicks "Generate Note" | Local LLM produces a structured note with Subjective / Objective / Assessment / Plan / Response sections from the (possibly edited) transcript | A clean, correctly-sectioned SOAP-R note |
+| FR-6 | **Review & edit note** | P0 | Doctor | Note displayed | Doctor reads and freely edits any section before use (human-in-the-loop; nothing is auto-filed). May go back, edit the transcript, and regenerate if the note is badly wrong | Doctor-approved note text |
+| FR-7 | **Mic device selection & level check** | P1 | Doctor | Before/at recording | Choose input device and see a live input-level meter to confirm audio is being captured | Confidence that the right mic is working before the visit |
+| FR-8 | **Browse & reopen saved encounters** | P1 | Doctor | Opens the saved-encounters list | Lists previously saved encounters (timestamp/label) and lets the doctor reopen a transcript/note to view, edit, re-export, or delete | Doctor can return to past notes without an external system |
 
 ### Session & retention model
 
 - **Transcripts and notes are persisted locally inside the application** and remain available across sessions until the doctor deletes them. The app keeps a local store of past encounters the doctor can revisit.
 - **Audio is transient**: held only long enough to transcribe each segment, then discarded. Audio is never written to disk as a retained file.
-- After a note is generated, the app shows a **pop-up offering to delete the transcript**. If the doctor declines, the transcript stays in the app; the note is always kept. The doctor can later delete the transcript and/or the note independently, at any time.
 - All persisted PHI (transcripts and notes) is **encrypted at rest** (see NFRs) so a lost or stolen device does not expose patient data.
-- The doctor may also **export** (PDF/TXT) to keep copies outside the app; those exported files are theirs to manage.
 
-### Edge cases & explicit out-of-scope behaviors
+### Edge cases
 
-- **Very long visits** (approaching/over ~20 min): transcription must handle long audio without running out of memory (chunked processing — see NFRs).
 - **Silence / no speech**: produce an empty or "insufficient audio" result rather than a hallucinated note.
-- **Mixed EN/FR in one visit**: best-effort; auto-detect picks the dominant language. Robust code-switching is **not** guaranteed in v1.
-- **Background noise / overlapping speech**: best-effort transcription. **Speaker diarization (labeling Doctor vs Patient) is deferred to P2** — v1 produces a single transcript and the LLM infers roles from conversational context when writing the note.
-- **Out of scope:** EMR write-back, billing/diagnosis codes, online/telehealth capture, clinical advice, multi-clinician on one device, languages other than EN/FR.
-
 ---
 
 ## 3. Non-Functional Requirements
 
-All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM (32 GB upper), **CPU-only, no GPU**. Numbers are design targets to validate during benchmarking, not guarantees, given on-device model variability.
+All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or less, **CPU-only, no GPU**. Numbers are design targets to validate during benchmarking, not guarantees, given on-device model variability.
 
 | # | Requirement | Target | Rationale |
 |---|------------|--------|-----------|
 | NFR-1 | **Per-segment transcription latency** | Captured text appears **< 2 s** after a speech pause (for a typical 5–15 s utterance) | Must feel near-instant so the doctor isn't waiting mid-visit; drives choice of a fast, CPU-light STT model (Parakeet TDT v3, §6.4) |
 | NFR-2 | **Note generation** | Runs in a **background queue**; doctor is not blocked and can start the next patient. Target completion **< 90 s** for a ~20-min encounter on the 16 GB profile | A 7–8B quantized LLM on CPU needs time; backgrounding hides it so throughput isn't affected |
-| NFR-3 | **Throughput** | Up to **50 encounters/device/day**, processed **sequentially** (one active encounter at a time) | Matches a busy walk-in/solo clinic peak day; no concurrency required |
-| NFR-4 | **Encounter length** | Handle encounters up to **~30 min** of audio without instability | Headroom over the ~20-min average; long visits must not exhaust memory |
-| NFR-5 | **Peak memory** | Total app + models peak **< 12 GB RAM** | Leaves ~4 GB for Windows + the doctor's EHR/browser on a 16 GB machine; STT + LLM may need to load/unload to coexist |
-| NFR-6 | **Privacy / data residency** | **Zero network egress of PHI.** App is fully functional **offline**; no telemetry containing PHI; no third-party cloud calls | Core product promise and PHIPA/PIPEDA posture |
-| NFR-7 | **Encryption at rest** | All persisted PHI (transcripts, notes, app store) **encrypted at rest** (AES-256; key protected via Windows DPAPI tied to the user account) | Persistent local PHI must survive device loss/theft without exposure |
-| NFR-8 | **Durability / crash safety** | Captured transcript persisted incrementally so an app/OS crash mid-visit loses **≤ the last unsaved segment** | A 20-min visit's transcript must not vanish on a crash |
-| NFR-9 | **Data lifecycle** | Audio discarded immediately after each segment is transcribed; transcript/note retained until the doctor deletes them; deletions are **permanent** (no recycle/cloud copy) | Minimizes audio PHI footprint; gives the doctor full control over retained text |
-| NFR-10 | **Note quality** | No hard WER SLA in v1. Commit: **all SOAP sections populated only from transcript facts, no fabricated content**; **mandatory human review** before use | Honest given CPU-model limits; safety comes from the human-in-the-loop, not model perfection |
-| NFR-11 | **Availability** | N/A as a service (local desktop app); target **no crash** across a full clinic day; graceful recovery on restart | It's a local app, but it must be dependable across 50 visits |
-| NFR-12 | **Install & footprint** | Single Windows installer; models bundled or fetched once on first run; on-disk footprint **target < 10 GB** (STT + LLM weights) | Must be deployable by a non-technical clinic on a normal laptop |
-| NFR-13 | **Cold start** | App ready to record **< 10 s** from launch (models may lazy-load on first record) | Doctor can't wait minutes between patients |
-| NFR-14 | **Maintainability** | STT and LLM are **swappable** behind internal interfaces so models can be upgraded without rewrites | On-device model landscape moves fast; avoid lock-in to one model |
-| NFR-15 | **Licensing** | All bundled models and runtimes must be **free for commercial use** (permissive OSS, ideally Apache-2.0/MIT) with **no per-seat fees or usage caps** | Core "no subscription / cost-effective" value prop; avoids legal/cost risk from restrictive model licenses |
+| NFR-3 | **Encounter length** | Handle encounters up to **~30 min** of audio without instability | Headroom over the ~20-min average; long visits must not exhaust memory |
+| NFR-4 | **Peak memory** | Total app + models peak **< 12 GB RAM** | Leaves ~4 GB for Windows + the doctor's EHR/browser on a 16 GB machine; STT + LLM may need to load/unload to coexist |
+| NFR-5 | **Encryption at rest** | All persisted PHI (transcripts, notes, app store) **encrypted at rest** (AES-256; key protected via Windows DPAPI tied to the user account) | Persistent local PHI must survive device loss/theft without exposure |
+| NFR-6 | **Durability / crash safety** | Captured transcript persisted incrementally so an app/OS crash mid-visit loses **≤ the last unsaved segment** | A 20-min visit's transcript must not vanish on a crash |
+| NFR-7 | **Data lifecycle** | Audio discarded immediately after each segment is transcribed; transcript/note retained until the doctor deletes them; deletions are **permanent** (no recycle/cloud copy) | Minimizes audio PHI footprint; gives the doctor full control over retained text |
+| NFR-8 | **Note quality** | No hard WER SLA in v1. Commit: **all SOAP-R sections populated only from transcript facts, no fabricated content**; **mandatory human review** before use | Honest given CPU-model limits; safety comes from the human-in-the-loop, not model perfection |
+| NFR-9 | **Availability** | N/A as a service (local desktop app); target **no crash** across a full clinic day; graceful recovery on restart | It's a local app |
+| NFR-10 | **Install & footprint** | Single Windows installer; models downloaded once after installation; on-disk footprint **target < 10-20 GB** (STT + LLM weights) | Must be deployable by a non-technical clinic on a normal laptop |
+| NFR-11 | **Cold start** | App ready to record **< 10 s** from launch (models may lazy-load on first record) | Doctor can't wait minutes between patients |
 
 ---
 
@@ -131,27 +112,18 @@ The application is a single Windows desktop process composed of swappable buildi
 | **Audio capture** | Read microphone, buffer PCM, detect speech pauses (VAD) to segment utterances | Part of the existing STT codebase being integrated |
 | **STT engine** | Transcribe each audio segment to text; EN/FR auto-detect | **Parakeet TDT 0.6B v3**, CPU-only via an ONNX runtime; multilingual EN+FR with auto-detect. Single STT engine for v1 (see §6.4) |
 | **Transcript store** | Hold the live, editable transcript; persist per-encounter; preserve manual edits | App-owned; encrypted local store (see Data Model) |
-| **Note generator (LLM)** | Turn the approved transcript into a structured SOAP note (EN/FR), on click | **Local 7–8B instruct model, 4-bit GGUF, via `llama.cpp`.** Default **Qwen2.5-7B-Instruct (Apache-2.0)**; alternate **Mistral-7B-Instruct v0.3 (Apache-2.0)** |
-| **Prompt/template layer** | SOAP system prompt, section schema, language handling, anti-fabrication guardrails | App-owned; the main thing this project must build well |
+| **Note generator (LLM)** | Turn the approved transcript into a structured SOAP note (EN/FR), on click | **Open source models - mistral 7b, phi 3.5 Q_8, Q_4, via `llama.cpp`.|
+| **Prompt/template layer** | SOAP-R system prompt, section schema, language handling, anti-fabrication guardrails | App-owned; the main thing this project must build well |
 | **Local store** | Encrypted persistence of transcripts + notes; saved-encounter list | App-owned (see Data Model) |
 | **UI shell** | Record controls, live transcript, note view/edit, export/print, saved list | Desktop framework **TBD** alongside the STT codebase decision |
 
 ### Model selection — note generator (the focus of v1)
 
 - **Runtime:** `llama.cpp` (GGUF), CPU inference, 4-bit quantization (Q4_K_M) to fit memory and hit latency.
-- **Default model:** **Qwen2.5-7B-Instruct** — Apache-2.0 (commercially free, no caps), strong instruction-following for structured output, solid French.
-- **Alternate:** **Mistral-7B-Instruct v0.3** — Apache-2.0, lighter/faster, strong French; fallback if Qwen is too slow on low-end CPUs.
-- **Explicitly avoided:** Llama-3.x (Meta Community License) and Gemma (Gemma license) — usable but carry usage terms; excluded to keep the licensing story clean (NFR-15).
+- **Default model:** **Mistral-7B-Instruct v0.3** — Apache-2.0, heavy, best note generation.
+- **Alternate model 1:** **Phi3.5 Q_8** — MIT, lighter, decent note generation.
+- **Alternate model 2:** **Phi3.5 Q_4** — MIT, lightest, okayish note generation.
 - **Swappable interface:** the note generator sits behind an internal `generate_note(transcript, language) -> SOAP` interface so the model can be upgraded or A/B-tested without touching the rest of the app (NFR-14).
-
-### Memory coexistence note
-
-To respect the **<12 GB peak** target (NFR-5), the STT model and the LLM are **not required to be resident simultaneously**. STT is active during recording; the LLM is loaded for the on-click generation step. If memory is tight, the app can unload STT before loading the LLM (acceptable because generation is an explicit, post-recording step). This is a key reason note generation is on-click and backgrounded rather than continuous.
-
-### Deployment models
-
-1. **Primary — fully on-device:** everything runs on the clinician's Windows 11 machine. No network dependency for core function.
-2. **Secondary — single-tenant VPS:** for clinics preferring not to run models on the local laptop, one dedicated VPS per clinic hosts the same app/models, accessed only by that clinic. Still no shared multi-tenant cloud; PHI stays within the clinic's dedicated instance. (Detailed in Trade-offs.)
 
 ---
 
@@ -194,21 +166,20 @@ flowchart LR
 
     subgraph STT["STT path"]
         Cap --> Seg[Segment buffer]
-        Seg --> ASR[STT Engine<br/>Parakeet TDT v3, CPU<br/>EN/FR auto-detect]
+        Seg --> ASR[STT Engine]
     end
 
     ASR --> TStore[Transcript State<br/>live, editable, edits preserved]
 
     subgraph NoteGen["Note-generation path — built by this project"]
         TStore --> Prompt[Prompt/Template Layer<br/>SOAP schema · language · anti-fabrication]
-        Prompt --> LLM[LLM Note Generator<br/>Qwen2.5-7B-Instruct Q4 · llama.cpp · CPU]
+        Prompt --> LLM[LLM Note Generator]
         LLM --> Note[SOAP Note]
     end
 
     TStore --> UI
     Note --> UI[UI Shell<br/>record · transcript · note · export]
     UI <--> Persist[(Encrypted Local Store<br/>AES-256 + DPAPI)]
-    UI --> Export[Copy / PDF / TXT / Print]
 ```
 
 ### 5.3 Sequence — live capture → note generation
@@ -375,8 +346,6 @@ This stage answers: **which model runs, and when does it live in RAM?** The life
 | Role | Model | License | Notes |
 |------|-------|---------|-------|
 | Sole engine (v1) | Parakeet TDT 0.6B v3 | CC-BY-4.0 (attribution required) | Fast, CPU-light, multilingual EN+FR with auto-detect; the all-rounder default. v1 ships this as the only STT engine |
-
-v1 deliberately ships a **single STT engine**. An alternative higher-accuracy engine (e.g. a Whisper-family model) was considered as a user-selectable fallback but is deferred — see [Future Considerations](#13-future-considerations) for the technical reason and the path to adding it later. The `transcribe(audio) -> text` interface keeps that door open without disturbing the pipeline.
 
 Models are downloaded once on first selection and cached on disk thereafter.
 
@@ -940,7 +909,12 @@ A doctor passphrase was rejected for v1: it adds a prompt every launch and "forg
 
 **Zero PHI egress (NFR-6).** The app is fully functional offline and makes no network calls that carry patient data. Transcripts, notes, and the patient label never leave the device.
 
-**Automatic crash reporting (technical only).** To support fixing the app in early deployment, crash reports are sent automatically. They contain **only technical information** — stack trace, error type, app version, OS — and the PHI fields (`transcript`, `soap_data`, `label`) are **structurally excluded** so they cannot be attached. This preserves NFR-6, which concerns *PHI* egress: a scrubbed crash report carries no PHI. The behavior is disclosed once in a short privacy notice.
+**Automatic technical telemetry (no PHI).** To know the product works on real devices and to fix it early, the app sends **technical-only** events automatically — no opt-in, disclosed once in a short privacy notice. This preserves NFR-6, which concerns *PHI* egress: these events carry none. It covers both crashes and a small set of usage/health events.
+
+- **Allowlist, never blocklist.** Each event is built from a fixed set of non-PHI fields — app version, OS, arch, detected RAM tier, active model tier, event name, coarse timings, and for errors the error *type/message string only* (`TechnicalContext`). Nothing else is attachable by construction.
+- **Scrub backstop (defense-in-depth).** Every outgoing event still passes through `scrub_event`, which recursively strips any field whose key looks like PHI (`transcript`, `soap`, `note`, `label`, `record`) — so a future richer payload can never leak one.
+- **Events:** `app_launched`, `setup_started` / `model_download_done` / `model_download_failed`, `note_generated` (+ ms), `correction_pass_ran`, `error` (sanitized), `crash` (stack trace + `TechnicalContext`). Never the transcript, note, audio, or patient label.
+- **Transport:** a single HTTPS POST of the event JSON to **our own** ingest endpoint (§14.4) — fire-and-forget, queued locally and retried, never blocks the UI, silent on failure. It is off unless the ingest URL is compiled into the build (`MEDSCRIBE_TELEMETRY_URL`), so a URL-less build stays fully offline. No third-party analytics vendor is involved.
 
 ### 10.4 Data lifecycle
 
@@ -958,7 +932,7 @@ The clinic/clinician is the **custodian** of the health information; the app is 
 |----------|--------|-----------|
 | DB key protection | Windows DPAPI, no passphrase | Frictionless; key bound to the Windows account, useless on a stolen device |
 | App-level lock | None; rely on Windows login | One clinician per device; OS sign-in is the boundary |
-| Crash reporting | Automatic, technical-only; PHI fields structurally excluded | Enables fixing the app without breaking zero-PHI-egress (NFR-6) |
+| Telemetry | Automatic, technical-only; allowlist + `scrub_event` backstop; POST to our own endpoint (§14.4) | Signal on real-device health without breaking zero-PHI-egress (NFR-6); no third-party analytics vendor |
 | Audit log | Out of scope for v1 | Single-user device; deferred to Future Considerations |
 | Custodianship | Clinician is custodian; app is the tool | Aligns responsibility with PHIPA/PIPEDA |
 
@@ -1025,5 +999,61 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 **Why the alternate STT engine is deferred (technical note).** The default STT engine (Parakeet) runs on an **ONNX** runtime, while the note-generation LLM (§8) runs on **llama.cpp**. A Whisper-family STT engine would run on **whisper.cpp**. Both whisper.cpp and llama.cpp statically embed their *own* copy of the same low-level tensor library (**ggml**); linking both into one executable produces duplicate-symbol link errors, so they cannot coexist in a single binary. v1 therefore ships exactly one ggml consumer — the LLM — and an ONNX-based STT (Parakeet) that carries no ggml, which links cleanly.
 
 Adding a whisper-based engine later is still possible without this conflict by running one engine **out-of-process** (a separate child process the app talks to locally), so each binary embeds its own ggml independently. That isolation pairs naturally with the **swap** residency mode (§7) — the alternate engine and the LLM would load one at a time, with the clinician shown a brief, plain-language "this may add a short delay" notice at the hand-off rather than any technical detail. This is a known, accepted limitation of the current single-binary design.
+
+## 14. Distribution, Updates & Telemetry
+
+How the app reaches users, how they get updates, and where the technical telemetry (§10.3) is stored. All three are deliberately lightweight and self-owned — no app store, no third-party analytics vendor.
+
+### 14.1 Installer & hosting
+
+- **Installer:** `bun run tauri build` on Windows produces an **NSIS `.exe`** (and MSI) via Tauri's bundler. The build-time toolchain (LLVM/Clang, CMake, Perl) compiles llama.cpp into the native binary and is **not** shipped; end users need none of it. The only runtime dependency is **WebView2**, which ships with Windows 10/11 and the NSIS installer auto-installs if missing.
+- **Lean installer.** The installer carries only the app plus the small Silero VAD (`silero_vad.onnx`, ~1.8 MB); the LLM and Parakeet STT are fetched on **first launch** (§8.2, Phase D3), keeping the `.exe` at tens of MB rather than several GB. `bundle.resources` therefore bundles only the VAD.
+- **Host: GitHub Releases.** Each version is a tagged GitHub Release with the `.exe` attached as an asset. The 2 GB-per-asset limit is irrelevant here because models are **not** hosted on GitHub — they download from their existing source (Hugging Face) on first run, and that URL is a **swappable constant** (movable to our own R2/S3 later without breaking already-installed clients, since they only re-download on a fresh install).
+
+### 14.2 Download website
+
+- A static page on **Vercel** with a "Download for Windows" button linking to the release asset via the **`/releases/latest/download/<asset>`** redirect, so the link never goes stale across versions.
+- The same Vercel project hosts the telemetry ingest function (§14.4) — one deploy, one domain covers both the site and the endpoint.
+
+### 14.3 Updates
+
+Two paths ship: an automatic in-app updater (default), with manual re-install always available as the fallback.
+
+**Auto-update (Tauri updater plugin).**
+- `createUpdaterArtifacts: true` — the build emits a **signed** update bundle alongside the installer. Updates are signed with a keypair (`tauri signer generate`); the **public key** lives in `tauri.conf.json`, the **private key** is a CI/release secret. The app installs an update only if its signature verifies against the embedded public key, so a tampered or spoofed bundle is rejected.
+- **Manifest + host.** Each release publishes a `latest.json` (version, notes, per-target signed-bundle URL). Both the manifest and the bundle are **GitHub Release assets**, so the update host is the same as the download host (§14.1) — no extra infrastructure. The updater's `endpoints` point at the release URL.
+- **Check + apply.** On launch the app makes **one** best-effort HTTPS call to the manifest endpoint. If a newer version exists it shows a **non-blocking prompt** ("Update available — install and restart?"); the clinician chooses when, so an update never interrupts a consult. Offline or endpoint-unreachable → the check fails silently and the app runs normally.
+- **PHI posture.** The update check carries **no PHI** — it sends only the current version (in the request URL) and receives the manifest. It is the one outbound call besides telemetry (§10.3), and like telemetry it is best-effort and silent on failure, so the offline default still holds.
+
+**Manual fallback.** A new version is always also a plain GitHub Release; a user can download and run the new installer (which upgrades in place) if they prefer, or if auto-update is ever disabled. The download site (§14.2) always points at latest.
+
+### 14.4 Telemetry backend
+
+The client-side policy (what is collected, the allowlist, the scrub backstop) is §10.3; this is where events land.
+
+- **Ingest:** a **Vercel serverless function** receives the POSTed event JSON, validates it against the allowlisted shape (**rejecting any unexpected keys** — a second, server-side backstop against PHI), and inserts one row.
+- **Storage: Neon Postgres.** Low-volume, append-mostly desktop telemetry — a single managed Postgres is ample. One `events` table:
+
+  | column | type | note |
+  |--------|------|------|
+  | `id` | bigserial PK | |
+  | `received_at` | timestamptz default `now()` | server clock |
+  | `event` | text | event name (allowlisted) |
+  | `app_version` | text | |
+  | `os` / `arch` | text | |
+  | `ram_tier` / `model_tier` | text | nullable |
+  | `duration_ms` | integer | nullable |
+  | `error_kind` | text | nullable, sanitized string |
+  | `install_id` | uuid | random per **install**, not per patient |
+  | `payload` | jsonb | remaining allowlisted fields |
+
+- **`install_id`** is a random UUID generated once per install and stored in the settings file. It identifies a *device*, never a patient, so distinct-device counts and per-device error rates are possible without any PHI or personal identifier.
+- **Hardening (the endpoint is public).** Two guards keep the ingest URL from being spammed: a **shared secret token** the app sends in a header (the function rejects requests without it), and **rate-limiting** per source. Prevents junk rows and runaway cost.
+- The whole path — endpoint and database — is infrastructure we own; no third-party analytics SDK is embedded in the app.
+
+### 14.5 Release pipeline & versioning
+
+- **CI/CD (GitHub Actions).** On every push/PR, CI runs `cargo test` + `bun test` + a compile (catch breakage early). On a **version tag**, CD spins up a Windows runner → `tauri build` → code-sign → publish the GitHub Release with the installer, the signed updater bundle, and `latest.json` (§14.3). This removes the manual, error-prone per-release steps and guarantees every release is signed and complete.
+- **Version-bump discipline.** The auto-updater decides "is there an update?" by comparing the installed `tauri.conf.json` version against the released one. **The version must be bumped before every release** or the updater sees no change and users never receive it. CD enforces this by tagging = the source of the version, so a release can't be cut without a new number.
 
 **Why the one-key EMR paste is deferred (technical note).** The hotkey hand-off's core requirement is **focus preservation**: the paste must land in the EMR field the clinician selected, so the picker must appear **without stealing focus** from that field. A normal pop-up window activates when shown — Windows moves keyboard focus to it, the EMR field loses the caret, and the simulated Ctrl+V then pastes nowhere useful. Solving this needs two pieces of native, Windows-specific work: (1) a **non-activating, always-on-top overlay** — the Win32 `WS_EX_NOACTIVATE` extended window style, which the app framework does not expose and which must be set on the window handle directly; and (2) because a window that never holds focus also never receives keyboard events, the picker can't be driven by ordinary in-page key handling — the navigation keys (S/O/A/P, arrows, Enter, Esc) must be captured **globally by the backend** while the overlay is visible and **forwarded** to it, then unregistered when it closes. Both pieces only do anything on a real Windows machine and can't be validated on the Linux/WSL build host, so they are best built and verified in a Windows session. v1 therefore ships the **manual copy/paste** hand-off (§8.6); the backend command surface for the hotkey path (`paste_section`, global-shortcut registration) is built but dormant, so adding the overlay later is additive rather than a rework.
