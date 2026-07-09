@@ -74,6 +74,14 @@ export interface SetupStatus {
   ready: boolean;
 }
 
+/** Compiled-in beta trial verdict (implementation.md §1). `trial::TrialStatus`. */
+export interface TrialStatus {
+  /** True once the trial end date has passed — the app blocks with an expired screen. */
+  expired: boolean;
+  /** Last usable day, `YYYY-MM-DD`, for the expired screen to display. */
+  end_date: string;
+}
+
 /** Progress for an in-flight optional-model download (D1). `total === 0` ⇒ unknown size. */
 export interface ModelDownloadProgressEvent {
   tier: string;

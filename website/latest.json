@@ -1,0 +1,11 @@
+{
+  "version": "0.1.0",
+  "notes": "ASmart Medical Scribe 0.1.0.",
+  "pub_date": "2026-07-09T16:45:36.629Z",
+  "platforms": {
+    "windows-x86_64": {
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTRG1QSlpHbnNNNGNWRVJIUm1pWGxJY3FSdkFCWDNOcGcvTHFWam1SQjNTTlVCYUdGWkxJL05vTmJBbDZoTStVeXoyVStHc0tjZWgzZWJESGd5aXlvUHBEc0xHbDFsS0EwPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNjE1NTM2CWZpbGU6QVNtYXJ0IE1lZGljYWwgU2NyaWJlXzAuMS4wX3g2NC1zZXR1cC5leGUKNnJnRVVodUhtVHQvNzZDZm9UaDNMQ3AyMDl0Y1NCUThiL3Vqd3diVDVNckJVZG5WdjRUT0JvbmZQZEgxK2g1dlNXeDdITU1ldUM3MDY0Qkg1c0hyQ1E9PQo=",
+      "url": "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/asmart-medical-scribe-0.1.0-x64-setup.exe"
+    }
+  }
+}

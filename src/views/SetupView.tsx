@@ -2,6 +2,7 @@ import { useEffect, useRef, useState } from "react";
 import {
   downloadModel,
   downloadStt,
+  markSetupCompleted,
   onModelDownloadDone,
   onModelDownloadError,
   onModelDownloadProgress,
@@ -87,7 +88,12 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
         setupStatus()
           .then((s) => {
             setStatus(s);
-            if (s.ready) onReady();
+            if (s.ready) {
+              // Reached here only via a completed download → a genuine first-run
+              // setup finish (§3 telemetry). Best-effort; never block the UI.
+              void markSetupCompleted().catch(() => {});
+              onReady();
+            }
           })
           .catch(() => {});
       }),
@@ -112,7 +118,7 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
   return (
     <div className="flex h-screen flex-col items-center justify-center bg-neutral-950 p-8 text-neutral-100">
       <div className="w-full max-w-md">
-        <h1 className="text-lg font-semibold">Setting up Medical Scribe</h1>
+        <h1 className="text-lg font-semibold">Setting up ASmart Medical Scribe</h1>
         <p className="mt-2 text-sm text-neutral-400">
           Downloading the on-device models. This happens once — everything runs
           offline afterwards.

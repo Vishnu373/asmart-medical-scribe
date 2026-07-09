@@ -1,4 +1,4 @@
-# Medical Scribe
+# ASmart Medical Scribe
 
 > On-device medical scribe for Windows — records a doctor–patient consult, transcribes it locally, and generates a SOAP note. **Nothing leaves the machine.**
 
@@ -13,7 +13,6 @@ Built with **Tauri 2** (Rust backend + React / TypeScript frontend), fully offli
 | **Storage** | SQLCipher (encrypted) + Windows DPAPI-wrapped key |
 
 - 📐 Architecture → [`design.md`](./design.md) 
-- 🛠️ Build plan & progress → [`implementation.md`](./implementation.md)
 
 ---
 
@@ -47,8 +46,8 @@ Install these first — the native build won't compile without them.
 
 ```bash
 # 1. Clone
-git clone https://github.com/Vishnu373/medical-scribe.git
-cd medical-scribe
+git clone https://github.com/Vishnu373/asmart-medical-scribe.git
+cd asmart-medical-scribe
 
 # 2. Install frontend dependencies
 bun install
@@ -164,3 +163,20 @@ bun run test
 </details>
 
 ---
+
+## Uploading models
+// to do section
+
+1. Download the models to locally via command prompt or any terminal
+For command prompt:
+curl -L -o phi-q4.gguf  "hugging_face_url"
+
+2. Hashing them via sha256 (need more info on this)
+certutil -hashfile model_file_name SHA256
+
+- Get the hashcode and paste it in each model section in the following file:
+src-tauri\src\models\mod.rs
+
+3. Run the script
+
+4. 

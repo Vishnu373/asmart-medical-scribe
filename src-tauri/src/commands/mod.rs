@@ -22,7 +22,10 @@ pub fn ping(message: String) -> String {
 /// IDLE → RECORDING (design §9.4). Rejected unless currently IDLE.
 #[tauri::command]
 pub fn start_recording(coordinator: State<'_, Arc<Coordinator>>) -> Result<(), String> {
-    coordinator.start_recording()
+    crate::trial::ensure_active()?;
+    coordinator.start_recording()?;
+    crate::telemetry::track_event("session_started", serde_json::json!({}));
+    Ok(())
 }
 
 /// RECORDING → PROCESSING → IDLE: stop capture, drain the queue, return to IDLE.
@@ -30,7 +33,12 @@ pub fn start_recording(coordinator: State<'_, Arc<Coordinator>>) -> Result<(), S
 /// UI can load it for editing and note generation (design §6.6).
 #[tauri::command]
 pub fn stop_recording(coordinator: State<'_, Arc<Coordinator>>) -> Result<Option<String>, String> {
-    coordinator.stop_recording()
+    let saved = coordinator.stop_recording()?;
+    crate::telemetry::track_event(
+        "session_completed",
+        serde_json::json!({ "saved": saved.is_some() }),
+    );
+    Ok(saved)
 }
 
 /// Pause capture within a recording (stays RECORDING; design §6.6/§9.4).
@@ -99,6 +107,7 @@ pub async fn generate_note(
     store: State<'_, SharedStore>,
     record_id: String,
 ) -> Result<Option<String>, String> {
+    crate::trial::ensure_active()?;
     let transcript = load_transcript(&store, &record_id)?;
     let coordinator = coordinator.inner().clone();
     tauri::async_runtime::spawn_blocking(move || coordinator.generate_note(&record_id, &transcript))
@@ -115,6 +124,7 @@ pub async fn regenerate_note(
     store: State<'_, SharedStore>,
     record_id: String,
 ) -> Result<Option<String>, String> {
+    crate::trial::ensure_active()?;
     let transcript = load_transcript(&store, &record_id)?;
     let coordinator = coordinator.inner().clone();
     tauri::async_runtime::spawn_blocking(move || coordinator.generate_note(&record_id, &transcript))
@@ -134,6 +144,7 @@ pub async fn suggest_corrections(
     store: State<'_, SharedStore>,
     record_id: String,
 ) -> Result<(), String> {
+    crate::trial::ensure_active()?;
     let transcript = load_transcript(&store, &record_id)?;
     let coordinator = coordinator.inner().clone();
     tauri::async_runtime::spawn_blocking(move || coordinator.suggest_corrections(&transcript))
@@ -229,6 +240,40 @@ pub fn list_input_devices() -> Result<Vec<InputDevice>, String> {
                 .collect()
         })
         .map_err(|e| e.to_string())
+}
+
+/// Submit doctor-typed feedback ("report a problem") through the telemetry seam
+/// (§10.3) — the "broke but didn't crash" channel that lands alongside crashes.
+/// Routes to the same backend when built with `crash-reporting` + a DSN; a local
+/// log otherwise. The body is free text and NOT scrubbable, so the UI warns the
+/// clinician against including patient information.
+#[tauri::command]
+pub fn submit_feedback(message: String) -> Result<(), String> {
+    let message = message.trim();
+    if message.is_empty() {
+        return Err("feedback message is empty".to_string());
+    }
+    crate::telemetry::report_feedback(message);
+    Ok(())
+}
+
+/// Mark first-run setup as complete (implementation.md §3) — a deliberate,
+/// PHI-free product event fired once, when the final required model download lands
+/// and the app becomes usable. The frontend calls this from the setup screen's
+/// completion transition, which only runs on a genuine first run (a later launch
+/// finds the models present and skips setup entirely).
+#[tauri::command]
+pub fn mark_setup_completed() {
+    crate::telemetry::track_event("setup_completed", serde_json::json!({}));
+}
+
+/// Report the compiled-in beta trial verdict (implementation.md §1). The frontend
+/// calls this on startup and, once `expired`, shows the expired screen instead of
+/// the app. Pure/local — the date is baked into the binary and compared to the
+/// system clock (see `crate::trial`).
+#[tauri::command]
+pub fn trial_status() -> crate::trial::TrialStatus {
+    crate::trial::status()
 }
 
 /// Load a record's transcript for generation, rejecting a missing record or an

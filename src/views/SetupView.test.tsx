@@ -60,5 +60,8 @@ describe("SetupView", () => {
     // Nothing is downloaded when both models are already on disk.
     expect(mockInvoke).not.toHaveBeenCalledWith("download_model", expect.anything());
     expect(mockInvoke).not.toHaveBeenCalledWith("download_stt");
+    // `setup_completed` marks a genuine first-run finish (§3 telemetry) — it must
+    // NOT fire when models are already present (a later, ordinary launch).
+    expect(mockInvoke).not.toHaveBeenCalledWith("mark_setup_completed");
   });
 });

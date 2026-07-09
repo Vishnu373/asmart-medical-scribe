@@ -1,4 +1,4 @@
-# Medical Scribe — System Design
+# ASmart Medical Scribe — System Design
 
 > An on-device application that records doctor–patient conversations, transcribes them locally, and generates structured SOAP-R clinical notes — with no patient data ever leaving the clinician's Windows device.
 
@@ -141,7 +141,7 @@ flowchart TB
     Patient([🧑 Patient])
 
     subgraph Device["🔒 Clinician's Windows 11 Device (privacy boundary)"]
-        App[Medical Scribe App<br/>capture · transcribe · generate · store]
+        App[ASmart Medical Scribe App<br/>capture · transcribe · generate · store]
         Store[(Encrypted local store<br/>transcripts + notes)]
         App --- Store
     end
@@ -958,6 +958,16 @@ The clinic/clinician is the **custodian** of the health information; the app is 
 - **Rationale:** The transcript editor is a plain `<textarea>`. A textarea cannot host overlay elements at arbitrary character offsets — Option 1 would require replacing it with a mirror-overlay or `contentEditable` surface and tracking each suggestion's character offset as the clinician edits the text underneath it (the offsets shift on every insertion/deletion, and a stale offset anchors the popup to the wrong span). That offset-bookkeeping is exactly the fragility flagged as the phase's open risk. The review list carries **no offsets**: a suggestion is `{original, replacement}`, and Accept simply replaces the first occurrence of `original` in the current transcript — correct regardless of intervening edits, and if the span is gone the suggestion is silently dropped. Both options are equally *suggest-only* and non-blocking (the safety property is unchanged); the list trades literal spatial adjacency for robustness and a far smaller, testable implementation. The streamed, parse-as-you-go delivery (§6.7) is identical either way — only the anchoring differs.
 - **Revisit if:** clinicians find the list hard to correlate with the phrase in a long transcript — then add lightweight highlighting (scroll-to / transient mark on hover) or move to a rich-text editor where true inline anchoring, with proper offset-mapping, becomes affordable.
 
+### Beta trial gate: compiled-in expiry vs a server-enforced license
+
+- **Decision:** How to enforce a fixed end date on the time-limited beta, after which the app stops working.
+- **Options:**
+  1. **Compiled-in expiry** — bake the trial end date into the binary as a constant; on launch, compare the system clock to it and block the app once past it. No account, no network.
+  2. **Server-enforced license** — put signup/login (e.g. Supabase Auth) in front of the app, mint a per-user ID, and check the trial server-side, caching a session for offline grace.
+- **Chosen:** Option 1 (compiled-in expiry).
+- **Rationale:** The beta is a handful of **trusted** clinicians for roughly a month, so the threat model is "make the honest stop honest," not "defeat a determined attacker." Option 1 needs no backend, no login screen, and — critically — keeps the app **fully offline**, preserving the core no-PHI-egress / no-network posture (NFR-6); Option 2 would force at least one online authentication, turning the app network-dependent for a purely administrative gate. The date is evaluated in Rust and enforced in **two** places so the UI isn't the only guard: the frontend shows an expired screen before anything renders, and the work-initiating backend commands (`start_recording`, note generation, correction) reject once expired, so driving the IPC bridge directly is also blocked. The accepted weakness is **local-clock rollback** — a user could set their PC date back — which is unfixable without the very server Option 1 avoids; acceptable for trusted testers and consistent with the deferred code-signing risk posture.
+- **Revisit if:** the app moves beyond a trusted beta to a paid or wider release where clock-rollback or license-sharing actually matters — then a server-enforced license (Option 2), naturally paired with the account system that a commercial launch needs anyway, becomes worth its cost.
+
 ## 12. Pricing
 
 The economics are a direct consequence of the on-device design: there is **no marginal cost per encounter**. Everything runs locally on the clinician's existing laptop using open-source models that are free for commercial use (NFR-15) — no cloud API fees, no cloud compute, no cloud storage, no per-seat usage metering.
@@ -995,6 +1005,8 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 | **Fine-tuned models** | Note model fine-tuned on SOAP datasets for more consistent output | Few-shot prompting (§8.3) is a cheaper, reversible lever; no evidence yet that fine-tuning is needed |
 | **AI engineering for larger context** | Context-handling techniques (e.g. chunking, summarization, retrieval) for transcripts that exceed the model window | The model window far exceeds a realistic consult (§8.3), so the whole transcript fits in one prompt today; needed only for much longer inputs |
 | **Selectable alternate STT engine** | A user-selectable higher-accuracy / weaker-hardware STT option (e.g. a Whisper-family model) alongside the default Parakeet engine | A native-build constraint, not a product objection — see the note below. Parakeet (§6.4) covers EN+FR well, so a second engine is a refinement, not a v1 need |
+
+The r2.dev base URL should later swap to a custom domain (production polish, tied to #10).
 
 **Why the alternate STT engine is deferred (technical note).** The default STT engine (Parakeet) runs on an **ONNX** runtime, while the note-generation LLM (§8) runs on **llama.cpp**. A Whisper-family STT engine would run on **whisper.cpp**. Both whisper.cpp and llama.cpp statically embed their *own* copy of the same low-level tensor library (**ggml**); linking both into one executable produces duplicate-symbol link errors, so they cannot coexist in a single binary. v1 therefore ships exactly one ggml consumer — the LLM — and an ONNX-based STT (Parakeet) that carries no ggml, which links cleanly.
 

@@ -69,7 +69,10 @@ fn is_phi_key(key: &str) -> bool {
 /// event is scrubbed before send.
 #[cfg(feature = "crash-reporting")]
 pub fn init() {
-    let dsn = std::env::var("MEDSCRIBE_CRASH_DSN").unwrap_or_default();
+    // Baked in at compile time (`option_env!`), not read at runtime: the tester's
+    // machine has no `MEDSCRIBE_CRASH_DSN` set, so the DSN must be embedded during
+    // the build. A DSN is a send-only client ingest key, safe to ship in the binary.
+    let dsn = option_env!("MEDSCRIBE_CRASH_DSN").unwrap_or_default();
     if dsn.is_empty() {
         return;
     }
@@ -110,6 +113,61 @@ pub fn init() {
 /// Offline default: crash reporting compiled out (NFR-6 — no network egress).
 #[cfg(not(feature = "crash-reporting"))]
 pub fn init() {}
+
+/// Submit a doctor-typed "report a problem" message through the same seam as
+/// crashes (§10.3): an info-level event with only [`TechnicalContext`] attached,
+/// run through the same `before_send` scrub backstop in [`init`]. Sent only when
+/// built with `crash-reporting` *and* a DSN is set (else `capture_message` has no
+/// client and no-ops). CAVEAT: the body is free text the clinician typed, so it
+/// can't be scrubbed for PHI — the UI warns against including patient info.
+#[cfg(feature = "crash-reporting")]
+pub fn report_feedback(message: &str) {
+    let ctx = TechnicalContext::current();
+    sentry::with_scope(
+        |scope| {
+            scope.set_extra("app_version", ctx.app_version.into());
+            scope.set_extra("os", ctx.os.into());
+            scope.set_extra("arch", ctx.arch.into());
+        },
+        || {
+            sentry::capture_message(message, sentry::Level::Info);
+        },
+    );
+}
+
+/// Offline default: feedback isn't sent anywhere, just logged locally (NFR-6).
+#[cfg(not(feature = "crash-reporting"))]
+pub fn report_feedback(message: &str) {
+    log::info!("feedback (crash reporting disabled, not sent): {message}");
+}
+
+/// Record a deliberate, PHI-free product event (implementation.md §3) through the
+/// same seam as crashes: an info-level message named `name` with [`TechnicalContext`]
+/// plus the caller's `props`, run through the same `before_send` scrub backstop as
+/// every other event. Sent only when built with `crash-reporting` *and* a DSN is set
+/// (else `capture_message` has no client and no-ops). Call sites must pass only
+/// technical values (tier, counts, booleans) — never a transcript, note, or label.
+#[cfg(feature = "crash-reporting")]
+pub fn track_event(name: &str, props: Value) {
+    let ctx = TechnicalContext::current();
+    sentry::with_scope(
+        |scope| {
+            scope.set_extra("app_version", ctx.app_version.into());
+            scope.set_extra("os", ctx.os.into());
+            scope.set_extra("arch", ctx.arch.into());
+            scope.set_extra("props", props);
+        },
+        || {
+            sentry::capture_message(name, sentry::Level::Info);
+        },
+    );
+}
+
+/// Offline default: events aren't sent anywhere, just logged locally (NFR-6).
+#[cfg(not(feature = "crash-reporting"))]
+pub fn track_event(name: &str, props: Value) {
+    log::info!("event {name}: {props}");
+}
 
 #[cfg(test)]
 mod tests {

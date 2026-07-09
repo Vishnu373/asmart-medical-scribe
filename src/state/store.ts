@@ -6,6 +6,7 @@
  */
 
 import { create } from "zustand";
+import type { Update } from "@tauri-apps/plugin-updater";
 import type {
   AppState,
   CorrectionSuggestion,
@@ -100,6 +101,30 @@ export interface Toast {
   count: number;
 }
 
+/**
+ * App-update state machine (separate binary-only channel; no PHI). A passive
+ * background `check()` flips `stage` to `available`; the doctor drives the rest
+ * via a single morphing button — download runs in the background, and install
+ * (which relaunches) happens ONLY on an explicit click.
+ */
+export type UpdateStage =
+  | "idle" // no update, or still checking
+  | "available" // an update was found, not yet downloaded
+  | "downloading" // download in progress (background)
+  | "ready" // downloaded, awaiting the user's Install click
+  | "installing"; // install + relaunch underway
+
+interface UpdateSlice {
+  /** The pending update handle from `check()`, or `null` when up to date. */
+  update: Update | null;
+  updateStage: UpdateStage;
+  /** Download progress 0–100 (0 while indeterminate). */
+  updateProgress: number;
+  setUpdate: (update: Update | null) => void;
+  setUpdateStage: (stage: UpdateStage) => void;
+  setUpdateProgress: (progress: number) => void;
+}
+
 interface ToastSlice {
   /** Transient notifications; `error` events (§9.5) and failed commands surface here. */
   toasts: Toast[];
@@ -114,6 +139,7 @@ export type AppStore = UiSlice &
   NotesSlice &
   RecordsSlice &
   SettingsSlice &
+  UpdateSlice &
   ToastSlice;
 
 export const useAppStore = create<AppStore>((set) => ({
@@ -167,6 +193,14 @@ export const useAppStore = create<AppStore>((set) => ({
   // Settings
   settings: null,
   setSettings: (settings) => set({ settings }),
+
+  // App update
+  update: null,
+  updateStage: "idle",
+  updateProgress: 0,
+  setUpdate: (update) => set({ update }),
+  setUpdateStage: (updateStage) => set({ updateStage }),
+  setUpdateProgress: (updateProgress) => set({ updateProgress }),
 
   // Toasts
   toasts: [],

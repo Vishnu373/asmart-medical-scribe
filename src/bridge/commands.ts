@@ -15,6 +15,7 @@ import type {
   Settings,
   SetupStatus,
   SoapSection,
+  TrialStatus,
 } from "@/bridge/types";
 
 /** Round-trips a message through the backend to verify the bridge is wired. */
@@ -150,4 +151,29 @@ export function copyToClipboard(text: string): Promise<void> {
 
 export function pasteSection(recordId: string, section: SoapSection): Promise<void> {
   return invoke("paste_section", { recordId, section });
+}
+
+// — Feedback (§10.3). Doctor-typed "report a problem" text, routed through the
+// telemetry seam to the same backend as crashes. Free text is NOT scrubbable, so
+// the form warns against including patient information.
+
+/** Submit a free-text problem report; rejects on an empty message. */
+export function submitFeedback(message: string): Promise<void> {
+  return invoke("submit_feedback", { message });
+}
+
+/**
+ * Mark first-run setup as complete (§3 telemetry). Fired once, from the setup
+ * screen's completion transition — a PHI-free product event, best-effort.
+ */
+export function markSetupCompleted(): Promise<void> {
+  return invoke("mark_setup_completed");
+}
+
+// — Trial gate (implementation.md §1). Compiled-in beta expiry; the app blocks once
+// past the end date. Checked on startup before anything else renders.
+
+/** The beta trial verdict — whether the compiled-in end date has passed. */
+export function trialStatus(): Promise<TrialStatus> {
+  return invoke<TrialStatus>("trial_status");
 }

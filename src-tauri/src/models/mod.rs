@@ -49,23 +49,18 @@ pub struct OptionalModel {
 pub static OPTIONAL: &[OptionalModel] = &[
     OptionalModel {
         tier: "best",
-        url: "https://huggingface.co/bartowski/Mistral-7B-Instruct-v0.3-GGUF/resolve/main/Mistral-7B-Instruct-v0.3-Q4_K_M.gguf?download=true",
-        // TODO(D1): pin the SHA-256 of the released file (see the "okay" note below).
-        sha256: None,
+        url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/mistral.gguf",
+        sha256: Some("1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6"),
     },
     OptionalModel {
         tier: "medium",
-        url: "https://huggingface.co/worthdoing/Phi-3.5-mini-instruct-GGUF/resolve/main/phi-3.5-mini-instruct-Q8_0-worthdoing.gguf?download=true",
-        // TODO(D1): pin the SHA-256 of the released file (see the "okay" note below).
-        sha256: None,
+        url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/phi-q8.gguf",
+        sha256: Some("25a8bac561ce82344e2fe2e875e3633f81a162d3daee16f2ca51d559ae69669b"),
     },
     OptionalModel {
         tier: "okay",
-        url: "https://huggingface.co/worthdoing/Phi-3.5-mini-instruct-GGUF/resolve/main/phi-3.5-mini-instruct-Q4_K_M-worthdoing.gguf?download=true",
-        // TODO(D1): pin the SHA-256 of the released file so a corrupted/partial or
-        // swapped download is rejected. Left `None` until the checksum is captured;
-        // until then integrity rests on HTTPS + the size check only.
-        sha256: None,
+        url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/phi-q4.gguf",
+        sha256: Some("a58b37b8c631501c0f8a5ba711579c3c067c6d4c51ea5215c05190289b067f0a"),
     },
 ];
 
@@ -94,7 +89,7 @@ pub struct SttDownload {
 /// tier so the frontend can key its progress map by it.
 pub static STT: SttDownload = SttDownload {
     tier: "stt",
-    url: "https://blob.handy.computer/parakeet-v3-int8.tar.gz",
+    url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/parakeet.tar.gz",
     sha256: Some("43d37191602727524a7d8c6da0eef11c4ba24320f5b4730f1a2497befc2efa77"),
     dir_name: "parakeet-tdt-0.6b-v3",
 };
@@ -234,9 +229,17 @@ pub fn download_model(app: AppHandle, tier: String) -> Result<(), String> {
         }
         match result {
             Ok(()) => {
+                crate::telemetry::track_event(
+                    "model_download_completed",
+                    serde_json::json!({ "tier": &tier }),
+                );
                 let _ = app.emit("model-download-done", serde_json::json!({ "tier": tier }));
             }
             Err(e) => {
+                crate::telemetry::track_event(
+                    "model_download_failed",
+                    serde_json::json!({ "tier": &tier, "reason": e.to_string() }),
+                );
                 let _ = app.emit(
                     "model-download-error",
                     serde_json::json!({ "tier": tier, "message": e.to_string() }),
@@ -273,9 +276,17 @@ pub fn download_stt(app: AppHandle) -> Result<(), String> {
         }
         match result {
             Ok(()) => {
+                crate::telemetry::track_event(
+                    "model_download_completed",
+                    serde_json::json!({ "tier": &tier }),
+                );
                 let _ = app.emit("model-download-done", serde_json::json!({ "tier": tier }));
             }
             Err(e) => {
+                crate::telemetry::track_event(
+                    "model_download_failed",
+                    serde_json::json!({ "tier": &tier, "reason": e.to_string() }),
+                );
                 let _ = app.emit(
                     "model-download-error",
                     serde_json::json!({ "tier": tier, "message": e.to_string() }),

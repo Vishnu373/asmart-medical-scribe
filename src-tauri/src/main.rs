@@ -2,5 +2,5 @@
 #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
 
 fn main() {
-    medical_scribe_lib::run()
+    asmart_medical_scribe_lib::run()
 }

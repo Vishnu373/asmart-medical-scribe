@@ -1,4 +1,4 @@
-//! Medical Scribe — Tauri 2 backend entry point.
+//! ASmart Medical Scribe — Tauri 2 backend entry point.
 //!
 //! Modules are scaffolded empty in B1 and filled in per the implementation plan:
 //! audio capture/VAD/STT are ported from the reference codebase (B3–B6); storage,
@@ -17,6 +17,7 @@ mod settings;
 mod store;
 mod stt;
 mod telemetry;
+mod trial;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -40,11 +41,14 @@ pub fn run() {
     // Crash reporting (§10.3) is compiled out by default (offline, NFR-6) and a
     // no-op unless the `crash-reporting` feature + a DSN are present.
     telemetry::init();
+    telemetry::track_event("app_launched", serde_json::json!({}));
 
     tauri::Builder::default()
         .plugin(tauri_plugin_log::Builder::new().build())
         .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
+        .plugin(tauri_plugin_process::init())
         .setup(|app| {
             // The STT model is long-lived (warm across recordings); the per-
             // recording capture/segment/worker threads are spun up by the
@@ -174,6 +178,9 @@ pub fn run() {
             commands::get_settings,
             commands::update_settings,
             commands::list_input_devices,
+            commands::submit_feedback,
+            commands::mark_setup_completed,
+            commands::trial_status,
             models::model_status,
             models::download_model,
             models::setup_status,

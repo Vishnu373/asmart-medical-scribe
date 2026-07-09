@@ -1,17 +1,22 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
 import { render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
+import { invoke } from "@tauri-apps/api/core";
 import App from "@/App";
 import { useAppStore } from "@/state";
 
 // Bridge calls go through `invoke`. The mock is command-aware because mounting a
 // view (e.g. Settings) fires its own loads — `list_input_devices` must return an
 // array (the real backend always does), or `devices.map` throws during render.
-vi.mock("@tauri-apps/api/core", () => ({
-  invoke: vi.fn((cmd: string) => {
+// `respond` is hoisted so individual tests can override one command (e.g. an
+// expired trial) while reusing these defaults.
+const { respond } = vi.hoisted(() => ({
+  respond: (cmd: string): Promise<unknown> => {
     switch (cmd) {
       case "ping":
         return Promise.resolve("pong: ready");
+      case "trial_status":
+        return Promise.resolve({ expired: false, end_date: "2026-07-31" });
       case "list_input_devices":
         return Promise.resolve([]);
       case "model_status":
@@ -38,17 +43,21 @@ vi.mock("@tauri-apps/api/core", () => ({
       default:
         return Promise.resolve(null);
     }
-  }),
+  },
 }));
+vi.mock("@tauri-apps/api/core", () => ({ invoke: vi.fn((cmd: string) => respond(cmd)) }));
 vi.mock("@tauri-apps/api/event", () => ({ listen: vi.fn().mockResolvedValue(() => {}) }));
 
-beforeEach(() => useAppStore.setState({ view: "recording" }));
+beforeEach(() => {
+  useAppStore.setState({ view: "recording" });
+  vi.mocked(invoke).mockImplementation((cmd) => respond(cmd) as Promise<never>);
+});
 
 describe("App shell", () => {
   it("renders the header and primary nav", async () => {
     render(<App />);
     // Setup gate (D3) resolves ready → the shell mounts after the status check.
-    expect(await screen.findByRole("heading", { name: "Medical Scribe" })).toBeInTheDocument();
+    expect(await screen.findByRole("heading", { name: "ASmart Medical Scribe" })).toBeInTheDocument();
     expect(screen.getByRole("navigation", { name: "Primary" })).toBeInTheDocument();
     expect(screen.getByRole("button", { name: "Recording" })).toBeInTheDocument();
   });
@@ -63,5 +72,19 @@ describe("App shell", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     expect(screen.getByRole("region", { name: "Settings" })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
+  });
+
+  it("hard-stops on the expired screen once the trial has ended (§1)", async () => {
+    vi.mocked(invoke).mockImplementation((cmd) =>
+      (cmd === "trial_status"
+        ? Promise.resolve({ expired: true, end_date: "2026-07-31" })
+        : respond(cmd)) as Promise<never>,
+    );
+    render(<App />);
+    expect(
+      await screen.findByRole("heading", { name: "This beta has ended" }),
+    ).toBeInTheDocument();
+    // The app is blocked — no nav, no recording view.
+    expect(screen.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
   });
 });

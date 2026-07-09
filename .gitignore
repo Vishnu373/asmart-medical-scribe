@@ -8,6 +8,9 @@ dist/
 src-tauri/target/
 src-tauri/gen/
 
+# private key
+~/
+
 # Model weights (downloaded / vendored separately, never committed)
 src-tauri/resources/models/*
 !src-tauri/resources/models/.gitkeep
