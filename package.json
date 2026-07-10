@@ -10,6 +10,7 @@
     "tauri": "tauri",
     "release": "tauri build -- --features crash-reporting",
     "upload_installer": "bun scripts/upload_installer_r2.mjs",
+    "upload_models": "bun scripts/upload_models_r2.mjs",
     "test": "vitest run",
     "test:watch": "vitest",
     "lint": "eslint src",
