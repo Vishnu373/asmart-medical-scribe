@@ -5,7 +5,9 @@
   "platforms": {
     "windows-x86_64": {
       "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTRG1QSlpHbnNNNFcrTDhsM3dmWlZ0Q245bXdhK0FwbVdnc28rQndpTXljZDBEWTBncEJ6VXpHd3dSVnZqdHRqUnhRY0xWV282TDNWTi9uRk1qSmludGFia01SVkY3NHdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNjE3NjU2CWZpbGU6QVNtYXJ0IE1lZGljYWwgU2NyaWJlXzAuMS4wX3g2NC1zZXR1cC5leGUKc3lKaUxTNWNPYURqWE8zY3Rmc3FucUErY3N2NVhnSkhyVFNEamJXNUZ4eEV6Z2lNL21xMHA1cTNhVE5nNVNXZ2l0S04rOTREMks1aXE5cUtXaGdvQlE9PQo=",
-      "url": "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/asmart-medical-scribe-0.1.0-x64-setup.exe"
+      "url": "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/asmart_medical_scribe_0.1.0_x64-setup.exe"
     }
   }
 }
+
+

@@ -26,3 +26,6 @@ src-tauri/resources/models/*
 # Editor / OS
 .DS_Store
 *.log
+
+# Local secrets (R2 upload credentials)
+.env

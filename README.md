@@ -184,3 +184,6 @@ bun run tauri build -- --features crash-reporting
 
 Building the installer files:
 bun run release
+
+Uploading the installer files to R2:
+bun run upload_installer
