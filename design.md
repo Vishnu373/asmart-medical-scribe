@@ -27,7 +27,7 @@
 
 Clinicians lose significant time to documentation — writing up each encounter during or after the visit pulls attention away from the patient and extends the working day. Existing AI scribe products are cloud-based, which raises privacy/compliance concerns under Canadian law (PHIPA/PIPEDA) and locks small clinics into recurring per-seat subscriptions.
 
-This product lets the doctor focus on **one thing — treating the patient** — while the application handles documentation. It is **cost-effective** (no per-seat cloud subscription) and **fully private**: all audio capture, transcription, and note generation run on the clinician's own device.
+This product lets the doctor focus on **one thing — treating the patient** — while the application handles documentation. It is **cost-effective** (one-time payment) and **fully private**: all audio capture, transcription, and note generation run on the clinician's own device.
 
 ### Goals (in scope for v1)
 
@@ -41,7 +41,7 @@ This product lets the doctor focus on **one thing — treating the patient** —
 
 - **No EMR/EHR integration** — the doctor copies the note manually into their chart.
 - **No billing codes, ICD-10-CA codes, orders, or referrals** — deferred to a future phase.
-- **No online/telehealth consults** — v1 captures in-person visits only (loopback/system-audio capture deferred to a future phase).
+- **No online/telehealth consults** — v1 captures in-person visits only.
 
 ### Key assumptions & constraints
 
@@ -105,17 +105,16 @@ All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or l
 
 ### Component overview
 
-The application is a single Windows desktop process composed of swappable building blocks. The **STT path is treated as an existing, already-solved component** (the developer is integrating a known open-source speech-to-text codebase); the design's primary engineering focus is the **note-generation path**.
 
-| Component | Responsibility | Choice / status |
-|-----------|----------------|-----------------|
-| **Audio capture** | Read microphone, buffer PCM, detect speech pauses (VAD) to segment utterances | Part of the existing STT codebase being integrated |
-| **STT engine** | Transcribe each audio segment to text; EN/FR auto-detect | **Parakeet TDT 0.6B v3**, CPU-only via an ONNX runtime; multilingual EN+FR with auto-detect. Single STT engine for v1 (see §6.4) |
-| **Transcript store** | Hold the live, editable transcript; persist per-encounter; preserve manual edits | App-owned; encrypted local store (see Data Model) |
-| **Note generator (LLM)** | Turn the approved transcript into a structured SOAP note (EN/FR), on click | **Open source models - mistral 7b, phi 3.5 Q_8, Q_4, via `llama.cpp`.|
-| **Prompt/template layer** | SOAP-R system prompt, section schema, language handling, anti-fabrication guardrails | App-owned; the main thing this project must build well |
-| **Local store** | Encrypted persistence of transcripts + notes; saved-encounter list | App-owned (see Data Model) |
-| **UI shell** | Record controls, live transcript, note view/edit, export/print, saved list | Desktop framework **TBD** alongside the STT codebase decision |
+| Component | Responsibility | 
+|-----------|----------------|
+| **Audio capture** | Read microphone, buffer PCM, detect speech pauses (VAD) to segment utterances
+| **STT engine** | Transcribe each audio segment to text; EN/FR auto-detect
+| **Transcript store** | Hold the live, editable transcript; persist per-encounter; preserve manual edits
+| **Note generator (LLM)** | Turn the approved transcript into a structured SOAP note (EN/FR), on click
+| **Prompt/template layer** | SOAP-R system prompt, section schema, language handling, anti-fabrication guardrails
+| **Local store** | Encrypted persistence of transcripts + notes; saved-encounter list
+| **UI shell** | Record controls, live transcript, note view/edit, export/print, saved list
 
 ### Model selection — note generator (the focus of v1)
 
@@ -123,13 +122,11 @@ The application is a single Windows desktop process composed of swappable buildi
 - **Default model:** **Mistral-7B-Instruct v0.3** — Apache-2.0, heavy, best note generation.
 - **Alternate model 1:** **Phi3.5 Q_8** — MIT, lighter, decent note generation.
 - **Alternate model 2:** **Phi3.5 Q_4** — MIT, lightest, okayish note generation.
-- **Swappable interface:** the note generator sits behind an internal `generate_note(transcript, language) -> SOAP` interface so the model can be upgraded or A/B-tested without touching the rest of the app (NFR-14).
+- **Swappable interface:** the note generator sits behind an internal `generate_note(transcript, language) -> SOAP-R` interface so the model can be upgraded or A/B-tested without touching the rest of the app (NFR-14).
 
 ---
 
 ## 5. Diagrams
-
-Diagrams are split by concern. The recurring theme: **the device boundary is the privacy boundary** — no PHI crosses it.
 
 ### 5.1 System context
 
@@ -411,8 +408,8 @@ This stage answers: **what ties Pieces 6.1–6.5 together into a single, well-be
 ```
         Start                Stop
  IDLE ─────────► RECORDING ─────────► PROCESSING ─────► IDLE
-  ▲   (spin up)             (drain & finalize)    │
-  └──────────────────────────────────────────────┘
+  ▲   (spin up)             (drain & finalize)            │
+  └───────────────────────────────────────────────────────┘
 ```
 
 - **IDLE** — app open, the STT model preloaded/warm in the background (§6.4), no capture running.
@@ -469,7 +466,7 @@ It runs **before**, not concurrently with, note generation. The two never execut
 
 **Streamed, parse-as-you-go.** The model emits suggestions as a stream of small, independently-parseable units (one structured record per line), each naming an **original span** and its **replacement**. The UI shows each suggestion the instant its record completes, rather than waiting for the whole pass — so the first corrections appear early and perceived latency drops. Constraining the output to *replacements of spans that exist in the transcript* (not free-form text) is what keeps a "suggestion" from becoming an invention.
 
-**Non-blocking presentation — a review list beside the transcript.** Suggestions appear as a **list next to the transcript**, each row showing the flagged phrase and its proposed replacement with Accept / Reject in place, without obscuring the transcript. Accepting replaces that span in the editor and rides the existing debounced autosave (§6.5); rejecting dismisses it. The clinician can also ignore the whole pass — a **Cancel** path (reusing the generation cancel mechanism) lets them skip straight to editing and Generate. (An earlier design anchored each suggestion as an inline popup at its phrase; because the transcript is a plain text area with no way to anchor overlays at character offsets that survive concurrent edits, the equivalent-safety review list was chosen instead — see the §11 trade-off.)
+**Non-blocking presentation — a review list beside the transcript.** Suggestions appear as a **list next to the transcript**, each row showing the flagged phrase and its proposed replacement with Accept / Reject in place, without obscuring the transcript. Accepting replaces that span in the editor and rides the existing debounced autosave (§6.5); rejecting dismisses it. The clinician can also ignore the whole pass — a **Cancel** path (reusing the generation cancel mechanism) lets them skip straight to editing and Generate.
 
 **Behavioral rules.**
 

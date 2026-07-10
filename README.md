@@ -179,4 +179,8 @@ src-tauri\src\models\mod.rs
 
 3. Run the script
 
-4. 
+Telemtry setup command:
+bun run tauri build -- --features crash-reporting
+
+Building the installer files:
+bun run release
