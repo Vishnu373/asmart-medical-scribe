@@ -28,8 +28,7 @@
     "targets": "all",
     "resources": {
       "models/**/*": "models/",
-      "libs/*": "./",
-      "redist/*": "redist/"
+      "libs/*": "./"
     },
     "icon": [
       "icons/32x32.png",
