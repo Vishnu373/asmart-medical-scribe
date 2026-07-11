@@ -1,11 +1,11 @@
 {
-  "version": "0.1.0",
-  "notes": "ASmart Medical Scribe 0.1.0.",
-  "pub_date": "2026-07-09T17:20:56.995Z",
+  "version": "0.1.1",
+  "notes": "ASmart Medical Scribe 0.1.1.",
+  "pub_date": "2026-07-10T21:40:08.000Z",
   "platforms": {
     "windows-x86_64": {
-      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTRG1QSlpHbnNNNFcrTDhsM3dmWlZ0Q245bXdhK0FwbVdnc28rQndpTXljZDBEWTBncEJ6VXpHd3dSVnZqdHRqUnhRY0xWV282TDNWTi9uRk1qSmludGFia01SVkY3NHdjPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNjE3NjU2CWZpbGU6QVNtYXJ0IE1lZGljYWwgU2NyaWJlXzAuMS4wX3g2NC1zZXR1cC5leGUKc3lKaUxTNWNPYURqWE8zY3Rmc3FucUErY3N2NVhnSkhyVFNEamJXNUZ4eEV6Z2lNL21xMHA1cTNhVE5nNVNXZ2l0S04rOTREMks1aXE5cUtXaGdvQlE9PQo=",
-      "url": "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/asmart_medical_scribe_0.1.0_x64-setup.exe"
+      "signature": "dW50cnVzdGVkIGNvbW1lbnQ6IHNpZ25hdHVyZSBmcm9tIHRhdXJpIHNlY3JldCBrZXkKUlVTRG1QSlpHbnNNNGVLQ2Y0d1JlbkF1d1RSSHNLMzhCYmovNjdDVE56MFRtWkdyYmxhMUQzbHkweFF2RW05bFdVclVtb0NqTUY2VEp0dW0wQlpVWGFFcDBZVjVQSlV6M3dNPQp0cnVzdGVkIGNvbW1lbnQ6IHRpbWVzdGFtcDoxNzgzNzM0MDA4CWZpbGU6YXNtYXJ0X21lZGljYWxfc2NyaWJlXzAuMS4xX3g2NC1zZXR1cC5leGUKRGFyR0xlbFIzQnUra0QzMlpFTmpDbkdRM2F5ZDRycWIxWHJ2bEhIUTN1OTVSSXBIdTRqelo4VmhzaDhTbldIa3RtR2dVZVBPcFJ1WXVLRE1aZTQ5Q2c9PQo=",
+      "url": "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/asmart_medical_scribe_0.1.1_x64-setup.exe"
     }
   }
 }

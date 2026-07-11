@@ -1,6 +1,6 @@
 [package]
 name = "asmart-medical-scribe"
-version = "0.1.0"
+version = "0.1.1"
 description = "On-device medical scribe"
 edition = "2021"
 default-run = "asmart-medical-scribe"

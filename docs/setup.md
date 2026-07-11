@@ -167,6 +167,8 @@ bun run tauri build -- --features crash-reporting
 **Build the installer files:**
 
 ```bash
+$env:TAURI_SIGNING_PRIVATE_KEY="<your-key>"
+$env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<your-key-password>"
 bun run release
 ```
 
