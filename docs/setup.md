@@ -178,3 +178,18 @@ bun run release
 bun run upload_installer
 ```
 
+### 4. Local device testing (Windows VM)
+
+Test the installer on a clean virtual machine before shipping.
+
+**Install the hypervisor:**
+
+| Host OS | VMware product | Link |
+|---------|----------------|------|
+| **Windows** | VMware Workstation Pro | [vmware.com/products/desktop-hypervisor](https://www.vmware.com/products/desktop-hypervisor/workstation-and-fusion) |
+| **Mac** | VMware Fusion Pro | [vmware.com/products/desktop-hypervisor](https://www.vmware.com/products/desktop-hypervisor/workstation-and-fusion) |
+
+1. Create an account on the VMware website.
+2. Open the **Downloads** section of the dashboard and click **free software**.
+3. Find the VM and install it.
+4. For the ISO (used during VM setup), download the **Windows 11 English** image — [microsoft.com/software-download/windows11](https://www.microsoft.com/en-ca/software-download/windows11).
