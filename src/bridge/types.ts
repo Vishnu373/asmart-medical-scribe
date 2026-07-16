@@ -35,9 +35,7 @@ export interface Note {
 
 /** Doctor-facing + internal settings (design §9.3). `settings::Settings`. */
 export interface Settings {
-  model_choice: string;
   mic_device: string | null;
-  paste_hotkey: string;
   residency_mode: string | null;
   residency_override: string | null;
   observed_total_ram: number | null;
@@ -55,19 +53,8 @@ export interface InputDevice {
   is_default: boolean;
 }
 
-/** On-disk presence of one model tier (design §8.2, D1). `models::ModelStatus`. */
-export interface ModelStatus {
-  /** The `model_choice` tier: `best` | `medium` | `okay`. */
-  tier: string;
-  present: boolean;
-  /** Whether this tier is an on-demand download (vs bundled). */
-  optional: boolean;
-}
-
 /** Whether the required models are on disk so the app can start (D3 first-run gate). `models::SetupStatus`. */
 export interface SetupStatus {
-  /** The RAM-fit LLM tier this machine needs (`best` | `medium`) — what Setup downloads. */
-  llm_tier: string;
   llm_present: boolean;
   stt_present: boolean;
   /** Both required models present — the app can leave Setup. */

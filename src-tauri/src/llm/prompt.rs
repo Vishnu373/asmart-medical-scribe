@@ -4,9 +4,12 @@
 //!
 //! The prompt is laid out `[system + worked example] → [transcript] → [assistant]`
 //! so the fixed prefix (system + example) can be prompt-cached (§8.2): the same
-//! prefix is reused across every note, and only the transcript changes. One shared
-//! technique for both models — the example teaches the format, so nothing
-//! model-specific is stated; only the instruct-template wrapper differs.
+//! prefix is reused across every note, and only the transcript changes. A single
+//! on-device model (Gemma) with its chat template; the worked example teaches the
+//! format, so nothing model-specific is stated in the instruction itself.
+//
+// TODO(§5): replace the one-shot example below with the supplied few-shot +
+// chain-of-thought prompt, and add the reasoning→note boundary handling.
 
 use super::LlmModel;
 
@@ -91,14 +94,14 @@ pub fn user_message(transcript: &str) -> String {
 pub fn prefix(model: LlmModel) -> String {
     let example_user = user_message(EXAMPLE_TRANSCRIPT);
     match model {
-        LlmModel::Mistral => format!(
-            "<s>[INST] {SOAP_SYSTEM_PROMPT}\n\n{example_user} [/INST] {EXAMPLE_NOTE}</s>[INST] {USER_LEAD_IN}"
-        ),
-        LlmModel::Phi | LlmModel::PhiQ4 => format!(
-            "<|system|>\n{SOAP_SYSTEM_PROMPT}<|end|>\n\
-             <|user|>\n{example_user}<|end|>\n\
-             <|assistant|>\n{EXAMPLE_NOTE}<|end|>\n\
-             <|user|>\n{USER_LEAD_IN}"
+        // Gemma has no system role, so the instruction rides in the first user turn.
+        // The BOS is added by the tokenizer (`AddBos::Always`), so it is not in the
+        // string. The one-shot example is a completed user→model turn pair before the
+        // real transcript's user turn.
+        LlmModel::Gemma => format!(
+            "<start_of_turn>user\n{SOAP_SYSTEM_PROMPT}\n\n{example_user}<end_of_turn>\n\
+             <start_of_turn>model\n{EXAMPLE_NOTE}<end_of_turn>\n\
+             <start_of_turn>user\n{USER_LEAD_IN}"
         ),
     }
 }
@@ -109,17 +112,14 @@ pub fn prefix(model: LlmModel) -> String {
 pub fn transcript_tail(model: LlmModel, transcript: &str) -> String {
     let transcript = transcript.trim();
     match model {
-        LlmModel::Mistral => format!("{transcript} [/INST]"),
-        LlmModel::Phi | LlmModel::PhiQ4 => format!("{transcript}<|end|>\n<|assistant|>\n"),
+        LlmModel::Gemma => format!("{transcript}<end_of_turn>\n<start_of_turn>model\n"),
     }
 }
 
-/// Wrap the system, the one-shot example, and the real transcript in the instruct
-/// template of the selected model family. Split into [`prefix`] (fixed, cacheable
-/// §8.7) + [`transcript_tail`] (changing); this is the concatenation and stays the
-/// single source of the exact prompt for the fallback (uncached) path. The two
-/// models ship different chat formats; using the wrong one degrades adherence to
-/// the SOAP structure, so the template follows the model.
+/// Wrap the system, the one-shot example, and the real transcript in the model's
+/// chat template. Split into [`prefix`] (fixed, cacheable §8.7) + [`transcript_tail`]
+/// (changing); this is the concatenation and stays the single source of the exact
+/// prompt for the fallback (uncached) path.
 pub fn build_prompt(model: LlmModel, transcript: &str) -> String {
     format!("{}{}", prefix(model), transcript_tail(model, transcript))
 }
@@ -179,32 +179,33 @@ mod tests {
     fn prefix_plus_tail_equals_build_prompt() {
         // The KV-cache reuse (§8.7) prefills `prefix` and appends `transcript_tail`;
         // it must reconstruct exactly the fallback prompt or cached and uncached
-        // notes would diverge. Guard the split for every model and a few transcripts.
-        for model in [LlmModel::Mistral, LlmModel::Phi, LlmModel::PhiQ4] {
-            for t in ["", "  cough for two days  ", "chest pain\nradiating to arm"] {
-                assert_eq!(
-                    format!("{}{}", prefix(model), transcript_tail(model, t)),
-                    build_prompt(model, t),
-                    "prefix+tail != build_prompt for {model:?} / {t:?}"
-                );
-            }
+        // notes would diverge. Guard the split for a few transcripts.
+        let model = LlmModel::Gemma;
+        for t in ["", "  cough for two days  ", "chest pain\nradiating to arm"] {
+            assert_eq!(
+                format!("{}{}", prefix(model), transcript_tail(model, t)),
+                build_prompt(model, t),
+                "prefix+tail != build_prompt for {t:?}"
+            );
         }
         // The boundary sits at the user lead-in, so the prefix ends with it and the
         // tail carries no part of it.
-        assert!(prefix(LlmModel::Mistral).ends_with("Consultation transcript:\n\n"));
-        assert!(!transcript_tail(LlmModel::Mistral, "x").contains("Consultation transcript:"));
+        assert!(prefix(model).ends_with("Consultation transcript:\n\n"));
+        assert!(!transcript_tail(model, "x").contains("Consultation transcript:"));
     }
 
     #[test]
-    fn build_prompt_uses_the_right_template_per_model() {
-        let mistral = build_prompt(LlmModel::Mistral, "cough for two days");
-        assert!(mistral.starts_with("<s>[INST]"));
-        assert!(mistral.ends_with("[/INST]"));
-        // The one-shot example is a completed turn before the real transcript.
-        assert!(mistral.contains(EXAMPLE_NOTE));
-        assert!(mistral.contains("right down beforehand"));
-        assert!(mistral.contains("cough for two days"));
-        // All five headers appear (via the example) for both templates.
+    fn build_prompt_uses_the_gemma_template() {
+        let p = build_prompt(LlmModel::Gemma, "cough for two days");
+        assert!(p.starts_with("<start_of_turn>user\n"));
+        // Ends on an open model turn so the model generates the note next.
+        assert!(p.ends_with("<start_of_turn>model\n"));
+        // The one-shot example is a completed model turn before the real transcript.
+        assert!(p.contains(EXAMPLE_NOTE));
+        assert!(p.contains("<end_of_turn>"));
+        assert!(p.contains("right down beforehand"));
+        assert!(p.contains("cough for two days"));
+        // All five headers appear (via the example).
         for header in [
             "## Subjective",
             "## Objective",
@@ -212,24 +213,7 @@ mod tests {
             "## Plan",
             "## Response",
         ] {
-            assert!(mistral.contains(header), "mistral missing {header}");
-        }
-
-        let phi = build_prompt(LlmModel::Phi, "cough for two days");
-        assert!(phi.contains("<|system|>"));
-        assert!(phi.contains("<|user|>"));
-        assert!(phi.contains("<|assistant|>"));
-        assert!(phi.ends_with("<|assistant|>\n"));
-        assert!(phi.contains(EXAMPLE_NOTE));
-        assert!(phi.contains("cough for two days"));
-        for header in [
-            "## Subjective",
-            "## Objective",
-            "## Assessment",
-            "## Plan",
-            "## Response",
-        ] {
-            assert!(phi.contains(header), "phi missing {header}");
+            assert!(p.contains(header), "missing {header}");
         }
     }
 }

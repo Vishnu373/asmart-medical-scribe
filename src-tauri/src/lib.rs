@@ -88,14 +88,19 @@ pub fn run() {
             }
             log::info!("model residency mode: {}", mode.as_str());
 
-            // In-process note-generation model (§8). The doctor's `model_choice`
-            // tier picks the model (best/medium/okay → Mistral/Phi-Q8/Phi-Q4);
-            // when unset/unknown it falls back to the RAM-fit default (§8.2).
-            // Residency mode decides *when* it loads — warmed at startup when
-            // co-resident, loaded per generation when swapping. The model file is
-            // resolved across the download dir then the bundled resource dir (D1),
-            // so an optional tier the doctor pulled shadows the (absent) bundle.
-            let llm_model = LlmModel::from_choice(&app_settings.model_choice, total_ram);
+            // One-time upgrade migration (§4d): drop the retired multi-tier LLM GGUFs
+            // (Mistral/Phi) a pre-§3 install left in the download dir, so an upgraded
+            // device isn't stuck carrying ~7–11 GB of dead weights. Best-effort.
+            if let Err(e) = models::cleanup_retired_weights(app.handle()) {
+                log::warn!("retired-weight cleanup failed (non-fatal): {e}");
+            }
+
+            // In-process note-generation model (§8). One model now — Gemma (§3
+            // single-model refactor). Residency mode decides *when* it loads — warmed
+            // at startup when co-resident, loaded per generation when swapping. The
+            // model file is resolved across the download dir then the bundled resource
+            // dir (D1); the installer bundles no LLM, so it comes from the download dir.
+            let llm_model = LlmModel::Gemma;
             let model_dirs = models::model_dirs(app.handle()).map_err(|e| e.to_string())?;
             let n_threads = std::thread::available_parallelism()
                 .map(|n| n.get() as i32)
@@ -143,9 +148,8 @@ pub fn run() {
                 store.clone(),
                 data_dir,
             );
-            // Shared with the `update_settings` command so a `model_choice` change
-            // retargets the live engine (no restart): the generator and the command
-            // hold the same `Arc<LlmEngine>`.
+            // Managed so the `get_llm_status` command can report load readiness (§8.2
+            // startup fix): it and the generator share the same `Arc<LlmEngine>`.
             app.manage(llm_engine.clone());
             // Correction (§6.7) reuses the same resident engine; it holds its own
             // clone so it and the note generator share one loaded model.
@@ -203,8 +207,7 @@ pub fn run() {
             commands::submit_feedback,
             commands::mark_setup_completed,
             commands::trial_status,
-            models::model_status,
-            models::download_model,
+            models::download_llm,
             models::setup_status,
             models::download_stt,
             handoff::paste_section,

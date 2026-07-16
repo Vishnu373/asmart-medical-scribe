@@ -429,30 +429,29 @@ This section covers **only the one-time mode decision**. Run-time concerns — c
 
 At first run we read the machine's **total physical RAM** (via a system-info probe). Total RAM is a stable, per-device property: it does not change between sessions and it alone determines whether co-residency is *ever* viable on this box. We deliberately do **not** base the mode on momentary *available* RAM, which fluctuates with whatever else the user has open and would make the decision flip-flop.
 
-### The feasibility calculation
+### The decision rule
 
-We compute a combined footprint:
+With a single small note model (§8.2), the mode follows a plain **total-RAM threshold** rather than a per-model footprint sum:
 
 ```
-footprint = STT model size
-          + LLM quantized size                (the single note-generation model, §8.2)
-          + headroom for app + webview + OS   (~2–3 GB)
+co-resident   if total physical RAM ≥ 16 GB
+swap          otherwise (e.g. an 8 GB box)
 ```
 
-The LLM size is still a **parameter** read from the note-generation model rather than a value baked into this strategy. As of v0.1.2 there is one model (§8.2), so this parameter is a single constant instead of a RAM-keyed choice — but the residency logic is unchanged: co-resident vs swap is still decided on total RAM against this footprint. Because the constant changed with the model swap, the cached decision's `residency_calc_version` is bumped so every device re-decides on the new footprint rather than trusting a stale cache.
+Earlier versions summed the STT size, the RAM-keyed LLM size, and an OS headroom allowance, then required a margin above that total. The single ~3.2 GB Gemma model (§8.2) alongside the STT model fits comfortably on any 16 GB machine and needs a swap fallback only on 8 GB boxes, so the footprint arithmetic collapses to this one cutoff — simpler, and no longer dependent on a per-model size estimate. Because the rule changed, the cached decision's `residency_calc_version` is bumped so every device re-decides under the new threshold rather than trusting a stale cache.
 
 ### The two modes
 
 | Mode | Behavior | Cost | When chosen |
 |------|----------|------|-------------|
-| **Co-resident** | Both STT and LLM stay warm in RAM throughout a session | Higher steady-state RAM use | Comfortable margin available |
-| **Swap** | One model resident at a time; the LLM is loaded at the transcription→generation hand-off | A few seconds of model-load latency at hand-off | Tight machine, no safe margin |
+| **Co-resident** | Both STT and LLM stay warm in RAM throughout a session | Higher steady-state RAM use | Total RAM ≥ 16 GB |
+| **Swap** | One model resident at a time; the LLM is loaded at the transcription→generation hand-off | A few seconds of model-load latency at hand-off | Total RAM < 16 GB |
 
 Co-resident gives a zero-latency hand-off from Stop to note generation. Swap trades that latency for a substantially lower peak RAM footprint.
 
-### Margin, not bare fit
+### Threshold, not bare fit
 
-The mode is chosen on **headroom, not technical fit**. We require a real buffer (≈2 GB free above the combined footprint) before selecting co-resident. Bare-fit ("it just barely fits") invites disk paging the moment any transient memory pressure appears, so we treat it as not fitting.
+The 16 GB cutoff is deliberately above a bare technical fit. A device that only *just* fits both models invites disk paging the moment any transient memory pressure appears, so the threshold keeps a real buffer for the app, webview, OS, and the clinician's other applications rather than choosing co-residency on a machine that can barely hold the two models.
 
 ### Decide once, cache it
 
@@ -495,11 +494,11 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 - there is **no `model_choice` setting** and **no model picker** in Settings (§9.3);
 - there are **no on-demand tier downloads** — Setup fetches exactly one LLM;
-- the §7 residency probe still reads total RAM and still decides co-resident vs swap, but it feeds a **single fixed** LLM footprint into that calculation instead of a RAM-keyed one.
+- the §7 residency probe still reads total RAM and still decides co-resident vs swap, but on a **flat 16 GB total-RAM threshold** — it no longer needs a per-model footprint estimate.
 
-| Model | Quant | Approx. resident footprint |
-|-------|-------|----------------------------|
-| `gemma-4-E2B-it-UD-Q4_K_XL` | Q4_K_XL (Unsloth dynamic) | *set at implementation from the shipped GGUF; validate in benchmarking* |
+| Model | Quant | On-disk size |
+|-------|-------|--------------|
+| `gemma-4-E2B-it-UD-Q4_K_XL` | Q4_K_XL (Unsloth dynamic) | 3.18 GB |
 
 **Execution model.** The GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6).
 
@@ -509,7 +508,7 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 - **Integrity-checked.** Each download is verified against a known SHA-256 checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
 - **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function.
 
-**Upgrade migration — delete the retired tier weights.** A device upgrading from a prior version still has the old GGUFs (`Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`, `phi-3.5-mini-instruct-Q8_0-worthdoing.gguf`, `phi-3.5-mini-instruct-Q4_K_M-worthdoing.gguf`) in its app-data models dir — several GB that will never be loaded again. On first launch of v0.1.2 the app **deletes any of these that exist** from the writable models dir (the bundled resource dir is read-only and carries none), reclaiming the disk. The deletion is best-effort and idempotent: a missing file is a no-op, a failed unlink is logged and does not block startup.
+**Upgrade migration — delete the retired tier weights.** A device upgrading from a prior version still has the old GGUFs (`mistral.gguf`, `phi-q8.gguf`, `phi-q4.gguf`) in its app-data models dir — several GB that will never be loaded again. On first launch of v0.1.2 the app **deletes any of these that exist** from the writable models dir (the bundled resource dir is read-only and carries none), reclaiming the disk. The deletion is best-effort and idempotent: a missing file is a no-op, a failed unlink is logged and does not block startup.
 
 **Startup model load is non-blocking (v0.1.2 "not responding" fix).** In co-resident mode the model was previously loaded **synchronously inside the Tauri `setup` hook**, which runs on the main thread before the webview can paint — so a multi-GB GGUF load plus warmup left the window unresponsive ("not responding") for the whole load on every launch. In v0.1.2 the app **finishes starting first**: `setup` returns immediately and the window paints, and the co-resident preload (model load + prefix warmup, §8.6) runs on a **background thread**. The UI reflects load state via an `llm-status` event (`loading` → `ready`, or `error`; §9.5) so a status indicator can read "Preparing note model…" while it loads and enable Generate when ready. Swap mode is unaffected — it already loaded lazily per generation. A concurrent-load guard serializes the background preload against a Generate that arrives before it finishes, so the model is loaded at most once.
 

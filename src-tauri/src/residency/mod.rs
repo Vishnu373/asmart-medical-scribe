@@ -3,8 +3,9 @@
 //! Two sizable CPU models share one machine: the STT model used while recording
 //! and the LLM used after Stop. On a roomy box both stay warm (zero-latency
 //! hand-off); on a tight box keeping both resident risks OS disk paging, so we
-//! load one at a time. This module decides which regime to use from the machine's
-//! **total physical RAM** — a stable per-device property — and caches the result.
+//! load one at a time. With a single small note model (§3), the regime follows a
+//! plain **total physical RAM** threshold — a stable per-device property — rather
+//! than a per-model footprint sum; the result is cached.
 //!
 //! Only the one-time *mode* decision lives here; run-time load/unload is the
 //! lifecycle's job (STT engine idle-watcher, B5; LLM hand-off, B10).
@@ -13,28 +14,18 @@ use crate::settings::Settings;
 
 const GIB: u64 = 1024 * 1024 * 1024;
 
-/// Version of the footprint formula. The cached decision is derived from RAM *and*
-/// these inputs, so bump this whenever a footprint changes — the constants below
-/// *or* [`crate::llm::LlmModel::footprint`] — otherwise a new build with corrected
-/// sizes would trust a stale cache on unchanged hardware and keep the wrong mode (§7).
-const RESIDENCY_CALC_VERSION: u32 = 1;
+/// Version of the residency decision. The cached decision is derived from RAM *and*
+/// this rule, so bump it whenever the rule changes (e.g. the threshold below),
+/// otherwise a new build would trust a stale cache on unchanged hardware and keep
+/// the wrong mode (§7). Bumped 2 → 3 when the footprint-sum calc was replaced by
+/// this flat RAM threshold.
+const RESIDENCY_CALC_VERSION: u32 = 3;
 
-// Footprint inputs (§7 "feasibility calculation"). These are design-target
-// *estimates* to validate during benchmarking (design §3 "numbers are targets"),
-// kept as named constants so the residency logic holds whatever the real sizes
-// turn out to be.
-//
-// STT: the default Parakeet TDT 0.6B engine, resident.
-const STT_FOOTPRINT: u64 = 5 * GIB / 2; // ~2.5 GB
-// The LLM footprint and its RAM-keyed model choice (§8.2) are owned by the `llm`
-// module ([`LlmModel`]) — the single source of truth, so this budget always sizes
-// for exactly the model the engine loads (see `default_llm_footprint` below).
-// Reserve for the app, webview, and OS on top of the two models (§7: ~2–3 GB);
-// take the conservative upper end.
-const HEADROOM: u64 = 3 * GIB;
-// Required free buffer above the combined footprint before we trust co-residency
-// (§7 "margin, not bare fit"): a bare fit invites paging under any pressure.
-const CO_RESIDENT_MARGIN: u64 = 2 * GIB;
+/// Total-RAM cutoff for co-residency (§7). At/above this we keep both the STT and
+/// the single note model warm; below it (e.g. an 8 GB box) we swap one in at the
+/// hand-off. Compared against *total physical* RAM ([`probe_total_ram`]), a stable
+/// per-device property — never momentary available RAM.
+const CO_RESIDENT_MIN_RAM: u64 = 16 * GIB;
 
 /// The chosen residency regime (§7 output flag).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -66,19 +57,11 @@ impl ResidencyMode {
     }
 }
 
-/// The default LLM footprint for this machine per the model-choice policy (§8.2).
-/// The residency calc needs the *size* of whichever LLM will be selected; the
-/// choice and its footprint are owned by [`crate::llm::LlmModel`] so this budget
-/// and the engine's actual load can never disagree.
-fn default_llm_footprint(total_ram: u64) -> u64 {
-    crate::llm::LlmModel::for_total_ram(total_ram).footprint()
-}
-
-/// The pure feasibility calculation (§7): co-resident only when total RAM clears
-/// the combined footprint *plus* the safety margin; otherwise swap.
-pub fn decide_mode(total_ram: u64, llm_footprint: u64) -> ResidencyMode {
-    let footprint = STT_FOOTPRINT + llm_footprint + HEADROOM;
-    if total_ram >= footprint + CO_RESIDENT_MARGIN {
+/// The pure feasibility decision (§7): co-resident at/above the total-RAM cutoff,
+/// otherwise swap. A single small note model makes a flat threshold sufficient —
+/// no per-model footprint sum.
+pub fn decide_mode(total_ram: u64) -> ResidencyMode {
+    if total_ram >= CO_RESIDENT_MIN_RAM {
         ResidencyMode::CoResident
     } else {
         ResidencyMode::Swap
@@ -106,8 +89,8 @@ pub fn resolve(settings: &mut Settings, total_ram: u64) -> (ResidencyMode, bool)
     }
 
     // 2. Cached automatic decision, trusted only while *both* the hardware and the
-    //    footprint formula are unchanged — the cache is keyed on its inputs (RAM)
-    //    and the formula version, so a build with corrected sizes re-decides.
+    //    decision rule are unchanged — the cache is keyed on its input (RAM) and the
+    //    rule version, so a build with a changed threshold re-decides.
     if settings.observed_total_ram == Some(total_ram)
         && settings.residency_calc_version == Some(RESIDENCY_CALC_VERSION)
     {
@@ -120,9 +103,9 @@ pub fn resolve(settings: &mut Settings, total_ram: u64) -> (ResidencyMode, bool)
         }
     }
 
-    // 3. (Re)decide and cache alongside the RAM value and formula version it was
+    // 3. (Re)decide and cache alongside the RAM value and rule version it was
     //    decided from.
-    let mode = decide_mode(total_ram, default_llm_footprint(total_ram));
+    let mode = decide_mode(total_ram);
     settings.residency_mode = Some(mode.as_str().to_string());
     settings.observed_total_ram = Some(total_ram);
     settings.residency_calc_version = Some(RESIDENCY_CALC_VERSION);
@@ -166,18 +149,23 @@ mod tests {
     use super::*;
 
     #[test]
-    fn decision_boundaries_8_16_32_gib() {
-        // 8 GB: below the combined footprint + margin → swap.
+    fn decision_boundaries_around_16_gib() {
+        // 8 GB: below the 16 GB cutoff → swap.
         assert_eq!(
             resolve(&mut Settings::default(), 8 * GIB).0,
             ResidencyMode::Swap
         );
-        // 16 GB: clears footprint + 2 GB margin with the larger LLM → co-resident.
+        // Just under the cutoff → still swap (threshold is inclusive at 16 GB).
+        assert_eq!(
+            resolve(&mut Settings::default(), 16 * GIB - 1).0,
+            ResidencyMode::Swap
+        );
+        // Exactly 16 GB → co-resident.
         assert_eq!(
             resolve(&mut Settings::default(), 16 * GIB).0,
             ResidencyMode::CoResident
         );
-        // 32 GB: comfortable margin → co-resident.
+        // 32 GB: comfortably above → co-resident.
         assert_eq!(
             resolve(&mut Settings::default(), 32 * GIB).0,
             ResidencyMode::CoResident
@@ -255,8 +243,8 @@ mod tests {
     #[test]
     fn formula_change_retriggers_the_decision() {
         // Cached by an older build (same hardware, but a stale calc version, e.g.
-        // the footprint constants were corrected since). The RAM matches, yet the
-        // cache must NOT be trusted — re-decide rather than keep a stale mode.
+        // the RAM threshold changed since). The RAM matches, yet the cache must NOT
+        // be trusted — re-decide rather than keep a stale mode.
         let mut s = Settings::default();
         resolve(&mut s, 32 * GIB);
         s.residency_calc_version = Some(RESIDENCY_CALC_VERSION - 1);

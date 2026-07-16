@@ -19,22 +19,17 @@ const { respond } = vi.hoisted(() => ({
         return Promise.resolve({ expired: false, end_date: "2026-07-31" });
       case "list_input_devices":
         return Promise.resolve([]);
-      case "model_status":
-        return Promise.resolve([]);
       case "get_llm_status":
         return Promise.resolve("ready");
       case "setup_status":
         return Promise.resolve({
-          llm_tier: "medium",
           llm_present: true,
           stt_present: true,
           ready: true,
         });
       case "get_settings":
         return Promise.resolve({
-          model_choice: "medium",
           mic_device: null,
-          paste_hotkey: "Alt+P",
           residency_mode: null,
           residency_override: null,
           observed_total_ram: null,

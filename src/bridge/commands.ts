@@ -9,7 +9,6 @@ import { invoke } from "@tauri-apps/api/core";
 import type {
   InputDevice,
   LlmStatus,
-  ModelStatus,
   Note,
   Record,
   RecordSummary,
@@ -121,27 +120,20 @@ export function listInputDevices(): Promise<InputDevice[]> {
   return invoke<InputDevice[]>("list_input_devices");
 }
 
-// — Models (§8.2, D1). All three LLM tiers ("best" Mistral, "medium" Q8, "okay" Q4)
-// are on-demand downloads; each build bundles the one RAM-fit default. (STT/Parakeet
-// is bundle-only.) `download_model` returns once the worker is spawned — progress and
-// the terminal result arrive as `model-download-*` events.
-
-/** Presence of each model tier on disk, so the UI can offer the optional download. */
-export function modelStatus(): Promise<ModelStatus[]> {
-  return invoke<ModelStatus[]>("model_status");
-}
-
-/** Begin downloading an optional model tier (`best`, `medium` or `okay`). */
-export function downloadModel(tier: string): Promise<void> {
-  return invoke("download_model", { tier });
-}
-
 // — First-run setup (§8.2, D3). The installer ships no model weights; the required
-// set (RAM-fit LLM + Parakeet STT) is downloaded once on first launch, then cached.
+// set (the Gemma note model + Parakeet STT) is downloaded once on first launch, then
+// cached. Each download returns once the worker is spawned — progress and the
+// terminal result arrive as `model-download-*` events.
 
 /** Whether the required models are present so the app can start (else show Setup). */
 export function setupStatus(): Promise<SetupStatus> {
   return invoke<SetupStatus>("setup_status");
+}
+
+/** Begin downloading the note-generation model; progress arrives as `model-download-*`
+ * events keyed by tier `"llm"`. Parameterless — there is one model. */
+export function downloadLlm(): Promise<void> {
+  return invoke("download_llm");
 }
 
 /** Begin downloading the Parakeet STT model; progress arrives as `model-download-*`

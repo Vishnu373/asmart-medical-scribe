@@ -1,7 +1,6 @@
 // Post-build: upload the NSIS installer (and its .sig) to Cloudflare R2 via the
 // S3-compatible API (AWS SDK, as documented). Run after `tauri build`.
-// Credentials come from the environment (bun auto-loads .env):
-//   R2_ACCOUNT_ID, R2_ACCESS_KEY_ID, R2_SECRET_ACCESS_KEY, R2_BUCKET
+
 import { readdirSync, readFileSync } from "node:fs";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";

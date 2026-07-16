@@ -131,8 +131,6 @@ bun run test
 
 **Download** each model locally (any terminal; example uses Command Prompt):
 
-// TODO: A folder for downloading the model; the folder must be referenced in upload_models_r2.mjs 
-
 ```bash
 curl -L -o model_file_name "model_file_url"
 ```
@@ -154,7 +152,6 @@ src-tauri\src\models\mod.rs
 ```bash
 bun run upload_models
 ```
-
 
 ### 2. Build
 

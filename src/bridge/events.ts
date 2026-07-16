@@ -64,7 +64,8 @@ export function onLlmStatus(handler: (payload: LlmStatusEvent) => void): Promise
   return on("llm-status", handler);
 }
 
-// — Optional-model download (§8.2, D1).
+// — Model download (§8.2, D3): the Gemma note model (`"llm"`) and Parakeet STT
+// (`"stt"`), both keyed by `tier`.
 
 export function onModelDownloadProgress(
   handler: (payload: ModelDownloadProgressEvent) => void,

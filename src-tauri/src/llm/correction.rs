@@ -51,22 +51,19 @@ fn user_message(transcript: &str) -> String {
 }
 
 /// Wrap the system instruction, the one-shot example, and the real transcript in the
-/// instruct template of the selected model family — the same per-model templating as
-/// note generation (§8.3), since the two models ship different chat formats and using
-/// the wrong one degrades adherence to the JSON-lines output.
+/// model's chat template — the same templating as note generation (§8.3). Correction
+/// is a plain suggestion pass (no chain-of-thought), unlike note generation.
 pub fn build_prompt(model: LlmModel, transcript: &str) -> String {
     let example_user = user_message(EXAMPLE_TRANSCRIPT);
     let real_user = user_message(transcript);
     match model {
-        LlmModel::Mistral => format!(
-            "<s>[INST] {CORRECTION_SYSTEM_PROMPT}\n\n{example_user} [/INST] {EXAMPLE_OUTPUT}</s>[INST] {real_user} [/INST]"
-        ),
-        LlmModel::Phi | LlmModel::PhiQ4 => format!(
-            "<|system|>\n{CORRECTION_SYSTEM_PROMPT}<|end|>\n\
-             <|user|>\n{example_user}<|end|>\n\
-             <|assistant|>\n{EXAMPLE_OUTPUT}<|end|>\n\
-             <|user|>\n{real_user}<|end|>\n\
-             <|assistant|>\n"
+        // Gemma has no system role, so the instruction rides in the first user turn;
+        // the BOS is added by the tokenizer (`AddBos::Always`), not the string.
+        LlmModel::Gemma => format!(
+            "<start_of_turn>user\n{CORRECTION_SYSTEM_PROMPT}\n\n{example_user}<end_of_turn>\n\
+             <start_of_turn>model\n{EXAMPLE_OUTPUT}<end_of_turn>\n\
+             <start_of_turn>user\n{real_user}<end_of_turn>\n\
+             <start_of_turn>model\n"
         ),
     }
 }
@@ -124,20 +121,13 @@ mod tests {
     }
 
     #[test]
-    fn build_prompt_uses_the_right_template_per_model() {
-        let mistral = build_prompt(LlmModel::Mistral, "cough for two days");
-        assert!(mistral.starts_with("<s>[INST]"));
-        assert!(mistral.ends_with("[/INST]"));
-        assert!(mistral.contains(CORRECTION_SYSTEM_PROMPT));
-        assert!(mistral.contains(EXAMPLE_OUTPUT));
-        assert!(mistral.contains("cough for two days"));
-
-        let phi = build_prompt(LlmModel::Phi, "cough for two days");
-        assert!(phi.contains("<|system|>"));
-        assert!(phi.contains("<|assistant|>"));
-        assert!(phi.ends_with("<|assistant|>\n"));
-        assert!(phi.contains(EXAMPLE_OUTPUT));
-        assert!(phi.contains("cough for two days"));
+    fn build_prompt_uses_the_gemma_template() {
+        let p = build_prompt(LlmModel::Gemma, "cough for two days");
+        assert!(p.starts_with("<start_of_turn>user\n"));
+        assert!(p.ends_with("<start_of_turn>model\n"));
+        assert!(p.contains(CORRECTION_SYSTEM_PROMPT));
+        assert!(p.contains(EXAMPLE_OUTPUT));
+        assert!(p.contains("cough for two days"));
     }
 
     #[test]

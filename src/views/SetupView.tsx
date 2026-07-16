@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
-  downloadModel,
+  downloadLlm,
   downloadStt,
   markSetupCompleted,
   onModelDownloadDone,
@@ -10,12 +10,14 @@ import {
 } from "@/bridge";
 import type { SetupStatus } from "@/bridge";
 
+/** The note model's download event key (matches `models::LLM.tier`). */
+const LLM = "llm";
 /** The Parakeet STT download's event key (matches `models::STT.tier`). */
 const STT = "stt";
 
 /** A required model the first run must fetch, derived from `SetupStatus`. */
 interface Slot {
-  /** Event key: the LLM tier (`best`/`medium`) or `"stt"`. */
+  /** Event key: `"llm"` or `"stt"`. */
   key: string;
   label: string;
   present: boolean;
@@ -23,7 +25,7 @@ interface Slot {
 
 function slotsFor(s: SetupStatus): Slot[] {
   return [
-    { key: s.llm_tier, label: "Note model", present: s.llm_present },
+    { key: LLM, label: "Note model", present: s.llm_present },
     { key: STT, label: "Speech recognition", present: s.stt_present },
   ];
 }
@@ -51,7 +53,7 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
       return next;
     });
     setProgress((p) => ({ ...p, [key]: 0 }));
-    const call = key === STT ? downloadStt() : downloadModel(key);
+    const call = key === STT ? downloadStt() : downloadLlm();
     call.catch((err) => {
       started.current.delete(key);
       setErrors((e) => ({ ...e, [key]: String(err) }));

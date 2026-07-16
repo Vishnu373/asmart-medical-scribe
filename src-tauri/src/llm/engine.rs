@@ -29,90 +29,24 @@ use llama_cpp_2::LlamaStateSeqFlags;
 use super::correction;
 use super::prompt;
 
-/// The note-generation model (design §8.2). The three doctor-facing tiers map
-/// here: `best`→Mistral, `medium`→Phi (Q8), `okay`→PhiQ4. When no tier is chosen
-/// the model is picked fit-to-machine on total RAM ([`for_total_ram`]). Each build
-/// bundles exactly one LLM (the RAM-fit default); all three tiers are also
-/// downloadable on demand (D1, `models`).
+/// The note-generation model (design §8.2). A single on-device model —
+/// `gemma-4-E2B-it-UD-Q4_K_XL` — behind the `NoteGenerator` interface. Kept as an
+/// enum (one variant today) so `prompt` / `correction` / [`PrefixCache`] keep a
+/// typed dispatch point if a second model is ever added. The installer bundles no
+/// LLM; it is downloaded once at first-run Setup (D3, `models`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmModel {
-    /// `best` (≥16 GB default): Mistral-7B-Instruct-v0.3 Q4_K_M (~4.4 GB). Bundled
-    /// on ≥16 GB builds; downloadable elsewhere.
-    Mistral,
-    /// `medium` (<16 GB default): Phi-3.5-mini-instruct Q8_0 (~4.0 GB). Bundled on
-    /// <16 GB builds; downloadable elsewhere.
-    Phi,
-    /// `okay`: Phi-3.5-mini-instruct Q4_K_M (~2.4 GB). Downloaded on demand.
-    PhiQ4,
+    /// Gemma 3n E2B instruct, Unsloth dynamic Q4_K_XL (GGUF).
+    Gemma,
 }
 
-const GIB: u64 = 1024 * 1024 * 1024;
-
-// The §8.2 model-choice threshold: at/above this total RAM the larger LLM is
-// selected. This module is the single source of truth for the model choice *and*
-// its footprint (see [`LlmModel::footprint`]); the §7 residency budget reads them
-// so it can never size co-residency for a different model than the engine loads.
-const LLM_MODEL_THRESHOLD: u64 = 16 * GIB;
-
 impl LlmModel {
-    /// The §8.2 selection rule, keyed on total RAM (the same probe that drives §7).
-    /// This is the default when the doctor hasn't picked a tier explicitly.
-    pub fn for_total_ram(total_ram: u64) -> Self {
-        if total_ram >= LLM_MODEL_THRESHOLD {
-            LlmModel::Mistral
-        } else {
-            LlmModel::Phi
-        }
-    }
-
-    /// Map a doctor-facing `model_choice` tier (§9.3) to a model, or `None` for an
-    /// unrecognized value so the caller can fall back to the automatic pick.
-    pub fn from_tier(choice: &str) -> Option<Self> {
-        match choice {
-            "best" => Some(LlmModel::Mistral),
-            "medium" => Some(LlmModel::Phi),
-            "okay" => Some(LlmModel::PhiQ4),
-            _ => None,
-        }
-    }
-
-    /// The doctor-facing `model_choice` tier for this model — the inverse of
-    /// [`from_tier`]. Used by the first-run setup (D3) to name the RAM-fit LLM it
-    /// must download.
-    pub fn tier(self) -> &'static str {
-        match self {
-            LlmModel::Mistral => "best",
-            LlmModel::Phi => "medium",
-            LlmModel::PhiQ4 => "okay",
-        }
-    }
-
-    /// Resolve the model the engine should load: the explicitly chosen tier if it
-    /// is recognized, otherwise the fit-to-machine default ([`for_total_ram`]).
-    pub fn from_choice(choice: &str, total_ram: u64) -> Self {
-        LlmModel::from_tier(choice).unwrap_or_else(|| LlmModel::for_total_ram(total_ram))
-    }
-
-    /// Approximate resident RAM footprint of the loaded GGUF (design §8.2). The
-    /// residency feasibility calc (§7) reads this so its co-residency budget is
-    /// for exactly the model [`for_total_ram`] will pick — one source of truth for
-    /// the (choice, size) pair. Design-target estimates, validated in benchmarking.
-    pub fn footprint(self) -> u64 {
-        match self {
-            LlmModel::Mistral => 22 * GIB / 5, // ~4.4 GB (Q4_K_M)
-            LlmModel::Phi => 4 * GIB,          // ~4.0 GB (Q8_0)
-            LlmModel::PhiQ4 => 12 * GIB / 5,   // ~2.4 GB (Q4_K_M)
-        }
-    }
-
     /// The GGUF filename resolved under the models search dirs (D1: app-data
-    /// download dir first, then the bundled resource dir). These literals are the
-    /// installer/download filenames; `models::OPTIONAL` keys off the same names.
+    /// download dir first, then the bundled resource dir). Must equal the R2 object's
+    /// on-disk name; `models::LLM` downloads to exactly this name.
     pub fn file_name(self) -> &'static str {
         match self {
-            LlmModel::Mistral => "Mistral-7B-Instruct-v0.3-Q4_K_M.gguf",
-            LlmModel::Phi => "phi-3.5-mini-instruct-Q8_0-worthdoing.gguf",
-            LlmModel::PhiQ4 => "phi-3.5-mini-instruct-Q4_K_M-worthdoing.gguf",
+            LlmModel::Gemma => "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
         }
     }
 }
@@ -149,11 +83,9 @@ pub struct LlmEngine {
     /// [`unload`]/model change. Guarded separately from `model`; a fresh context is
     /// still built per note, so cancel/error can never leave stale tokens here.
     prefix_cache: Mutex<Option<PrefixCache>>,
-    /// The tier the engine should load. Mutable so a `model_choice` change in
-    /// Settings takes effect live ([`set_model`]) without an app restart; guarded
-    /// separately from `model` and never held across a load, so the two locks
-    /// don't nest.
-    kind: Mutex<LlmModel>,
+    /// The model the engine loads. Immutable — there is one model, so it is fixed at
+    /// construction (no live retargeting anymore).
+    kind: LlmModel,
     /// Model-file search dirs, in priority order (D1): the app-data download dir
     /// first (optional models the doctor pulled), then the bundled resource dir.
     model_dirs: Vec<PathBuf>,
@@ -174,7 +106,7 @@ impl LlmEngine {
             backend,
             model: Mutex::new(None),
             prefix_cache: Mutex::new(None),
-            kind: Mutex::new(kind),
+            kind,
             model_dirs,
             n_threads: n_threads.max(1),
             load_lock: Mutex::new(()),
@@ -182,28 +114,7 @@ impl LlmEngine {
     }
 
     pub fn model_kind(&self) -> LlmModel {
-        *self.kind.lock().unwrap()
-    }
-
-    /// Point the engine at `kind` (the doctor's `model_choice`, resolved to a tier).
-    /// When the tier actually changes, drop any loaded model so the next
-    /// [`ensure_loaded`]/[`generate`] loads the new one — this is what makes a
-    /// Settings model change take effect without restarting the app. A no-op when
-    /// the tier is unchanged, so callers can invoke it on every settings save.
-    pub fn set_model(&self, kind: LlmModel) {
-        let changed = {
-            let mut cur = self.kind.lock().unwrap();
-            if *cur == kind {
-                false
-            } else {
-                *cur = kind;
-                true
-            }
-        };
-        if changed {
-            self.unload();
-            info!("LLM target model changed to {:?}", kind);
-        }
+        self.kind
     }
 
     pub fn is_loaded(&self) -> bool {
@@ -255,8 +166,7 @@ impl LlmEngine {
     pub fn unload(&self) {
         *self.lock_model() = None;
         // Drop the cached prefix state with the model: it belongs to this model
-        // (and would be re-primed cold on the next load, §8.7). This is also the
-        // invalidation path for a model change — `set_model` calls `unload`.
+        // (and would be re-primed cold on the next load, §8.7).
         *self.prefix_cache.lock().unwrap() = None;
     }
 

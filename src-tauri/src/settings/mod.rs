@@ -15,14 +15,8 @@ use std::sync::{Arc, Mutex};
 // back to defaults (config-only, no PHI) rather than fail to parse.
 #[serde(default)]
 pub struct Settings {
-    /// Doctor-facing: `best` / `medium` / `okay`, or `""` = automatic (§7). Empty
-    /// means "no tier chosen", so the engine and first-run setup both fall back to
-    /// the RAM-fit default ([`LlmModel::from_choice`] → [`LlmModel::for_total_ram`]).
-    pub model_choice: String,
     /// Doctor-facing: selected input device, `None` = system default.
     pub mic_device: Option<String>,
-    /// Doctor-facing: rebindable paste hotkey, default Alt+P (§8.6).
-    pub paste_hotkey: String,
     /// Internal: co-resident vs swap, decided once and cached (§7).
     pub residency_mode: Option<String>,
     /// Doctor-facing: manual residency force; `None` = use the automatic decision.
@@ -30,8 +24,9 @@ pub struct Settings {
     pub residency_override: Option<String>,
     /// Internal: cached RAM probe in bytes; a mismatch re-triggers the decision (§7).
     pub observed_total_ram: Option<u64>,
-    /// Internal: which footprint formula produced `residency_mode`. Bumped when the
-    /// model-size constants change so a new build re-decides on the same hardware (§7).
+    /// Internal: which residency decision rule produced `residency_mode`. Bumped when
+    /// the rule changes (e.g. the RAM threshold) so a new build re-decides on the same
+    /// hardware (§7).
     pub residency_calc_version: Option<u32>,
     /// Internal: VAD speech threshold (§6.2).
     pub vad_threshold: f32,
@@ -42,9 +37,7 @@ pub struct Settings {
 impl Default for Settings {
     fn default() -> Self {
         Self {
-            model_choice: String::new(), // "" = automatic: pick the RAM-fit tier
             mic_device: None,
-            paste_hotkey: "Alt+P".to_string(),
             residency_mode: None,
             residency_override: None,
             observed_total_ram: None,
@@ -119,7 +112,7 @@ mod tests {
         let shared = SharedSettings::new(Settings::default(), path.clone());
 
         let mut next = Settings::default();
-        next.model_choice = "best".to_string();
+        next.mic_device = Some("USB Mic".to_string());
         shared.update(next.clone()).unwrap();
 
         assert_eq!(shared.get(), next); // cached copy updated
@@ -139,7 +132,6 @@ mod tests {
         let path = dir.path().join("settings.json");
         let mut s = Settings::default();
         s.mic_device = Some("USB Mic".to_string());
-        s.paste_hotkey = "Ctrl+V".to_string();
         s.save(&path).unwrap();
         assert_eq!(Settings::load(&path).unwrap(), s);
     }
@@ -152,7 +144,6 @@ mod tests {
         fs::write(&path, r#"{"mic_device":"USB Mic"}"#).unwrap();
         let s = Settings::load(&path).unwrap();
         assert_eq!(s.mic_device, Some("USB Mic".to_string()));
-        assert_eq!(s.model_choice, Settings::default().model_choice);
         assert_eq!(s.idle_timeout, Settings::default().idle_timeout);
     }
 

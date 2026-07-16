@@ -1,15 +1,13 @@
 //! Model distribution: on-disk resolution + model downloads (D1, D3).
 //!
 //! The installer ships **no** model weights (D3 lean installer). On first launch a
-//! one-time Setup downloads the models the app requires — the RAM-fit default LLM
-//! (Mistral "best" on ≥16 GB, Phi-3.5 Q8 "medium" on <16 GB; design §8.2) and the
-//! Parakeet STT model — and the app is gated until they are present ([`setup_status`]).
-//! Beyond that required set, all three LLM tiers — Mistral "best", Phi Q8 "medium",
-//! Phi Q4 "okay" — are downloadable on demand from Settings so a doctor can pull a
-//! different one. These downloads are the only network calls in the app (NFR-6
-//! zero-egress is about *PHI*; this is model weights), and each is content-verified
-//! before use. The LLMs are single GGUFs ([`download_model`]); Parakeet is a gzipped
-//! tar of a *directory*, so it is verified then extracted ([`download_stt`]).
+//! one-time Setup downloads the two models the app requires — the note-generation
+//! model (Gemma; design §8.2) and the Parakeet STT model — and the app is gated
+//! until both are present ([`setup_status`]). These downloads are the only network
+//! calls in the app (NFR-6 zero-egress is about *PHI*; this is model weights), and
+//! each is content-verified before use. The LLM is a single GGUF ([`download_llm`]);
+//! Parakeet is a gzipped tar of a *directory*, so it is verified then extracted
+//! ([`download_stt`]).
 //!
 //! Downloaded models land in the writable `app_data_dir/models`; [`resolve`] also
 //! searches the read-only `resource_dir/models` after it, so a model bundled by a
@@ -28,51 +26,30 @@ use tauri::{AppHandle, Emitter, Manager};
 
 use crate::llm::LlmModel;
 
-/// An LLM tier that is downloaded on demand rather than bundled. `tier` is the
-/// `model_choice` key (§9.3); the on-disk filename is owned by [`LlmModel`] so the
-/// download and the loader always agree on the name.
-pub struct OptionalModel {
-    /// The `model_choice` tier this satisfies.
+/// The single note-generation model download (D3). One GGUF, content-verified before
+/// use. The on-disk filename is owned by [`LlmModel`] so the download and the loader
+/// always agree on the name. A `static` (not `const`) so a reference into it is
+/// `'static` and can move into the download thread.
+pub struct LlmDownload {
     pub tier: &'static str,
-    /// Direct-download URL (a GGUF; HTTPS, follows redirects).
     pub url: &'static str,
-    /// Expected lowercase hex SHA-256, when known. `None` skips verification (a
-    /// pinned hash is strongly preferred — see the field's TODO at the call site).
     pub sha256: Option<&'static str>,
 }
 
-/// The downloadable LLM tiers: all three — Mistral "best", and both Phi-3.5
-/// quantizations ("medium" Q8, "okay" Q4). On a given build one may already be
-/// bundled (the RAM-fit default), in which case `model_status` reports it present
-/// and the UI never offers its download. A `static` (not `const`) so a reference
-/// into it is `'static` and can move into the download thread.
-pub static OPTIONAL: &[OptionalModel] = &[
-    OptionalModel {
-        tier: "best",
-        url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/mistral.gguf",
-        sha256: Some("1270d22c0fbb3d092fb725d4d96c457b7b687a5f5a715abe1e818da303e562b6"),
-    },
-    OptionalModel {
-        tier: "medium",
-        url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/phi-q8.gguf",
-        sha256: Some("25a8bac561ce82344e2fe2e875e3633f81a162d3daee16f2ca51d559ae69669b"),
-    },
-    OptionalModel {
-        tier: "okay",
-        url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/phi-q4.gguf",
-        sha256: Some("a58b37b8c631501c0f8a5ba711579c3c067c6d4c51ea5215c05190289b067f0a"),
-    },
-];
-
-/// All doctor-facing tiers, for `model_status` presence reporting.
-const ALL_TIERS: [&str; 3] = ["best", "medium", "okay"];
+/// The Gemma GGUF download. Event key `"llm"` is distinct from `"stt"` so the
+/// frontend can key its progress map by it. URL points at our R2 object; the
+/// SHA-256 is pinned so the transfer is content-verified before use.
+pub static LLM: LlmDownload = LlmDownload {
+    tier: "llm",
+    url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+    sha256: Some("b8906b8c5e05e57b657646bbc657bd35814a269b2c20f0a2579047fafa1a67dd"),
+};
 
 /// The Parakeet STT model download (D3). Unlike the LLM GGUFs this is a gzipped
 /// tar of a *directory* of ONNX files, so the transfer is verified then extracted
 /// (see [`download_stt`]). It is required for the app to function at all, so the
-/// first-run setup pulls it before releasing the app (it is not an LLM tier —
-/// there is no per-tier `model_choice` for STT). `tier` here is the event key the
-/// download progress/done/error events carry, matching the LLM ones' `tier`.
+/// first-run setup pulls it before releasing the app. `tier` here is the event key
+/// the download progress/done/error events carry, matching the LLM download's `tier`.
 pub struct SttDownload {
     /// The event key for this download's `model-download-*` events.
     pub tier: &'static str,
@@ -124,65 +101,60 @@ pub fn resolve(file: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
     dirs.iter().map(|d| d.join(file)).find(|p| p.exists())
 }
 
-/// Presence of one tier's model file across the search dirs.
-#[derive(Serialize)]
-pub struct ModelStatus {
-    pub tier: String,
-    pub present: bool,
-    /// Whether this tier is an on-demand download (vs bundled). The UI shows a
-    /// Download affordance for an optional tier that is absent.
-    pub optional: bool,
-}
-
-/// Report which tier models are present on disk so the UI can show/hide the
-/// download affordance for the optional tier (§9.3, D1).
-#[tauri::command]
-pub fn model_status(app: AppHandle) -> Result<Vec<ModelStatus>, String> {
-    let dirs = model_dirs(&app).map_err(|e| e.to_string())?;
-    Ok(ALL_TIERS
-        .iter()
-        .map(|&tier| {
-            let file = LlmModel::from_tier(tier)
-                .expect("ALL_TIERS are valid tiers")
-                .file_name();
-            ModelStatus {
-                tier: tier.to_string(),
-                present: resolve(file, &dirs).is_some(),
-                optional: OPTIONAL.iter().any(|m| m.tier == tier),
-            }
-        })
-        .collect())
-}
-
 /// Whether the models the app *requires* to run are on disk (D3 first-run gate):
-/// the RAM-fit default LLM and the Parakeet STT model. The frontend shows the
+/// the note-generation model and the Parakeet STT model. The frontend shows the
 /// one-time Setup screen until `ready`.
 #[derive(Serialize)]
 pub struct SetupStatus {
-    /// The RAM-fit LLM tier this machine needs (`best` on ≥16 GB, `medium` on
-    /// <16 GB) — the tier the Setup screen downloads.
-    pub llm_tier: String,
     pub llm_present: bool,
     pub stt_present: bool,
     /// Both required models present — the app can start.
     pub ready: bool,
 }
 
-/// Report whether the required models (RAM-fit LLM + Parakeet STT) are present so
-/// the frontend can gate the app on first run (D3). The LLM tier is the §8.2
-/// fit-to-machine default, independent of any `model_choice` the doctor later sets.
+/// Report whether the required models (Gemma + Parakeet STT) are present so the
+/// frontend can gate the app on first run (D3).
 #[tauri::command]
 pub fn setup_status(app: AppHandle) -> Result<SetupStatus, String> {
     let dirs = model_dirs(&app).map_err(|e| e.to_string())?;
-    let llm = LlmModel::for_total_ram(crate::residency::probe_total_ram());
-    let llm_present = resolve(llm.file_name(), &dirs).is_some();
+    let llm_present = resolve(LlmModel::Gemma.file_name(), &dirs).is_some();
     let stt_present = resolve(STT.dir_name, &dirs).is_some();
     Ok(SetupStatus {
-        llm_tier: llm.tier().to_string(),
         llm_present,
         stt_present,
         ready: llm_present && stt_present,
     })
+}
+
+/// GGUFs shipped by the pre-§3 multi-tier builds (Mistral `best`, Phi `medium`/
+/// `okay`). v0.1.2 collapsed to a single Gemma model ([`LlmModel`]), so these names
+/// are no longer resolved by anything — an upgraded device would otherwise carry
+/// ~7–11 GB of dead weights forever.
+static RETIRED_LLM_FILES: &[&str] = &["mistral.gguf", "phi-q8.gguf", "phi-q4.gguf"];
+
+/// One-time upgrade migration (§4d): delete the retired multi-tier LLM GGUFs from
+/// the writable download dir. Best-effort — a file that's missing or can't be
+/// removed is skipped; the read-only resource dir is never touched. Called once at
+/// startup, independent of the model preload.
+pub fn cleanup_retired_weights(app: &AppHandle) -> Result<()> {
+    // Only the writable download dir (the first search dir); never the bundled one.
+    let dir = model_dirs(app)?.remove(0);
+    remove_retired_in(&dir);
+    Ok(())
+}
+
+/// Delete any [`RETIRED_LLM_FILES`] present in `dir` (pure over the dir — unit-tested).
+/// Best-effort: a file that can't be removed is logged and skipped.
+fn remove_retired_in(dir: &Path) {
+    for name in RETIRED_LLM_FILES {
+        let path = dir.join(name);
+        if path.exists() {
+            match fs::remove_file(&path) {
+                Ok(()) => log::info!("removed retired LLM weight {name}"),
+                Err(e) => log::warn!("could not remove retired LLM weight {name}: {e}"),
+            }
+        }
+    }
 }
 
 /// Progress for an in-flight download. `total` is 0 when the server omits a
@@ -194,34 +166,30 @@ struct DownloadProgress {
     total: u64,
 }
 
-/// Start downloading an optional model tier (D1). Returns immediately after
-/// validating and spawning the worker; progress and the terminal result are
-/// reported via events so the IPC thread stays free and the UI can show a bar:
+/// Start downloading the note-generation model (D3). Parameterless — there is one
+/// model. Returns immediately after spawning the worker; progress and the terminal
+/// result are reported via events so the IPC thread stays free and the UI can show a
+/// bar, keyed by `LLM.tier` (`"llm"`):
 ///   - `model-download-progress` `{ tier, downloaded, total }` (throttled)
 ///   - `model-download-done` `{ tier }`
 ///   - `model-download-error` `{ tier, message }`
 #[tauri::command]
-pub fn download_model(app: AppHandle, tier: String) -> Result<(), String> {
-    let spec = OPTIONAL
-        .iter()
-        .find(|m| m.tier == tier)
-        .ok_or_else(|| format!("'{tier}' is not an optional/downloadable model"))?;
-    let file = LlmModel::from_tier(&tier)
-        .ok_or_else(|| format!("unknown tier '{tier}'"))?
-        .file_name();
+pub fn download_llm(app: AppHandle) -> Result<(), String> {
+    let file = LlmModel::Gemma.file_name();
     let dest_dir = model_dirs(&app).map_err(|e| e.to_string())?.remove(0); // app-data/models
+    let tier = LLM.tier.to_string();
 
-    // Claim the tier; reject if a worker already holds it.
+    // Claim the download; reject if a worker already holds it.
     {
         let mut guard = IN_FLIGHT.lock().unwrap();
         let set = guard.get_or_insert_with(HashSet::new);
         if !set.insert(tier.clone()) {
-            return Err(format!("'{tier}' is already downloading"));
+            return Err("the note model is already downloading".to_string());
         }
     }
 
     std::thread::spawn(move || {
-        let result = download_to(&app, spec, file, &dest_dir);
+        let result = download_to(&app, &LLM, file, &dest_dir);
         // Release the claim before emitting the terminal event so a retry on error
         // (or a fresh download after done) isn't rejected as still in flight.
         if let Some(set) = IN_FLIGHT.lock().unwrap().as_mut() {
@@ -250,7 +218,7 @@ pub fn download_model(app: AppHandle, tier: String) -> Result<(), String> {
     Ok(())
 }
 
-/// Start downloading the Parakeet STT model (D3). Mirrors [`download_model`] —
+/// Start downloading the Parakeet STT model (D3). Mirrors [`download_llm`] —
 /// returns once the worker is spawned; progress and the terminal result arrive as
 /// the same `model-download-*` events, keyed by `STT.tier` (`"stt"`). Unlike an LLM
 /// GGUF the archive is a tar.gz of a directory, so the worker verifies then
@@ -364,7 +332,7 @@ fn single_subdir(dir: &Path) -> Result<Option<PathBuf>> {
 /// rename into place (D1). The streaming/verify is shared with the STT download via
 /// [`stream_verified`]; here the verified bytes are the final file, so we just
 /// rename and emit the closing 100% tick.
-fn download_to(app: &AppHandle, spec: &OptionalModel, file: &str, dest_dir: &Path) -> Result<()> {
+fn download_to(app: &AppHandle, spec: &LlmDownload, file: &str, dest_dir: &Path) -> Result<()> {
     let part = dest_dir.join(format!("{file}.part"));
     let downloaded = stream_verified(app, spec.tier, spec.url, spec.sha256, &part)?;
     fs::rename(&part, dest_dir.join(file)).map_err(|e| anyhow!("finalize download: {e}"))?;
@@ -492,19 +460,15 @@ mod tests {
     }
 
     #[test]
-    fn optional_catalog_filenames_match_the_loader() {
-        // The download filename must equal what the engine resolves, or a pulled
-        // model would never be found. Guards the two lists against drift.
-        for m in OPTIONAL {
-            let kind = LlmModel::from_tier(m.tier).expect("optional tier is a real tier");
-            assert!(
-                m.url.ends_with(&format!("{}?download=true", kind.file_name()))
-                    || m.url.contains(kind.file_name()),
-                "optional '{}' url does not reference its filename {}",
-                m.tier,
-                kind.file_name()
-            );
-        }
+    fn llm_catalog_url_matches_the_loader_filename() {
+        // The download URL must reference the filename the engine resolves, or the
+        // pulled model would never be found. Guards the spec against drift.
+        assert!(
+            LLM.url.contains(LlmModel::Gemma.file_name()),
+            "LLM url {} does not reference its filename {}",
+            LLM.url,
+            LlmModel::Gemma.file_name()
+        );
     }
 
     #[test]
@@ -512,6 +476,33 @@ mod tests {
         // The extracted directory must equal what the STT engine resolves, or a
         // downloaded Parakeet model would never be found. Guards against drift.
         assert_eq!(STT.dir_name, ModelKind::Parakeet.dir_name());
+    }
+
+    #[test]
+    fn remove_retired_in_deletes_only_retired_weights() {
+        let dir = tempfile::tempdir().unwrap();
+
+        // Two retired GGUFs plus the current model and an unrelated file.
+        for name in RETIRED_LLM_FILES {
+            fs::write(dir.path().join(name), b"x").unwrap();
+        }
+        let keep_current = dir.path().join(LlmModel::Gemma.file_name());
+        let keep_other = dir.path().join("notes.db");
+        fs::write(&keep_current, b"x").unwrap();
+        fs::write(&keep_other, b"x").unwrap();
+
+        remove_retired_in(dir.path());
+
+        // Every retired weight is gone; the current model and the stranger survive.
+        for name in RETIRED_LLM_FILES {
+            assert!(!dir.path().join(name).exists(), "{name} should be removed");
+        }
+        assert!(keep_current.exists());
+        assert!(keep_other.exists());
+
+        // Idempotent — a second pass with nothing to remove is a no-op, not an error.
+        remove_retired_in(dir.path());
+        assert!(keep_current.exists());
     }
 
     #[test]

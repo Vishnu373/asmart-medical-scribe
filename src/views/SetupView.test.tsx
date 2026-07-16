@@ -12,12 +12,11 @@ beforeEach(() => mockInvoke.mockReset());
 
 describe("SetupView", () => {
   it("auto-starts the missing required downloads on first run", async () => {
-    // <16 GB machine: needs Phi Q8 ("medium") + Parakeet; neither is present.
+    // First run: neither the note model nor Parakeet is present.
     mockInvoke.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "setup_status":
           return Promise.resolve({
-            llm_tier: "medium",
             llm_present: false,
             stt_present: false,
             ready: false,
@@ -30,9 +29,7 @@ describe("SetupView", () => {
     render(<SetupView onReady={vi.fn()} />);
 
     // Both required models begin downloading without a click.
-    await waitFor(() =>
-      expect(mockInvoke).toHaveBeenCalledWith("download_model", { tier: "medium" }),
-    );
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("download_llm"));
     expect(mockInvoke).toHaveBeenCalledWith("download_stt");
     expect(await screen.findByText("Note model")).toBeInTheDocument();
     expect(screen.getByText("Speech recognition")).toBeInTheDocument();
@@ -44,7 +41,6 @@ describe("SetupView", () => {
       switch (cmd) {
         case "setup_status":
           return Promise.resolve({
-            llm_tier: "best",
             llm_present: true,
             stt_present: true,
             ready: true,
@@ -58,7 +54,7 @@ describe("SetupView", () => {
 
     await waitFor(() => expect(onReady).toHaveBeenCalled());
     // Nothing is downloaded when both models are already on disk.
-    expect(mockInvoke).not.toHaveBeenCalledWith("download_model", expect.anything());
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_llm");
     expect(mockInvoke).not.toHaveBeenCalledWith("download_stt");
     // `setup_completed` marks a genuine first-run finish (§3 telemetry) — it must
     // NOT fire when models are already present (a later, ordinary launch).
