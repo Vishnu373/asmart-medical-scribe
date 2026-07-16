@@ -5,6 +5,7 @@ import {
   onError,
   onGenerationToken,
   onInputLevel,
+  onLlmStatus,
   onStateChanged,
   onTranscriptSegment,
 } from "@/bridge";
@@ -21,6 +22,7 @@ export function useBackendEvents() {
   const addSegment = useAppStore((s) => s.addSegment);
   const appendStreamingToken = useAppStore((s) => s.appendStreamingToken);
   const addSuggestion = useAppStore((s) => s.addSuggestion);
+  const setLlmStatus = useAppStore((s) => s.setLlmStatus);
   const pushToast = useAppStore((s) => s.pushToast);
 
   useEffect(() => {
@@ -41,6 +43,12 @@ export function useBackendEvents() {
       // the terminal done/error just returns the machine to IDLE (via state-changed),
       // which is the additive, non-blocking behavior — no toast on failure.
       onCorrectionSuggestion((p) => addSuggestion(p)),
+      // Note-model readiness (§8.2 startup fix): flip the "preparing" hint to ready,
+      // or toast a preload failure (the first Generate still retries and re-surfaces it).
+      onLlmStatus((p) => {
+        setLlmStatus(p.status);
+        if (p.status === "error" && p.message) pushToast(p.message, "error");
+      }),
       onError((p) => pushToast(p.message, "error")),
     ]).then((fns) => {
       // If the component unmounted before the listeners registered, drop them.
@@ -52,5 +60,13 @@ export function useBackendEvents() {
       active = false;
       unsubs.forEach((f) => f());
     };
-  }, [setRecordingState, setInputLevel, addSegment, appendStreamingToken, addSuggestion, pushToast]);
+  }, [
+    setRecordingState,
+    setInputLevel,
+    addSegment,
+    appendStreamingToken,
+    addSuggestion,
+    setLlmStatus,
+    pushToast,
+  ]);
 }

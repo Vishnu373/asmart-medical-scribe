@@ -158,6 +158,10 @@ pub struct LlmEngine {
     /// first (optional models the doctor pulled), then the bundled resource dir.
     model_dirs: Vec<PathBuf>,
     n_threads: i32,
+    /// Serializes [`ensure_loaded`] so the co-resident background preload (design
+    /// §8.2 startup fix) and an early Generate can't both load the model at once.
+    /// Held only across the load itself, never nested inside the `model` lock.
+    load_lock: Mutex<()>,
 }
 
 impl LlmEngine {
@@ -173,6 +177,7 @@ impl LlmEngine {
             kind: Mutex::new(kind),
             model_dirs,
             n_threads: n_threads.max(1),
+            load_lock: Mutex::new(()),
         })
     }
 
@@ -210,6 +215,14 @@ impl LlmEngine {
     /// but actual *available* RAM at generation time can be lower, so guard here
     /// to fail gracefully rather than risk a silent OOM.
     pub fn ensure_loaded(&self) -> Result<()> {
+        if self.is_loaded() {
+            return Ok(());
+        }
+        // Serialize concurrent loaders (background preload vs. an early Generate,
+        // design §8.2). `is_loaded` → load isn't atomic on its own; take the load
+        // lock and re-check under it so the model loads at most once. The lock is
+        // separate from `model` and released before this returns, so it never nests.
+        let _load = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
         if self.is_loaded() {
             return Ok(());
         }

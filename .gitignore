@@ -11,6 +11,9 @@ src-tauri/gen/
 # Graphify
 graphify-out/
 
+# implementation.md file
+docs/implementation.md
+
 # private key
 ~/
 

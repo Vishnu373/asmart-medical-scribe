@@ -21,6 +21,8 @@ const { respond } = vi.hoisted(() => ({
         return Promise.resolve([]);
       case "model_status":
         return Promise.resolve([]);
+      case "get_llm_status":
+        return Promise.resolve("ready");
       case "setup_status":
         return Promise.resolve({
           llm_tier: "medium",

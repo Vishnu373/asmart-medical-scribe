@@ -10,6 +10,7 @@ import type {
   ErrorEvent,
   GenerationTokenEvent,
   InputLevelEvent,
+  LlmStatusEvent,
   ModelDownloadProgressEvent,
   StateChangedEvent,
   TranscriptSegmentEvent,
@@ -53,6 +54,14 @@ export function onCorrectionSuggestion(
 
 export function onError(handler: (payload: ErrorEvent) => void): Promise<UnlistenFn> {
   return on("error", handler);
+}
+
+// — Note-model readiness (§8.2 startup fix, §9.5). The co-resident preload runs on a
+// background thread so the window stays interactive on launch; this event flips the
+// UI's "preparing" hint to ready (or surfaces a load error).
+
+export function onLlmStatus(handler: (payload: LlmStatusEvent) => void): Promise<UnlistenFn> {
+  return on("llm-status", handler);
 }
 
 // — Optional-model download (§8.2, D1).

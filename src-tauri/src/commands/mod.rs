@@ -192,6 +192,31 @@ pub fn get_settings(state: State<'_, SharedSettings>) -> Settings {
     state.get()
 }
 
+/// Current note-model readiness for the UI's "preparing" hint (design §8.2 startup
+/// fix, §9.5). Queried once at mount to seed the state before the async `llm-status`
+/// event flips it — the co-resident preload emits `loading` before the webview has a
+/// listener, so a mount query is how the UI reliably learns it is still warming.
+/// Returns `"ready"` when the model is loaded (or in swap mode, where it loads lazily
+/// per generation so generation is available immediately), else `"loading"`.
+#[tauri::command]
+pub fn get_llm_status(
+    engine: State<'_, Arc<LlmEngine>>,
+    settings: State<'_, SharedSettings>,
+) -> String {
+    // Swap mode loads lazily per generation (no preload, so no `llm-status` event
+    // fires) — generation is available immediately, so report "ready". The effective
+    // mode must honor a residency *override*, which `resolve` applies without ever
+    // writing `residency_mode`; reading that field raw would report "loading" forever
+    // on a swap-by-override device (design §7).
+    let swap = crate::residency::effective_mode(&settings.get())
+        == Some(crate::residency::ResidencyMode::Swap);
+    if engine.is_loaded() || swap {
+        "ready".to_string()
+    } else {
+        "loading".to_string()
+    }
+}
+
 /// Persist patched settings (§9.3/§9.4). The frontend sends the full object
 /// (read-modify-write), so internal keys are preserved across the round-trip. The
 /// value param is named `settings` to match the `invoke("update_settings", { settings })`

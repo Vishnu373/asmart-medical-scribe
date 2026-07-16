@@ -12,6 +12,7 @@ export default function RecordingView() {
   const recordingState = useAppStore((s) => s.recordingState);
   const paused = useAppStore((s) => s.paused);
   const inputLevel = useAppStore((s) => s.inputLevel);
+  const llmStatus = useAppStore((s) => s.llmStatus);
 
   const metering = recordingState === "RECORDING" && !paused;
 
@@ -19,7 +20,7 @@ export default function RecordingView() {
     <section aria-label="Recording" className="flex flex-1 flex-col gap-6 p-6">
       <div className="flex items-center justify-between">
         <h2 className="text-lg font-semibold text-neutral-100">Recording</h2>
-        <StatusBadge state={recordingState} paused={paused} />
+        <StatusBadge state={recordingState} paused={paused} llmStatus={llmStatus} />
       </div>
 
       <LevelMeter level={inputLevel} active={metering} />

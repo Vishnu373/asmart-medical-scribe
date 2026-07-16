@@ -8,6 +8,7 @@
 import { invoke } from "@tauri-apps/api/core";
 import type {
   InputDevice,
+  LlmStatus,
   ModelStatus,
   Note,
   Record,
@@ -106,6 +107,13 @@ export function getSettings(): Promise<Settings> {
 
 export function updateSettings(settings: Settings): Promise<void> {
   return invoke("update_settings", { settings });
+}
+
+/** Current note-model readiness (§8.2 startup fix). Queried once at mount to seed the
+ * UI before the async `llm-status` event arrives; `"loading"` while the co-resident
+ * preload warms the model, else `"ready"`. */
+export function getLlmStatus(): Promise<LlmStatus> {
+  return invoke<LlmStatus>("get_llm_status");
 }
 
 /** Enumerate capture devices for the mic picker (§9.3, FR-12). */

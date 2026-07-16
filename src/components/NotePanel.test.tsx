@@ -33,6 +33,7 @@ beforeEach(() => {
     currentRecordId: "r1",
     notes: [],
     streamingNote: "",
+    llmStatus: "ready",
   });
 });
 

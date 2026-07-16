@@ -111,6 +111,15 @@ export interface CorrectionSuggestion {
 export interface StateChangedEvent {
   state: AppState;
 }
+/** Note-model readiness (design §8.2 startup fix, §9.5). `loading` while the
+ * co-resident preload warms the model on a background thread; `ready` once it is
+ * loaded (or in swap mode, where it loads lazily per generation). */
+export type LlmStatus = "loading" | "ready" | "error";
+/** `llm-status` payload; `message` carries the error text when `status === "error"`. */
+export interface LlmStatusEvent {
+  status: LlmStatus;
+  message?: string;
+}
 export interface ErrorEvent {
   code: string;
   message: string;

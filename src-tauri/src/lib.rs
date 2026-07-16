@@ -22,7 +22,7 @@ mod trial;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::Manager;
+use tauri::{Emitter, Manager};
 
 use llm::{LlmEngine, LlmModel, RealCorrectionSuggester, RealNoteGenerator};
 use orchestrator::{emit_app_event, Coordinator, RealPipeline};
@@ -105,12 +105,33 @@ pub fn run() {
             );
             let swap_mode = mode == ResidencyMode::Swap;
             if !swap_mode {
-                // Co-resident: warm the model now so the first Generate is instant.
-                // A failure here (e.g. model not yet bundled) is non-fatal — the
-                // first generation retries and surfaces the error then.
-                if let Err(e) = llm_engine.ensure_loaded() {
-                    log::warn!("LLM preload failed (will retry on first generation): {e}");
-                }
+                // Co-resident: warm the model so the first Generate is instant, but
+                // do it on a background thread — the multi-GB GGUF load + warmup is
+                // seconds long and `setup` runs on the main thread before the webview
+                // paints, so warming here synchronously froze the window ("not
+                // responding") on launch (design §8.2, startup fix). The UI shows a
+                // "preparing" status until the `llm-status` event flips to `ready`.
+                // A load failure is non-fatal — the first generation retries and
+                // surfaces the error then.
+                let engine = llm_engine.clone();
+                let status_handle = app.handle().clone();
+                std::thread::spawn(move || {
+                    let _ = status_handle
+                        .emit("llm-status", serde_json::json!({ "status": "loading" }));
+                    match engine.ensure_loaded() {
+                        Ok(()) => {
+                            let _ = status_handle
+                                .emit("llm-status", serde_json::json!({ "status": "ready" }));
+                        }
+                        Err(e) => {
+                            log::warn!("LLM preload failed (will retry on first generation): {e}");
+                            let _ = status_handle.emit(
+                                "llm-status",
+                                serde_json::json!({ "status": "error", "message": e.to_string() }),
+                            );
+                        }
+                    }
+                });
             }
 
             let handle = app.handle().clone();
@@ -176,6 +197,7 @@ pub fn run() {
             commands::update_note,
             commands::revert_version,
             commands::get_settings,
+            commands::get_llm_status,
             commands::update_settings,
             commands::list_input_devices,
             commands::submit_feedback,

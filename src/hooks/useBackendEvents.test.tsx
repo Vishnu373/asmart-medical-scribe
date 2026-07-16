@@ -11,6 +11,7 @@ const captured = vi.hoisted(() => {
     segment?: (p: { seq: number; text: string }) => void;
     token?: (p: { text: string }) => void;
     suggestion?: (p: { original: string; replacement: string }) => void;
+    llmStatus?: (p: { status: string; message?: string }) => void;
     error?: (p: { code: string; message: string }) => void;
   };
 });
@@ -36,6 +37,10 @@ vi.mock("@/bridge", () => ({
     captured.suggestion = h;
     return Promise.resolve(() => {});
   },
+  onLlmStatus: (h: (p: { status: string; message?: string }) => void) => {
+    captured.llmStatus = h;
+    return Promise.resolve(() => {});
+  },
   onError: (h: (p: { code: string; message: string }) => void) => {
     captured.error = h;
     return Promise.resolve(() => {});
@@ -55,6 +60,8 @@ beforeEach(() =>
     transcript: "",
     streamingNote: "",
     suggestions: [],
+    llmStatus: "loading",
+    llmStatusLive: false,
     toasts: [],
   }),
 );
@@ -99,6 +106,21 @@ describe("useBackendEvents wires §9.5 events into the store", () => {
     expect(useAppStore.getState().suggestions).toEqual([
       { original: "tie the null", replacement: "Tylenol" },
     ]);
+  });
+
+  it("llm-status ready flips the note-model flag off loading", () => {
+    render(<Probe />);
+    act(() => captured.llmStatus!({ status: "ready" }));
+    expect(useAppStore.getState().llmStatus).toBe("ready");
+  });
+
+  it("llm-status error surfaces its message as a toast", () => {
+    render(<Probe />);
+    act(() => captured.llmStatus!({ status: "error", message: "model file missing" }));
+    expect(useAppStore.getState().llmStatus).toBe("error");
+    const toasts = useAppStore.getState().toasts;
+    expect(toasts).toHaveLength(1);
+    expect(toasts[0]).toMatchObject({ kind: "error", message: "model file missing" });
   });
 
   it("error pushes a toast", () => {

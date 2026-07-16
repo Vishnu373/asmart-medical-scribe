@@ -118,11 +118,9 @@ All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or l
 
 ### Model selection — note generator (the focus of v1)
 
-- **Runtime:** `llama.cpp` (GGUF), CPU inference, 4-bit quantization (Q4_K_M) to fit memory and hit latency.
-- **Default model:** **Mistral-7B-Instruct v0.3** — Apache-2.0, heavy, best note generation.
-- **Alternate model 1:** **Phi3.5 Q_8** — MIT, lighter, decent note generation.
-- **Alternate model 2:** **Phi3.5 Q_4** — MIT, lightest, okayish note generation.
-- **Swappable interface:** the note generator sits behind an internal `generate_note(transcript, language) -> SOAP-R` interface so the model can be upgraded or A/B-tested without touching the rest of the app (NFR-14).
+- **Runtime:** `llama.cpp` (GGUF), CPU inference, 4-bit quantization to fit memory and hit latency.
+- **Single model (v0.1.2):** **`gemma-4-E2B-it-UD-Q4_K_XL`** — one note-generation model for every device. The multi-tier scheme (Mistral-7B / Phi-3.5 Q8 / Phi-3.5 Q4, chosen by RAM) is **retired**: a single small, capable model removes the RAM-keyed branching, the doctor-facing model picker, and the on-demand tier downloads. On upgrade the app deletes the old tier weights (§8.2).
+- **Swappable interface:** the note generator still sits behind an internal `generate_note(transcript) -> SOAP-R` interface so the model can be upgraded without touching the rest of the app (NFR-14). What changed in v0.1.2 is that there is exactly **one** model behind that interface, not a user-selectable set.
 
 ---
 
@@ -437,11 +435,11 @@ We compute a combined footprint:
 
 ```
 footprint = STT model size
-          + selected LLM quantized size      (supplied by the model-choice design; not assumed here)
+          + LLM quantized size                (the single note-generation model, §8.2)
           + headroom for app + webview + OS   (~2–3 GB)
 ```
 
-The LLM size is a **parameter** read from the chosen note-generation model, not a value baked into this strategy — so the logic holds regardless of which model and quantization are selected.
+The LLM size is still a **parameter** read from the note-generation model rather than a value baked into this strategy. As of v0.1.2 there is one model (§8.2), so this parameter is a single constant instead of a RAM-keyed choice — but the residency logic is unchanged: co-resident vs swap is still decided on total RAM against this footprint. Because the constant changed with the model swap, the cached decision's `residency_calc_version` is bumped so every device re-decides on the new footprint rather than trusting a stale cache.
 
 ### The two modes
 
@@ -493,28 +491,35 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 ### 8.2 Model & runtime
 
-**Model selection.** All candidates were evaluated for raw note quality and judged acceptable, so selection is purely a fit-to-machine policy keyed on total RAM. This decision is made at the **same one-time startup probe** that drives the residency strategy (§7): the probe reads total RAM, this rule picks the model, and §7 then feeds the chosen model's size into its footprint calculation to decide co-resident vs swap.
+**Model selection (v0.1.2 — single model).** There is **one** note-generation model, `gemma-4-E2B-it-UD-Q4_K_XL`, used on every device. Prior versions picked one of three tiers by total RAM and let the doctor override it; that whole scheme is retired. The model is small and capable enough that a fit-to-machine choice is no longer worth its complexity, so:
 
-| Detected total RAM | Model | Default quant | User override |
-|--------------------|-------|---------------|---------------|
-| **≥ 16 GB** | Mistral-7B-Instruct-v0.3 (Apache-2.0) | Q4_K_M (~4.4 GB) | — |
-| **< 16 GB** | Phi-3.5-mini-instruct (MIT) | **Q8_0** (~4.0 GB) | switch to **Q4_K_M** (~2.3 GB) if generation feels slow |
+- there is **no `model_choice` setting** and **no model picker** in Settings (§9.3);
+- there are **no on-demand tier downloads** — Setup fetches exactly one LLM;
+- the §7 residency probe still reads total RAM and still decides co-resident vs swap, but it feeds a **single fixed** LLM footprint into that calculation instead of a RAM-keyed one.
 
-**Execution model.** The selected GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6).
+| Model | Quant | Approx. resident footprint |
+|-------|-------|----------------------------|
+| `gemma-4-E2B-it-UD-Q4_K_XL` | Q4_K_XL (Unsloth dynamic) | *set at implementation from the shipped GGUF; validate in benchmarking* |
 
-**Model distribution & first-run setup.** The installer ships **no** model weights — it carries only the application (and the small VAD model), keeping the download lean. The models the app needs are fetched **once, on first launch**, through a one-time **Setup** step, then cached on disk and reused every launch — fully offline thereafter (matching the STT lifecycle in §6.4, "downloaded once on first selection and cached"). Setup downloads exactly the models this machine requires: the **RAM-fit note-generation model** chosen by the rule above and the **Parakeet STT model**. Beyond that required pair, the other note-generation tiers remain available as on-demand downloads from Settings, so the clinician can switch model later.
+**Execution model.** The GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6).
+
+**Model distribution & first-run setup.** The installer ships **no** model weights — it carries only the application (and the small VAD model), keeping the download lean. The models the app needs are fetched **once, on first launch**, through a one-time **Setup** step, then cached on disk and reused every launch — fully offline thereafter (matching the STT lifecycle in §6.4). Setup now downloads exactly two files: the **single Gemma note model** and the **Parakeet STT model**. There is no longer any "download another tier later" affordance.
 
 - **Gated until ready.** On launch the app checks whether the required models are present; if not, it shows the Setup screen and does not proceed into recording/generation until both are downloaded and verified. Once present, Setup is skipped entirely.
-- **Integrity-checked.** Each download is verified against a known checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
-- **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function (§4 deployment model 1).
+- **Integrity-checked.** Each download is verified against a known SHA-256 checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
+- **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function.
 
-**Tuning notes (recorded, set at implementation via benchmarking — not architectural decisions):**
+**Upgrade migration — delete the retired tier weights.** A device upgrading from a prior version still has the old GGUFs (`Mistral-7B-Instruct-v0.3-Q4_K_M.gguf`, `phi-3.5-mini-instruct-Q8_0-worthdoing.gguf`, `phi-3.5-mini-instruct-Q4_K_M-worthdoing.gguf`) in its app-data models dir — several GB that will never be loaded again. On first launch of v0.1.2 the app **deletes any of these that exist** from the writable models dir (the bundled resource dir is read-only and carries none), reclaiming the disk. The deletion is best-effort and idempotent: a missing file is a no-op, a failed unlink is logged and does not block startup.
 
-- **Thread count** — scaled to the machine's physical core count.
-- **Context window** — capped to a working size covering the longest realistic transcript + prompt + generated note, to avoid reserving RAM the §7 budget needs.
+**Startup model load is non-blocking (v0.1.2 "not responding" fix).** In co-resident mode the model was previously loaded **synchronously inside the Tauri `setup` hook**, which runs on the main thread before the webview can paint — so a multi-GB GGUF load plus warmup left the window unresponsive ("not responding") for the whole load on every launch. In v0.1.2 the app **finishes starting first**: `setup` returns immediately and the window paints, and the co-resident preload (model load + prefix warmup, §8.6) runs on a **background thread**. The UI reflects load state via an `llm-status` event (`loading` → `ready`, or `error`; §9.5) so a status indicator can read "Preparing note model…" while it loads and enable Generate when ready. Swap mode is unaffected — it already loaded lazily per generation. A concurrent-load guard serializes the background preload against a Generate that arrives before it finishes, so the model is loaded at most once.
+
+**Tuning notes:**
+
+- **Thread count (decode-phase only).** At startup the app reads the machine's **physical** core count and sets the decode thread count to `physical_cores // 2` (floor, minimum 1). This is applied **only to the decode/generation phase** (`n_threads`); the **prefill/prompt phase is left at the llama.cpp default** (`n_threads_batch` untouched). Rationale: token-by-token decode is memory-bandwidth-bound and stops scaling — often regresses — past a fraction of the cores, while prefill is compute-bound and still benefits from the full set, so the two phases are tuned independently.
+- **Context window.** `n_ctx = 8192` — covers the fixed prompt prefix (system + few-shot examples, §8.3) plus the longest realistic transcript plus the generated note, while staying well under the model maximum and not reserving RAM the §7 budget needs.
+- **Max output tokens.** `max_output_tokens = 1536` — the ceiling for one generation. Note (§8.3): with chain-of-thought this budget must cover the model's reasoning **and** the note; the few-shot examples model brief reasoning to keep the note within budget (validate in benchmarking).
 - **Sampling** — low temperature for near-deterministic, low-hallucination clinical output (finalized alongside the prompt in §8.3).
-- **Memory levers** — mmap vs full load, and KV-cache precision, available as RAM/latency trade-offs during tuning.
-- **Prompt caching (fixed prefix reuse).** The system prompt + one-shot example (§8.3) are byte-identical every generation; ordering them ahead of the transcript lets their KV cache be prefilled once and reused across notes instead of re-read each time. Full design in **§8.6**.
+- **Prompt caching (fixed prefix reuse).** The system prompt + few-shot examples (§8.3) are byte-identical every generation; ordering them ahead of the transcript lets their KV cache be prefilled once and reused across notes instead of re-read each time. Full design in **§8.6**.
 
 ### 8.3 Prompt & output structure
 
@@ -537,8 +542,11 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 **Empty sections.** A section the transcript has no material for is written as **"Not discussed"**.
 
-**Prompting approach — one-shot.** The prompt carries **one worked example** (a raw, messy consult transcript and its ideal bulleted SOAP-R note). This locks structure and style far more reliably than instructions alone.
-- **Few-shot** (a handful of examples) remains a deferred lever if one example proves insufficient. The one-shot example is a **fixed prefix**, prompt-cached (§8.2) so it adds negligible per-note latency.
+**Prompting approach — few-shot + chain-of-thought (v0.1.2).** The prompt carries **several worked examples** (raw, messy consult transcripts paired with their ideal bulleted SOAP-R notes) and instructs the model to **reason before writing** — briefly work through what belongs in each section, then emit the note. Few-shot locks structure and style more reliably than a single example, and the chain-of-thought step improves per-section placement and the anti-fabrication discipline (§8.3 safety rules) on messy transcripts. The exact system prompt and examples are a **fixed, supplied artifact** (provided at implementation) — this section fixes the *contract* around it, not its wording.
+
+- **Reasoning is never part of the note.** The model's chain-of-thought is an intermediate, not clinical output: it must not be persisted, and it must not be shown as if it were the note. The prompt separates reasoning from the note with a **fixed boundary** the generator keys on — either an explicit delimiter emitted by the model or the first SOAP header (`## Subjective`). The generator suppresses streaming until that boundary is reached, then streams and persists **only** the note portion (§8.5). *(The precise boundary token follows from the supplied prompt and is pinned in implementation so the parser and the prompt agree exactly.)*
+- **Output-budget interaction.** Reasoning tokens are decoded under the same `max_output_tokens = 1536` ceiling as the note (§8.2). The examples deliberately model **concise** reasoning so the note is not truncated; this is a benchmarking check, not a free lunch.
+- **Fixed prefix, prompt-cached.** The system prompt + all few-shot examples are a **fixed prefix** (identical every note), prompt-cached (§8.6) so the added length costs negligible per-note latency — it is prefilled once and its KV state reused. Only the real transcript at the tail varies.
 
 ### 8.4 Lifecycle & orchestration
 
@@ -556,12 +564,14 @@ While in GENERATING, recording is blocked and a second Generate is ignored — a
 
 | Mode | When LLM is loaded | On Generate | After generation |
 |------|--------------------|-------------|------------------|
-| **Co-resident** | At startup, alongside STT; stays resident | Already in RAM — generation starts immediately | Stays resident |
+| **Co-resident** | Shortly after startup, on a **background thread** (not blocking the UI); stays resident | Already in RAM (or the UI waited on the `ready` status) — generation starts immediately | Stays resident |
 | **Swap** | Lazily, per generation | Unload STT → load LLM → generate | Unload LLM → reload STT for the next recording |
 
-In swap mode the load/unload is the RAM cost of running on a tight machine; in co-resident mode that cost is paid once at startup.
+In swap mode the load/unload is the RAM cost of running on a tight machine; in co-resident mode that cost is paid once, just after startup rather than inside it.
 
-**Warmup.** The first inference after a model load is slower (cold weights, cold buffers). To keep the clinician's first real generation at full speed, a hidden warmup pass — a tiny throwaway generation, never shown — runs immediately after each load: at startup in co-resident mode, and right after the swap-load in swap mode.
+**Startup load runs off the UI thread (v0.1.2).** The co-resident preload must not run inside the Tauri `setup` hook — that blocks the main thread and leaves the window "not responding" for the whole multi-GB load (§8.2). Instead `setup` returns immediately, the window paints, and the preload runs on a background thread that emits `llm-status` (`loading` → `ready` / `error`, §9.5). A concurrent-load guard makes a Generate arriving mid-preload wait on the same load rather than starting a second one.
+
+**Warmup.** The first inference after a model load is slower (cold weights, cold buffers). To keep the clinician's first real generation at full speed, a warmup pass runs immediately after each load — in co-resident mode this is the same background-thread step that primes the prompt-prefix KV cache (§8.6); in swap mode it runs right after the swap-load.
 
 **Cancellation.** A Cancel control stops generation mid-stream (via the decode loop's stop hook). On cancel, the partial note is **discarded** and the screen returns to its pre-Generate state; the transcript is untouched. Streamed output (below) keeps this responsive — the user sees tokens appear, so a cancel feels immediate.
 
@@ -574,6 +584,8 @@ In swap mode the load/unload is the RAM cost of running on a tight machine; in c
 This section covers how the streamed note reaches the screen and how it is stored durably and encrypted at rest.
 
 **Streaming render.** The backend emits generated tokens as events to the frontend (§8.4); the frontend appends them to a buffer as they arrive. During the stream the buffer is shown as **raw text**; once generation completes, the final markdown is **rendered once** as the formatted document (§8.3). Live-rendering half-formed markdown — a `##` header with no body yet, an unclosed `**` — flickers and looks broken, so rendering is deferred to completion while the raw stream still gives the clinician immediate feedback.
+
+**Reasoning is withheld from the stream (v0.1.2).** With chain-of-thought (§8.3) the model emits reasoning before the note. The generator does not forward those tokens: it withholds streaming until the reasoning→note boundary, then streams only the note. So both the streamed buffer and the persisted note contain the note alone — the clinician never sees the chain-of-thought, and it is never written to the encrypted store.
 
 **Storage engine.** All clinical data is held in a single **SQLite database encrypted with SQLCipher**, so the note, its versions, and the transcript are encrypted at rest and never leave the device. Application settings remain in the separate plain JSON store (no PHI), as decided for Phase 1.
 
@@ -595,7 +607,7 @@ This section covers how the streamed note reaches the screen and how it is store
 
 ### 8.6 Prompt-prefix caching (KV-cache reuse)
 
-The one-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of every generation: the system instruction plus the worked example. Only the transcript at the tail changes. 
+The few-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of every generation: the system instruction plus the worked examples. Only the transcript at the tail changes. (The prefix is larger in v0.1.2 — several examples plus their reasoning — which makes the one-time prefill more expensive and the KV reuse more valuable.)
 
 **What is being cached.** When the model reads tokens it produces per-token intermediate state (the attention **KV cache**) that generation then reads from. The prefix's KV entries depend only on the prefix tokens, so once computed they are valid for *any* transcript that follows — provided the prefix tokens are unchanged and sit at the same positions. That is the whole reason §8.3 orders the prompt `[system + example] → [transcript] → [assistant]`: **only the run of tokens before the first differing token is reusable**, so the fixed part must come first.
 
@@ -607,7 +619,7 @@ The one-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 
 **Correctness invariants.**
 
-- **Prefix must be truly fixed.** If anything in the prefix changes, the snapshot is stale and must be rebuilt. The triggers are: a **model change** (Settings switches tier → different tokenizer/template, §8.2) and any **prompt edit** (system prompt or example). On either, the snapshot is dropped with the model (`unload`) and re-primed on the next load. The saved-prefix-tokens check also prevents restoring one model's state under another.
+- **Prefix must be truly fixed.** If anything in the prefix changes, the snapshot is stale and must be rebuilt. With a single model (§8.2) the old **model-change** trigger is gone; the remaining trigger is a **prompt edit** (system prompt or examples) shipped in a new build, which changes the prefix tokens. The saved-prefix-tokens check catches any mismatch and falls back to a full decode, so a build whose prompt changed can never restore a stale snapshot.
 - **No accumulation.** Because every note uses a fresh context, transcript+note tokens never persist across notes, so nothing can accumulate toward the context window (§8.2) — the property the persistent-context alternative would have needed an explicit KV trim to hold.
 - **Single-flight.** Generation is already serialized behind the model lock (§8.4); the snapshot is guarded the same way, so two notes never share/mutate it concurrently.
 
@@ -660,9 +672,11 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 
 | Key | Surfaced? | Meaning |
 |-----|-----------|---------|
-| `model_choice` | **Doctor** | `best` (Mistral-7B) / `medium` (Phi-3.5 Q8) / `okay` (Phi-3.5 Q4); options the machine can't run are greyed out (§7) |
 | `mic_device` | **Doctor** | Selected input device |
+| `residency_override` | **Doctor** | Manual co-resident/swap force; empty = automatic (§7) |
 | `residency_mode` | internal | Co-resident vs swap, decided once (§7) |
+
+> `model_choice` was removed in v0.1.2 — there is a single note model (§8.2), so there is no model picker. An old settings file's `model_choice` key is ignored on load.
 
 **`Internal settings`**
 
@@ -693,6 +707,7 @@ The backend owns all state; commands are requests, and state guards reject illeg
 | `input-level` | `{ level }` | Live mic-level meter (FR-12) |
 | `generation-token` | `{ text }` | Streaming note tokens during GENERATING (§8.5) |
 | `state-changed` | `{ state }` | IDLE / RECORDING / PROCESSING / GENERATING transitions; GENERATING→IDLE signals the note is done and the UI loads the active note |
+| `llm-status` | `{ status, message? }` | Note-model load lifecycle: `loading` when the background preload starts, `ready` when warm, `error` on load failure (§8.2/§8.4). Drives the "Preparing note model…" indicator |
 | `error` | `{ code, message }` | Recoverable failures (e.g. RAM guard trips, §8.4) |
 
 ## 10. Security & Compliance

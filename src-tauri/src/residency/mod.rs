@@ -129,6 +129,29 @@ pub fn resolve(settings: &mut Settings, total_ram: u64) -> (ResidencyMode, bool)
     (mode, true)
 }
 
+/// The effective residency mode from the persisted settings alone, honoring the
+/// same precedence [`resolve`] uses — a manual override wins, else the cached
+/// automatic decision — but **without** a RAM probe or any mutation. For read-only
+/// callers (e.g. the `get_llm_status` command) that only need the current mode, not
+/// to (re)decide it. `None` when neither field holds a recognized value, i.e. the
+/// mode has not been decided yet.
+///
+/// This is the single source of truth for that precedence: reading `residency_mode`
+/// directly is wrong, because the override path returns early from `resolve` and
+/// never writes `residency_mode` (a swap-by-override device leaves it `None`).
+pub fn effective_mode(settings: &Settings) -> Option<ResidencyMode> {
+    settings
+        .residency_override
+        .as_deref()
+        .and_then(ResidencyMode::from_str)
+        .or_else(|| {
+            settings
+                .residency_mode
+                .as_deref()
+                .and_then(ResidencyMode::from_str)
+        })
+}
+
 /// Read the machine's total physical RAM in bytes. Stable per-device, so reading
 /// it each launch only validates the cache (§7 "re-probe only if total RAM
 /// changes"); we deliberately never sample momentary *available* RAM.
@@ -190,6 +213,29 @@ mod tests {
         let (second, changed) = resolve(&mut s, 32 * GIB);
         assert_eq!(first, second);
         assert!(!changed);
+    }
+
+    #[test]
+    fn effective_mode_honors_override_without_a_written_residency_mode() {
+        // The bug this guards: a swap override leaves `residency_mode` unset (resolve
+        // returns early), so reading it raw reports the wrong mode. `effective_mode`
+        // must see the override.
+        let mut s = Settings::default();
+        s.residency_override = Some("swap".to_string());
+        assert_eq!(s.residency_mode, None);
+        assert_eq!(effective_mode(&s), Some(ResidencyMode::Swap));
+
+        // Override wins even over a conflicting cached decision.
+        let mut s = Settings::default();
+        s.residency_override = Some("swap".to_string());
+        s.residency_mode = Some("co_resident".to_string());
+        assert_eq!(effective_mode(&s), Some(ResidencyMode::Swap));
+
+        // No override → the cached decision; none cached → None (undecided).
+        let mut s = Settings::default();
+        s.residency_mode = Some("co_resident".to_string());
+        assert_eq!(effective_mode(&s), Some(ResidencyMode::CoResident));
+        assert_eq!(effective_mode(&Settings::default()), None);
     }
 
     #[test]

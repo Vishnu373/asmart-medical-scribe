@@ -12,6 +12,11 @@ describe("app store slices", () => {
     expect(s.segments).toEqual([]);
     expect(s.records).toEqual([]);
     expect(s.settings).toBeNull();
+    // Safe default: gate Generate + show the "preparing" hint until the mount seed
+    // reports the true state, so a co-resident cold start can't be clicked into a
+    // blocking load (§8.2 startup fix).
+    expect(s.llmStatus).toBe("loading");
+    expect(s.llmStatusLive).toBe(false);
   });
 
   it("setters update their slice", () => {
@@ -53,6 +58,20 @@ describe("notes slice", () => {
     appendStreamingToken("## Sub");
     appendStreamingToken("jective");
     expect(useAppStore.getState().streamingNote).toBe("## Subjective");
+  });
+
+  it("seedLlmStatus applies before the live event has arrived", () => {
+    useAppStore.getState().seedLlmStatus("loading");
+    expect(useAppStore.getState().llmStatus).toBe("loading");
+  });
+
+  it("a late seed cannot clobber a status the live event already advanced", () => {
+    // The mount query races the `llm-status` event: a fast preload delivers `ready`
+    // first, then the stale `getLlmStatus()` promise resolves with `loading`. The
+    // seed must be ignored so Generate isn't stuck disabled for the session.
+    useAppStore.getState().setLlmStatus("ready");
+    useAppStore.getState().seedLlmStatus("loading");
+    expect(useAppStore.getState().llmStatus).toBe("ready");
   });
 });
 

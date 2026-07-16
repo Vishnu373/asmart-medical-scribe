@@ -24,13 +24,19 @@ export default function NotePanel() {
   const setStreamingNote = useAppStore((s) => s.setStreamingNote);
   const pushToast = useAppStore((s) => s.pushToast);
 
+  const llmStatus = useAppStore((s) => s.llmStatus);
+
   const generating = recordingState === "GENERATING";
   // Hold Generate until the §6.7 correction pass has ended (streamed/cancelled/
   // failed) — the machine leaves CORRECTING back to IDLE — preserving the
   // "sequenced, never concurrent" invariant on the UI side too.
   const correcting = recordingState === "CORRECTING";
   const active = notes.find((n) => n.is_active) ?? notes[0] ?? null;
-  const ready = recordId !== null && !generating && !correcting;
+  // Also hold while the co-resident preload is still warming the model (§8.2 startup
+  // fix); an `error` status leaves Generate enabled so the first attempt retries and
+  // surfaces the load error itself.
+  const modelWarming = llmStatus === "loading";
+  const ready = recordId !== null && !generating && !correcting && !modelWarming;
 
   const refresh = () =>
     recordId &&
@@ -79,6 +85,7 @@ export default function NotePanel() {
             type="button"
             onClick={onGenerate}
             disabled={!ready}
+            title={modelWarming ? "Preparing the note model…" : undefined}
             className="rounded-md bg-teal-600 px-3 py-1.5 text-sm font-medium hover:bg-teal-500 disabled:opacity-40"
           >
             {active ? "Regenerate" : "Generate note"}

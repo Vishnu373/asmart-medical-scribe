@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { ping, setupStatus, trialStatus } from "@/bridge";
+import { getLlmStatus, ping, setupStatus, trialStatus } from "@/bridge";
 import { useAppStore } from "@/state";
 import { useBackendEvents } from "@/hooks/useBackendEvents";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
@@ -33,6 +33,9 @@ function App() {
   // First-run gate (D3): `null` while checking, `false` until the required models
   // are downloaded (show Setup), `true` once the app can run.
   const [setupReady, setSetupReady] = useState<boolean | null>(null);
+  // Note-model readiness (§8.2 startup fix): seeded here at mount; surfaced in the
+  // recording-view StatusBadge (Idle → Loading → Ready).
+  const seedLlmStatus = useAppStore((s) => s.seedLlmStatus);
 
   // Wire backend → UI events (§9.5) into the store, once, at the root.
   useBackendEvents();
@@ -61,6 +64,17 @@ function App() {
       .then((s) => setSetupReady(s.ready))
       .catch(() => setSetupReady(true)); // don't hard-block if the check fails
   }, []);
+
+  // Seed the note-model status before the async `llm-status` event arrives — the
+  // co-resident preload emits `loading` before the webview has a listener, so this
+  // mount query is how the UI learns the model is still warming (§8.2 startup fix).
+  useEffect(() => {
+    getLlmStatus()
+      .then(seedLlmStatus)
+      // The default is the safe "loading"; if the command is somehow unavailable,
+      // clear the hint to "ready" rather than stranding Generate disabled.
+      .catch(() => seedLlmStatus("ready"));
+  }, [seedLlmStatus]);
 
   if (trial === null || setupReady === null) {
     return <div className="h-screen bg-neutral-950" aria-label="loading" />;

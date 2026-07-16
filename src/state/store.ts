@@ -10,6 +10,7 @@ import type { Update } from "@tauri-apps/plugin-updater";
 import type {
   AppState,
   CorrectionSuggestion,
+  LlmStatus,
   Note,
   RecordSummary,
   Settings,
@@ -75,10 +76,33 @@ interface NotesSlice {
   notes: Note[];
   /** Tokens accumulated during GENERATING (§8.5). */
   streamingNote: string;
+  /**
+   * Note-model readiness (§8.2 startup fix). Drives the header "preparing" hint
+   * and gates Generate while the co-resident preload warms the model on a
+   * background thread. Seeded by `getLlmStatus()` at mount, then kept live by the
+   * `llm-status` event. Defaults `"loading"` — the *safe* initial state: it gates
+   * Generate (no click can trigger a blocking load) and shows the hint until the
+   * mount seed reports the true state. The seed ships in the same binary so it
+   * always resolves, and its error path falls back to `"ready"`, so a co-resident
+   * cold start reads honestly while swap/loaded machines clear the hint in ms.
+   */
+  llmStatus: LlmStatus;
+  /**
+   * Whether the live `llm-status` event has set `llmStatus` yet. The mount seed
+   * ([`seedLlmStatus`]) races the event: a fast preload can deliver `ready`/`error`
+   * before the seed's promise resolves, so the seed must not clobber an
+   * already-advanced status back to a stale `loading`. Once this is set, the seed
+   * is ignored.
+   */
+  llmStatusLive: boolean;
   setNotes: (notes: Note[]) => void;
   setStreamingNote: (text: string) => void;
   /** Append a streamed `generation-token` to the live note (§9.5). */
   appendStreamingToken: (text: string) => void;
+  /** Apply a live `llm-status` event; authoritative, and locks out later seeds. */
+  setLlmStatus: (status: LlmStatus) => void;
+  /** Apply the mount-query seed, but only until the live event has taken over. */
+  seedLlmStatus: (status: LlmStatus) => void;
 }
 
 interface RecordsSlice {
@@ -182,9 +206,15 @@ export const useAppStore = create<AppStore>((set) => ({
   // Notes
   notes: [],
   streamingNote: "",
+  llmStatus: "loading",
+  llmStatusLive: false,
   setNotes: (notes) => set({ notes }),
   setStreamingNote: (streamingNote) => set({ streamingNote }),
   appendStreamingToken: (text) => set((s) => ({ streamingNote: s.streamingNote + text })),
+  setLlmStatus: (llmStatus) => set({ llmStatus, llmStatusLive: true }),
+  // Ignore a seed once the live event has advanced the status (avoids a slow mount
+  // query clobbering a newer `ready`/`error` back to a stale `loading`).
+  seedLlmStatus: (llmStatus) => set((s) => (s.llmStatusLive ? s : { llmStatus })),
 
   // Records
   records: [],
