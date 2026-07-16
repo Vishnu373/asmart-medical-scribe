@@ -227,7 +227,7 @@ sequenceDiagram
 
 ## 6. Speech-to-Text Pipeline
 
-This section details the on-device speech-to-text (STT) subsystem — the path from raw microphone input to editable transcript text. It is implemented in the **Rust backend** of the Tauri application and runs entirely locally. The pipeline is described as a sequence of discrete stages; this subsection covers the first.
+This section details the on-device speech-to-text (STT) subsystem — the path from raw microphone input to editable transcript text. It is implemented in the **Rust backend** of the Tauri application and runs entirely locally. The pipeline is described as a sequence of discrete stages.
 
 ### 6.1 Audio capture
 
@@ -237,22 +237,13 @@ The capture stage turns live microphone input into a clean, uniform audio signal
 
 - **Dedicated capture thread.** Audio capture runs on its own thread inside the app process (not a separate process), parallel to the UI. Its single job is to pull audio frames from the microphone as they arrive and forward them downstream over a thread-safe channel (mpsc). Isolating capture on its own thread guarantees that UI work (rendering, button clicks) can never stall capture and cause dropped audio. The thread is active for the duration of a recording and parked when idle.
 - **Cross-platform audio I/O via `cpal`.** The app opens the OS default or a user-selected input device and reads its **native format** — whatever sample type (e.g. `u8`, `i16`, `f32`), sample rate, and channel count the hardware happens to provide.
-- **Normalize to a uniform signal.** Every captured sample is converted to **32-bit float (`f32`)**, and the stream is **resampled to 16 kHz mono** (via `rubato`). This is the canonical input format STT models expect:
+- **Normalize to a uniform signal.** Every captured sample is converted to **32-bit float (`f32`)**, and the stream is **resampled to 16 kHz mono** (via `rubato`).
   - *`f32`* — one uniform numeric format downstream, normalized to the −1.0…+1.0 range, avoiding precision loss in subsequent math.
   - *16 kHz* — human speech information lives below ~8 kHz; by the Nyquist limit, 16 kHz sampling captures all of it. Higher rates (44.1/48 kHz) only add data the model doesn't need, increasing compute for no accuracy gain. 16 kHz is the minimum rate that fully preserves speech.
   - *mono* — a single combined channel; stereo is redundant for transcribing speech and doubles the data.
 
   Normalization changes only the *format/resolution* of the audio, never its content — all sounds (voices, noise, silence) are still present, just represented efficiently.
-- **Live input-level feedback.** A lightweight tap on the capture stream computes the current input amplitude and pushes it to the UI to drive a live waveform / volume meter. This is purely UX — it lets the clinician confirm the microphone is live and picking up sound **before** committing a full visit to recording (supports FR-12). It has no effect on transcription accuracy.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Microphone selection | User selects the input device from a list; OS default if none chosen | Clinics vary in mic setup; satisfies FR-12 |
-| Live level meter | Included | Confidence the mic is working before/at recording (FR-12) |
-| Capture format | 16 kHz, mono, `f32` | Required STT model input; minimum representation that preserves all speech (NFR-1 latency, NFR-5 memory) |
-| Concurrency | Capture on a dedicated thread, decoupled from UI via a channel | Real-time audio must never be blocked by UI work; no dropped samples |
+- **Live input-level feedback.** A lightweight tap on the capture stream computes the current input amplitude and pushes it to the UI to drive a live waveform / volume meter. This is purely UX — it lets the clinician confirm the microphone is live and picking up sound **before** committing a full visit to recording (supports FR-12).
 
 ### 6.2 Voice activity detection (VAD)
 
@@ -268,15 +259,6 @@ The VAD stage consumes the clean 16 kHz stream from §6.1 and classifies it, fra
   - **Prefill (pre-roll)** — buffers the few frames immediately *before* onset fired and prepends them to the segment, so the leading syllable of the first word isn't clipped.
 - **Clinical tuning bias.** Defaults lean toward a **longer hangover**: clinicians and patients pause mid-thought, and the system should prefer keeping an utterance whole over fragmenting it. Exact onset/hangover/prefill/threshold values are set during benchmarking against real clinical audio.
 
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Detection method | Neural VAD (Silero), not energy threshold | Robust to exam-room background noise; catches soft speech |
-| Smoothing | Onset + hangover + prefill smoothing layer | Avoids clipped words and over-fragmented segments |
-| Tuning bias | Longer hangover for clinical speech | Natural pauses shouldn't split an utterance; keep segments whole |
-| Threshold | Configurable, default ~0.5 | Adapt to noisy rooms without code changes |
-
 > Note: the hangover/sustained-silence duration that closes a segment is the same signal that defines a **segment boundary**, which is the transcription trigger detailed in §6.3.
 
 ### 6.3 Segment buffering & transcription trigger
@@ -289,7 +271,13 @@ This stage answers: **when is audio handed to the STT model, and how often?** Th
 
 - **Accumulate the current segment.** Speech frames passed by VAD append to a current-segment buffer; silence/noise frames are dropped.
 - **Close & flush on a pause boundary.** When VAD reports sustained silence (hangover expires), the current segment is complete: its audio is flushed as one finished segment, the buffer is cleared, and accumulation resumes for the next segment.
-- **Decoupled threads via a queue.** The capture (audio) thread never runs the model. A finished segment is pushed onto a thread-safe queue (mpsc channel); the capture thread immediately resumes listening. A separate **transcription worker thread** pulls segments from the queue and runs STT (model kept warm — §6.4). This decoupling guarantees that a slow transcription can never stall capture or drop audio (NFR-1). Mental model: **audio thread = ears (always listening), transcription thread = hands (typing it out), queue = conveyor belt between them.**
+- **Decoupled threads via a queue.** The capture (audio) thread never runs the model. A finished segment is pushed onto a thread-safe queue (mpsc channel); the capture thread immediately resumes listening. A separate **transcription worker thread** pulls segments from the queue and runs STT (model kept warm — §6.4). This decoupling guarantees that a slow transcription can never stall capture or drop audio (NFR-1).
+
+- Mental model: 
+    - audio thread = ears (always listening)
+    - transcription thread = hands (typing it out)
+    - queue = conveyor belt between them.
+
 - **Ordered assembly.** Because transcription is asynchronous, each segment carries a **sequence number** so the UI appends results in spoken order (FR-2/FR-3), regardless of completion timing.
 - **Tail flush on Stop.** On Stop, any still-open segment is force-flushed so the final words are transcribed and not lost.
 
@@ -301,15 +289,6 @@ This stage answers: **when is audio handed to the STT model, and how often?** Th
 | **Min-segment floor** | Tiny blips create useless sub-second fragments | VAD onset filters most; additionally discard segments below a minimum length |
 
 **Trade-off accepted:** transcribing per-segment gives live feedback but means the model sees one utterance at a time and loses cross-segment conversational context. For the Parakeet model this is a minor accuracy cost, accepted in exchange for the live incremental UX that FR-2 requires.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Transcription trigger | Per-segment at each VAD pause boundary (not at Stop) | Core of FR-2 incremental, live transcription |
-| Long-monologue handling | Max-segment cap force-flush (≈20–30 s) | Keeps latency and memory bounded when speakers don't pause |
-| Concurrency | Capture and transcription on separate threads, segments passed through an ordered (sequence-numbered) queue | Capture never blocks on the model; segments appended in spoken order |
-| End of recording | Flush the open segment on Stop | Final words are never lost |
 
 ```mermaid
 flowchart LR
@@ -354,18 +333,6 @@ Models are downloaded once on first selection and cached on disk thereafter.
 - **Reloads are cheap.** After a model has been loaded once, the OS keeps its file pages in the disk cache, so a reload shortly after (e.g. the next patient) is near-instant — it reads from RAM-cached pages rather than the SSD. Only sustained idleness incurs a full disk read again.
 - **Safe concurrency.** The resident model is guarded so a Record action and an idle-unload cannot collide; loading is coordinated so two triggers can't load it twice.
 
-**Memory-budget hook (phase two).** Because the STT model can be deliberately unloaded, it need not coexist in RAM with the future note-generation model. The lifecycle is designed so that, in phase two, STT is unloaded on Stop to make room for the note generator, keeping total peak memory under the 12 GB budget (NFR-5). In phase one (STT only), unload is purely timeout-driven.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Model residency | Kept warm in RAM across all segments of a visit | No per-segment reload; drives NFR-1 latency |
-| Load timing | Background preload right after app open | App ready instantly (NFR-13) *and* first Record feels instant; disk read hidden |
-| Idle release | Watcher thread unloads after a configurable idle timeout | Frees RAM between patients (NFR-5); never unloads mid-recording |
-| Engine | Single Parakeet V3 engine behind a swappable `transcribe(audio) -> text` interface | One vetted engine for v1; interface keeps a future alternate model pluggable without touching the pipeline (NFR-14) |
-| Phase-two readiness | Lifecycle supports unload-on-Stop to hand memory to a future note generator | Keeps peak under 12 GB when both models exist |
-
 ### 6.5 Transcript assembly & delivery to UI
 
 This stage answers: **how does a finished segment reach the screen — live, in order, without clobbering edits the clinician has already made?** (FR-2 live transcription, FR-3 editable transcript.)
@@ -381,23 +348,12 @@ Worker thread (Rust) ── emit("transcript-segment", {seq, text}) ──► Re
 **Ordered append.** Because segments finish asynchronously (a short utterance can transcribe before an earlier long one), each carries the **sequence number** assigned in §6.3. The UI maintains an ordered-by-sequence list and places each segment at its correct position, so the displayed order always matches the spoken order regardless of completion timing. Each segment is delivered **once, already final** — there is no mid-segment partial/streaming text, which avoids flicker at the cost of one-utterance (rather than word-by-word) granularity.
 
 **Edit preservation (FR-3) — append-only backend, frontend owns the document.** The clinician can edit the transcript while recording continues (correcting a drug name, a dosage). The rule that protects those edits:
-
 - New segments are **only ever appended at the tail**; the backend never rewrites or re-inserts into already-delivered text.
 - Once a segment is in the editor, it belongs to the **frontend's editable document**, which is the source of truth — the backend has no channel to mutate prior lines.
 - Consequently an edit to an earlier segment is untouched when a later segment arrives; they are disjoint regions and the backend writes only to the growing tail.
 - The full transcript is therefore **never re-sent** (which would wipe edits) — only incremental appends are emitted.
 
 **Backend copy is backup only.** The backend may retain a raw transcript copy purely for crash-recovery / autosave, but that is a backup — not the artifact the UI mirrors. The editable truth lives in the frontend.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Delivery | Tauri event emit (Rust) → listener (React); backend announces, never renders | Decoupled, non-blocking; backend can't overwrite the UI |
-| Ordering | UI keeps an ordered-by-sequence list; insert each segment at its position | Spoken order preserved despite async completion (FR-2) |
-| Edit safety | Append-only backend; frontend editor owns the document | Clinician edits are never clobbered by later segments (FR-3) |
-| Granularity | Each segment delivered once, already final — no mid-segment partials | Simpler, no flicker; one-utterance granularity accepted |
-| Persistence | Backend keeps a raw copy for crash-recovery only, not as UI source | Resilience without competing with the editable document |
 
 ### 6.6 Threading & coordination (orchestration)
 
@@ -438,19 +394,9 @@ The model is **not** unloaded here in v1 — it is left warm, and the idle-watch
 
 **Clean teardown & resilience.** Threads are stopped via a signal and **joined** (or parked for reuse) and the queue is closed, so no orphaned threads survive between encounters. If a thread **panics** (e.g. a model error), the coordinator catches it, surfaces an error to the UI, and returns the machine to a safe **IDLE** rather than wedging.
 
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| State ownership | Backend coordinator owns Idle/Recording/Processing; UI only requests transitions | Single source of truth for lifecycle; UI can't desync the backend |
-| Transition safety | State guards reject illegal/duplicate transitions | Robust against double-clicks and hotkey spam |
-| Stop semantics | Stop capture → tail-flush → drain queue → Idle | Guarantees no in-flight audio is lost |
-| Model on Stop | Stays warm; idle-watcher unloads later; PROCESSING is the phase-two LLM hook | Fast re-record between patients; clean seam for note generation |
-| Failure handling | Panic in any thread → coordinator recovers to Idle + surfaces error | No wedged or orphaned state |
-
 ### 6.7 Post-ASR correction suggestions
 
-This stage answers: **how do we help the clinician catch the mishearings that fuzzy word-fixing (§6.3) can't — errors that only a reader who understands the sentence would spot?** Deterministic cleanup corrects a single garbled word against a known list; it cannot repair a phrase that was transcribed as fluent-but-wrong English. A real example: *"right side, right down beforehand"* was actually *"right side of forehead"* — every word is a valid word, so only meaning reveals the error.
+This stage answers: **how do we help the clinician catch the mishearings that fuzzy word-fixing (§6.3) can't — errors that only a reader who understands the sentence would spot?** Deterministic cleanup corrects a single garbled word against a known list; it cannot repair a phrase that was transcribed as fluent-but-wrong English. 
 
 **Suggest, never rewrite.** The correction pass proposes edits; it does **not** change the transcript on its own. Each suggestion is surfaced in the UI and applied only if the clinician **accepts** it. This is the property that keeps the feature safe: the machine never silently alters what was said, so it cannot introduce a clinical fact the clinician didn't approve. It is the same anti-fabrication discipline as note generation (§8.3), enforced here by a human-in-the-loop gate rather than by a prompt alone.
 
@@ -460,9 +406,8 @@ This stage answers: **how do we help the clinician catch the mishearings that fu
 Stop ─► correction suggestions (auto) ─► clinician accepts/rejects ─► clicks Generate ─► note
 ```
 
-It runs **before**, not concurrently with, note generation. The two never execute at once, so they never contend for the CPU. The transcript stays fully editable throughout — suggestions augment the manual review, they don't replace it.
-
-**Reuses the resident model.** Correction uses the **same note-generation LLM** already governed by the residency strategy (§7) — no second model is downloaded, hosted, or kept warm. Structurally the pass mirrors note generation: a streamed inference driven by a backend command and delivered to the UI by event. The cost is one extra inference over the transcript; because it is **prefill-heavy but decode-light** (long input, short structured output), it is meaningfully cheaper than the note itself, and it overlaps the clinician's own reading, so its latency is largely hidden.
+**Reuses the resident model.** Correction uses the **same note-generation LLM** already governed by the residency strategy (§7).
+The cost is one extra inference over the transcript; because it is **prefill-heavy but decode-light** (long input, short structured output), it is meaningfully cheaper than the note itself, and it overlaps the clinician's own reading, so its latency is largely hidden.
 
 **Streamed, parse-as-you-go.** The model emits suggestions as a stream of small, independently-parseable units (one structured record per line), each naming an **original span** and its **replacement**. The UI shows each suggestion the instant its record completes, rather than waiting for the whole pass — so the first corrections appear early and perceived latency drops. Constraining the output to *replacements of spans that exist in the transcript* (not free-form text) is what keeps a "suggestion" from becoming an invention.
 
@@ -473,19 +418,6 @@ It runs **before**, not concurrently with, note generation. The two never execut
 - **Duplicate spans** — if the same original phrase occurs more than once, a suggestion applies to the **first not-yet-accepted** occurrence. (Rare; a simple, predictable rule.)
 - **No suggestions** — if the pass finds nothing, nothing pops up and Generate simply becomes available. No error, no modal.
 - **Failure/cancel** — a model error or a Cancel returns to a plain editable transcript; the feature is strictly additive and never blocks note generation.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Safety model | Suggest-and-approve; never auto-apply | Human gate prevents fabricated/altered clinical content (mirrors §8.3) |
-| Trigger | Auto on Stop, **sequenced before** Generate | Assists review without CPU contention with note generation |
-| Model | Reuse the resident note-generation LLM (§7) | No second model to source, host, download, or keep warm |
-| Delivery | Streamed, one parseable record per line, shown as each completes | Cuts perceived latency; corrections appear early |
-| Output shape | Replacement of an existing transcript span only | Constrains output so a suggestion can't become an invention |
-| Presentation | Review list beside the transcript, non-blocking, Accept/Reject in place (§11 trade-off) | Keeps transcript readable; no fragile character-offset anchoring; edit applied via existing autosave (§6.5) |
-| Duplicates | Apply to first not-yet-accepted occurrence | Simple, predictable |
-| Empty / cancel | No suggestions → silently enable Generate; Cancel → plain transcript | Strictly additive; never blocks the note path |
 
 ---
 
@@ -532,28 +464,18 @@ Because this is a per-device property, we probe **once on first run**, choose th
 
 The automatic decision is the default, but the user can force a mode in settings — e.g. force **Swap** to keep RAM free for other applications, or force **Co-resident** on a borderline machine they know performs fine. An explicit override takes precedence over the cached automatic decision.
 
-### Decisions
-
-| # | Decision | Choice | Rationale |
-|---|----------|--------|-----------|
-| A | What we measure | Total physical RAM | Stable per-device value; determines whether co-residency is ever viable. LLM size is supplied by the model-choice design, not assumed here |
-| B | Output | Mode flag: co-resident / swap | Drives whether both models stay warm or load on demand |
-| C | Threshold | Combined footprint + ≥2 GB margin | Avoid OS disk paging, which is worse than a deliberate reload |
-| D | Frequency | Probe once, cache; re-probe only if total RAM changes | One-time per-device setup, not per-launch |
-| E | Override | Manual force in settings | User may want RAM for other apps, or knows their machine |
-
 ---
 
 ## 8. Note Generation (LLM)
 
-Phase two turns a verified transcript into a structured clinical note. This section is built up piece by piece; the residency decision that governs how the note-generation model shares memory with the speech-to-text model is covered separately in [§7](#7-model-residency-strategy).
+Phase two turns a verified transcript into a structured clinical note. This section is built up piece by piece.
 
 ### 8.1 Trigger & input
 
 Note generation is **manual and explicit**, not automatic on Stop. The sequence is:
 
 1. **Stop** finalizes the transcript. In-flight audio is flushed and the last segments land in the transcript (the Processing→Idle drain described in §6.6). The complete transcript is shown in the UI and the machine is back at rest — no model is running.
-2. **The clinician reviews and edits the transcript**, assisted by the post-ASR correction suggestions that ran automatically on Stop (§6.7). They accept or reject the proposed fixes and make any further manual corrections — names, medications, mishearings. The correction pass has finished by the time Generate is pressed; no LLM is running during the note-generation trigger itself.
+2. **The clinician reviews and edits the transcript**, assisted by the post-ASR correction suggestions that ran automatically on Stop (§6.7).
 3. **The clinician clicks Generate.** *This* is the trigger that starts note generation, operating on the transcript exactly as the user left it.
 
 Making generation an explicit, post-review action is a deliberate clinical-safety choice: the clinician verifies the source text before a note is built from it, and the expensive LLM step is decoupled from recording.
@@ -569,18 +491,6 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 **Guard.** Generate is **disabled when the transcript is empty** and is **only available in the Idle state** — never mid-recording.
 
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Trigger | Manual Generate after review, not auto-on-Stop | Clinician verifies source text first; decouples LLM from recording |
-| Input format | Plain transcript text, as edited | Simple, robust; speaker role inferred from content |
-| Speaker labels | None (no diarization in v1) | Separate, fragile model; competes for the §7 memory budget |
-| Metadata | None sent to the model | Relevant content already in transcript; date stamped at save time |
-| Regeneration | Each Generate creates a new retained, revertable version | Clinician may prefer an earlier note |
-| Editing | Generated note editable in-app; edited text is the saved note | Final note is clinician-owned |
-| Guard | Disabled on empty transcript; Idle-only | Prevents meaningless or conflicting runs |
-
 ### 8.2 Model & runtime
 
 **Model selection.** All candidates were evaluated for raw note quality and judged acceptable, so selection is purely a fit-to-machine policy keyed on total RAM. This decision is made at the **same one-time startup probe** that drives the residency strategy (§7): the probe reads total RAM, this rule picks the model, and §7 then feeds the chosen model's size into its footprint calculation to decide co-resident vs swap.
@@ -590,70 +500,45 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 | **≥ 16 GB** | Mistral-7B-Instruct-v0.3 (Apache-2.0) | Q4_K_M (~4.4 GB) | — |
 | **< 16 GB** | Phi-3.5-mini-instruct (MIT) | **Q8_0** (~4.0 GB) | switch to **Q4_K_M** (~2.3 GB) if generation feels slow |
 
-A single threshold at 16 GB governs the choice. Below it, Phi defaults to the higher-quality **Q8_0**; the user can switch to **Q4_K_M** to reclaim RAM and speed up generation if needed. There is no second automatic floor — the quant drop below 16 GB is user-driven, not automatic. Both model licenses (Apache-2.0, MIT) permit commercial clinical use.
-
 **Execution model.** The selected GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6).
 
-**Model distribution & first-run setup.** The installer ships **no** model weights — it carries only the application (and the small VAD model), keeping the download lean. The models the app needs are fetched **once, on first launch**, through a one-time **Setup** step, then cached on disk and reused every launch — fully offline thereafter (matching the STT lifecycle in §6.4, "downloaded once on first selection and cached"). Setup downloads exactly the models this machine requires: the **RAM-fit note-generation model** chosen by the rule above (Mistral-7B on ≥16 GB, Phi-3.5 Q8 on <16 GB) and the **Parakeet STT model**. Beyond that required pair, the other note-generation tiers remain available as on-demand downloads from Settings, so the clinician can switch model later.
+**Model distribution & first-run setup.** The installer ships **no** model weights — it carries only the application (and the small VAD model), keeping the download lean. The models the app needs are fetched **once, on first launch**, through a one-time **Setup** step, then cached on disk and reused every launch — fully offline thereafter (matching the STT lifecycle in §6.4, "downloaded once on first selection and cached"). Setup downloads exactly the models this machine requires: the **RAM-fit note-generation model** chosen by the rule above and the **Parakeet STT model**. Beyond that required pair, the other note-generation tiers remain available as on-demand downloads from Settings, so the clinician can switch model later.
 
 - **Gated until ready.** On launch the app checks whether the required models are present; if not, it shows the Setup screen and does not proceed into recording/generation until both are downloaded and verified. Once present, Setup is skipped entirely.
 - **Integrity-checked.** Each download is verified against a known checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
 - **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function (§4 deployment model 1).
-- **On-disk resolution.** Downloaded models live in the app's writable data directory; the loader resolves each model by name there, so a model the clinician later downloads is picked up automatically on the next load.
 
 **Tuning notes (recorded, set at implementation via benchmarking — not architectural decisions):**
 
 - **Thread count** — scaled to the machine's physical core count.
-- **Context window** — capped to a working size covering the longest realistic transcript + prompt + generated note, rather than the model's full maximum (Mistral 32k / Phi 128k), to avoid reserving RAM the §7 budget needs.
+- **Context window** — capped to a working size covering the longest realistic transcript + prompt + generated note, to avoid reserving RAM the §7 budget needs.
 - **Sampling** — low temperature for near-deterministic, low-hallucination clinical output (finalized alongside the prompt in §8.3).
 - **Memory levers** — mmap vs full load, and KV-cache precision, available as RAM/latency trade-offs during tuning.
-- **Prompt caching (fixed prefix reuse).** The system prompt + one-shot example (§8.3) are byte-identical every generation; ordering them ahead of the transcript lets their KV cache be prefilled once and reused across notes instead of re-read each time. Full design in **§8.7**.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Model selection | ≥16 GB → Mistral-7B Q4_K_M; <16 GB → Phi-3.5-mini Q8_0 | Fit-to-machine; all candidates cleared on quality |
-| Quant override (<16 GB) | Default Q8_0; user may drop to Q4_K_M | Reclaim RAM / speed if generation feels slow |
-| Decision timing | At the §7 startup probe; model size feeds §7's footprint calc | One probe drives both model choice and residency mode |
-| Distribution | Lean installer (no bundled weights); required models downloaded once on first-run Setup, verified, cached | Small installer; models fetched to fit the machine and integrity-checked; offline after Setup |
-| Execution | `llama-cpp-2`, in-process, no server/network | Fully on-device; satisfies NFR-6 |
-| Runtime tuning | Threads, context cap, sampling, memory levers | Deferred to implementation benchmarking, not design-time |
+- **Prompt caching (fixed prefix reuse).** The system prompt + one-shot example (§8.3) are byte-identical every generation; ordering them ahead of the transcript lets their KV cache be prefilled once and reused across notes instead of re-read each time. Full design in **§8.6**.
 
 ### 8.3 Prompt & output structure
 
-**Output format — markdown.** The model emits the note as **markdown** with five fixed section headers (`## Subjective`, `## Objective`, `## Assessment`, `## Plan`, `## Response`) — the SOAP-R structure (§8.1 defines Response: how the patient has responded since the last visit to prior treatment). Markdown is the single representation used everywhere:
+**Output format — markdown.** The model emits the note as **markdown** with five fixed section headers (`## Subjective`, `## Objective`, `## Assessment`, `## Plan`, `## Response`) — the SOAP-R structure. Markdown is the single representation used everywhere:
 
 - **Display** — rendered as a formatted document in the UI (like a markdown preview), so the clinician sees an ordinary-looking note rather than raw `##`/`**` markers.
 - **Edit** — the clinician edits in-app (§8.1); the note stays markdown throughout.
 - **Store & version** — markdown is plain text, so persistence and versioning (§8.5) are trivial.
-- **EMR hand-off** — at copy time (§8.6) the fixed headers let a **deterministic parser** split the note into per-section text, and markdown markers are stripped to plain text. This is ordinary string processing — **no JSON, no grammar constraint, and no AI post-processing step.**
 
-Choosing markdown over JSON/GBNF keeps generation robust (no broken-JSON failure mode), gives a natural document for the clinician, and still yields structured sections via header parsing when needed.
+**Input — whole transcript, single prompt.** The full transcript is passed in one prompt with no context-handling layer (no chunking or pipeline); structured SOAP output comes from prompt engineering alone, since the window far exceeds a realistic consult.
 
-**Input — whole transcript, single prompt.** The full transcript is passed in one prompt with no context-handling layer (no chunking or pipeline); structured SOAP output comes from prompt engineering alone, since the window (Mistral 32k / Phi 128k) far exceeds a realistic consult (~6–8k tokens).
+**Scope — five sections (SOAP-R).** v1 produces **Subjective / Objective / Assessment / Plan / Response**.
+- Subjective(S) — patient's reported symptoms, feelings, history
+- Objective(O) — measurable/observed data (vitals, exam, results)
+- Assessment(A) — clinician's diagnosis/interpretation of S+O
+- Plan(P) — next steps (treatment, meds, referrals, follow-up)
+- Response(R) — how the patient responded to prior treatment since last visit
 
-**Scope — five sections (SOAP-R).** v1 produces **Subjective / Objective / Assessment / Plan / Response**. Response captures how the patient has responded since the last visit to prior treatment (symptom change, side effects, adherence). No chief-complaint block, vitals extraction, or coding hints in v1.
+**Bulleted, concise output.** Sections are written as **concise bullet points, not paragraphs**.
 
-**Bulleted, concise output.** Sections are written as **concise bullet points, not paragraphs**, in clinical shorthand where natural (pt, c/o, BP, hx) — a scannable note the clinician can sign with minimal editing, rather than prose that restates the transcript.
+**Empty sections.** A section the transcript has no material for is written as **"Not discussed"**.
 
-**Anti-hallucination.** The system prompt instructs the model to use **only facts present in the transcript** and to invent nothing — no assumed findings, diagnoses, or values not stated. This is the single most important safety property of the note: in a clinical record, a fabricated symptom is the worst failure mode. Low sampling temperature (§8.2) reinforces this. Placement rules per section (e.g. Objective excludes anything the patient merely reported; Assessment must be supported by the transcript) keep content in the right section without inviting invention.
-
-**Empty sections.** A section the transcript has no material for is written as **"Not discussed"** under its header rather than left blank — the section is never dropped, keeping structure consistent for rendering and EMR splitting. For **Response** specifically, a first visit with no prior treatment is stated explicitly (e.g. "First visit — no prior treatment") rather than marked "Not discussed".
-
-**Prompting approach — one-shot.** The prompt carries **one worked example** (a raw, messy consult transcript and its ideal bulleted SOAP-R note). This locks structure and style far more reliably than instructions alone, and the example deliberately shows the model resolving a garbled ASR phrase from context (e.g. "right down beforehand" → "right side of forehead") rather than copying it verbatim. **Few-shot** (a handful of examples) remains a deferred lever if one example proves insufficient. The one-shot example is a **fixed prefix**, prompt-cached (§8.2) so it adds negligible per-note latency.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Output format | Markdown, five fixed `##` SOAP-R headers | Robust (no broken-JSON failure), natural document, still splittable deterministically |
-| Post-processing | Deterministic parse/strip only; no AI, no grammar | Headers are predictable; plain string work suffices |
-| Scope | S/O/A/P/R (adds Response) | Captures interval response to prior treatment |
-| Style | Concise bullets, clinical shorthand | Scannable, sign-ready note; not prose restating the transcript |
-| Anti-hallucination | Prompt restricts model to transcript facts only; per-section placement rules | Fabricated clinical content is the worst failure |
-| Empty section | "Not discussed" under header (Response: state first-visit explicitly) | Consistent structure; clinician completes if needed |
-| Prompting | One-shot (worked example); few-shot deferred | One example locks format/style; example prompt-cached so latency cost is one-time (§8.2) |
+**Prompting approach — one-shot.** The prompt carries **one worked example** (a raw, messy consult transcript and its ideal bulleted SOAP-R note). This locks structure and style far more reliably than instructions alone.
+- **Few-shot** (a handful of examples) remains a deferred lever if one example proves insufficient. The one-shot example is a **fixed prefix**, prompt-cached (§8.2) so it adds negligible per-note latency.
 
 ### 8.4 Lifecycle & orchestration
 
@@ -680,20 +565,9 @@ In swap mode the load/unload is the RAM cost of running on a tight machine; in c
 
 **Cancellation.** A Cancel control stops generation mid-stream (via the decode loop's stop hook). On cancel, the partial note is **discarded** and the screen returns to its pre-Generate state; the transcript is untouched. Streamed output (below) keeps this responsive — the user sees tokens appear, so a cancel feels immediate.
 
-**Streaming.** Tokens are streamed to the UI as they are produced rather than shown only when complete. This makes the wait *feel* short and makes cancellation feel instant. (The orchestration loop emits the token stream here; UI rendering and persistence of it are §8.5.)
+**Streaming.** Tokens are streamed to the UI as they are produced rather than shown only when complete. This makes the wait *feel* short and makes cancellation feel instant. 
 
 **Load-time RAM guard.** The §7 budget is a startup decision on *total* RAM; actual *available* RAM at generation time can be lower. Before loading the LLM, available RAM is checked. If it is insufficient, the load fails gracefully: the app surfaces the error, stays in IDLE, and preserves the transcript — never a silent out-of-memory crash.
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Generation state | Distinct GENERATING state; single in-flight; recording blocked | Generation is a manual post-transcript action, not STT processing |
-| Load timing | Co-resident: load once at startup; Swap: load/unload per generation | Consumes the §7 residency-mode flag |
-| Warmup | Hidden throwaway pass after each load | Keeps the first real generation at full speed |
-| Cancellation | Discard partial note, transcript intact | A half-note is more confusing than useful |
-| Streaming | Stream tokens to UI as produced | Wait feels short; cancel feels instant |
-| RAM guard | Check available RAM before load; fail gracefully to IDLE | Available RAM can be below the startup budget; no silent OOM |
 
 ### 8.5 Delivery & persistence
 
@@ -719,51 +593,11 @@ This section covers how the streamed note reaches the screen and how it is store
 
 (The full cross-feature data model and Tauri command/event contracts are consolidated in the Data Model & Interfaces section.)
 
-**Decisions:**
+### 8.6 Prompt-prefix caching (KV-cache reuse)
 
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Streaming render | Show raw text while streaming; render markdown once on completion | Live-rendering partial markdown flickers/looks broken |
-| Storage engine | SQLite + SQLCipher (encrypted), one DB file | Encrypted at rest; PHI stays on device |
-| Audio retention | Discard audio after transcript finalized | Minimizes PHI footprint; re-transcription not needed in v1 |
-| Version = generation event | New immutable version per Generate/Regenerate; all retained, revertable | Matches §8.1 retain-and-revert |
-| Manual edits | Autosaved in place on the active version | Edits refine a version; avoids per-keystroke version churn |
-
-### 8.6 EMR hand-off
-
-v1 has no direct EMR integration, and the automated paste **hotkey is deferred to Future Considerations (§13)**. The clinician moves the note into their EMR (web or desktop) by **manual copy/paste**, section by section.
-
-**Flow.**
-
-1. The note is shown as four editable sections — **Subjective / Objective / Assessment / Plan** (§8.5).
-2. The clinician clicks **Copy** on a section; that section's text (plain text) is placed on the clipboard.
-3. They click the target field in their EMR and paste with **Ctrl+V**.
-4. They repeat per field, pasting sections in whatever order their EMR layout needs.
-
-**Note source.** Copy acts on the **current on-screen section text, including unsaved edits** — so the pasted content is always the latest, with no separate freeze/stage step.
-
-**Section text.** Each section is copied as **plain text** (the body under its `##` header, §8.3), since EMR fields are plain-text boxes.
-
-**No clipboard auto-clear in v1.** A copied section places PHI on the system clipboard, which is readable by any process. Because the clinician controls **when** they paste, the app does **not** time-wipe the clipboard — a timed clear could remove the text before they use it. Trade-off: a copied section lingers on the clipboard until overwritten or cleared by the clinician. (The deferred hotkey hand-off restores auto-clear, since there the paste timing is known — §13.)
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Delivery mechanism | Manual per-section **Copy** button → **Ctrl+V** into the EMR field | v1 has no EMR API integration; the one-key hotkey hand-off is deferred (§13) |
-| Note source | Current on-screen section text (incl. unsaved edits); no freeze/stage step | Reflects the latest edits |
-| Section format | Plain text, one section per Copy | EMR fields are plain text; clinician pastes field by field |
-| Clipboard | No auto-clear in v1 | Manual paste timing is unknown; a timed wipe could clear it too early |
-| One-key hotkey paste | Deferred to Future Considerations (§13) | Needs native Windows no-activate + global-key work best built/verified on Windows |
-| Field auto-mapping | Deferred to Future Considerations (§13) | Out of scope for v1 |
-
-### 8.7 Prompt-prefix caching (KV-cache reuse)
-
-The one-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of every generation: the system instruction plus the worked example. Only the transcript at the tail changes. Today that whole prefix is re-read (re-*prefilled*) on every note — the model redoes the same math over the same tokens each time, and few-shot (§8.3) would make the wasted work larger. This section is the plan to prefill that prefix **once** and reuse it. It promotes the §8.2 tuning note into a concrete design; §8.2's summary line stays as the pointer.
+The one-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of every generation: the system instruction plus the worked example. Only the transcript at the tail changes. 
 
 **What is being cached.** When the model reads tokens it produces per-token intermediate state (the attention **KV cache**) that generation then reads from. The prefix's KV entries depend only on the prefix tokens, so once computed they are valid for *any* transcript that follows — provided the prefix tokens are unchanged and sit at the same positions. That is the whole reason §8.3 orders the prompt `[system + example] → [transcript] → [assistant]`: **only the run of tokens before the first differing token is reusable**, so the fixed part must come first.
-
-**Mechanism (save the prefix's state once, restore it per note).** The prefix is prefilled a single time, and the *result* of that prefill — the model's computed KV state — is snapshotted and reused. The heavy work (running the prefix through every layer) happens once; every later note pastes the snapshot back instead of redoing it.
 
 1. **Prefill once, snapshot the state.** On load/warmup the engine tokenizes the fixed prefix (system + example + template scaffolding up to where the transcript begins), decodes it once into a context, then serializes the KV state **for that one sequence** into an in-memory byte buffer. It also records the **prefix token sequence**. The context is dropped. Using the *sequence-scoped* save (not the whole-context one) sizes the snapshot to the cells the prefix actually used (tens of MB), avoiding a transient ~1 GB allocation for the full N_CTX cache right after the model load — which would spike RAM exactly at the §7 residency threshold.
 2. **Per note — restore, don't recompute.** Build a fresh context, load the snapshot into it (a memory copy of the prefix KV — no transformer math), then decode only the transcript tail at positions after the prefix and generate. The prefix is never re-prefilled.
@@ -777,24 +611,11 @@ The one-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 - **No accumulation.** Because every note uses a fresh context, transcript+note tokens never persist across notes, so nothing can accumulate toward the context window (§8.2) — the property the persistent-context alternative would have needed an explicit KV trim to hold.
 - **Single-flight.** Generation is already serialized behind the model lock (§8.4); the snapshot is guarded the same way, so two notes never share/mutate it concurrently.
 
-**Interaction with residency (§7).** This helps **co-resident** mode only. In **swap** mode the model is unloaded after each generation to free RAM for STT (§8.4), which destroys the context and its cached prefix — so the next note re-prefills from cold regardless. That is acceptable: swap mode is the RAM-constrained path where keeping a model (and context) warm isn't affordable anyway. Caching is therefore a co-resident optimization; swap mode falls back to per-note prefill with no code-path difference visible to the clinician.
+**Interaction with residency (§7).** This helps **co-resident** mode only. In **swap** mode the model is unloaded after each generation to free RAM for STT (§8.4), which destroys the context and its cached prefix — so the next note re-prefills from cold regardless. That is acceptable: swap mode is the RAM-constrained path where keeping a model (and context) warm isn't affordable anyway. 
 
 **Dependency & fallback.** Reuse needs the `llama-cpp-2` binding to expose **sequence-scoped state save/restore** (`state_seq_get_size_ext` / `state_seq_get_data_ext` / `state_seq_set_data_ext`), confirmed present in the pinned version (0.1.150). The sequence-scoped variants (over the whole-context `get_state_size` / `copy_state_data`) are what keep the snapshot sized to the prefix's cells rather than the full N_CTX cache. The binding *also* exposes KV-cache trim (`clear_kv_cache_seq`), which the persistent-context alternative would have used — but the save/restore path is what we build (see the trade-off below). The **fallback** is the current behavior — prefill the full prompt per note — and it is entered automatically whenever the snapshot is missing (not yet primed, or after `unload`) or the boundary check fails, so the feature degrades to "correct but not cached" rather than breaking generation. The same fixed-prefix lever is shared by the correction pass (§6.7), so both benefit from one implementation.
 
 **Non-goals.** No cross-*session* (on-disk) cache — the prefix is cheap to prefill once per app run, and persisting KV state to disk adds complexity and a versioning/staleness surface for no material gain. No caching of the transcript or generated tokens (they are unique per note).
-
-**Decisions:**
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| What to cache | The fixed prefix (system + one-shot example) KV only | It is byte-identical every note; the transcript/note are unique |
-| How | Snapshot the prefix's KV state once (save/restore); restore it into a **fresh context per note**, then decode only the transcript tail | Skips re-prefilling the prefix without needing a long-lived context (see trade-off) |
-| **Save/restore vs persistent context + trim** | **Chosen: save/restore into a fresh context** (over a persistent `LlamaContext` + KV trim) | Persistent context would be a self-referential borrow of the owned model; save/restore gets the same win with simpler, safer code. Full trade-off in **§11** |
-| Invalidation | Rebuild on model change or any prompt/example edit; a saved-prefix-tokens check guards cross-model restores | A changed prefix makes the snapshot stale |
-| Residency | Co-resident only; swap mode re-prefills cold | Swap unloads the model (and drops the snapshot) after each note by design |
-| Binding dependency | Uses `llama-cpp-2` context state save/restore (present in 0.1.150); else fall back to per-note full prefill | Feature degrades to correct-but-uncached, never broken |
-| Persistence | In-memory per app run; no on-disk KV cache | Prefill-once is cheap; disk KV adds versioning/staleness cost for no gain |
-| Shared with | The §6.7 correction pass (same fixed prefix) | One mechanism serves both |
 
 ## 9. Data Model & Interfaces
 
@@ -835,14 +656,18 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 
 ### 9.3 Settings store (JSON)
 
-Doctor-facing settings are deliberately minimal (Model, Microphone, Paste key). The remaining keys are computed/internal and never shown.
+**`Doctor facing settings`**
 
 | Key | Surfaced? | Meaning |
 |-----|-----------|---------|
 | `model_choice` | **Doctor** | `best` (Mistral-7B) / `medium` (Phi-3.5 Q8) / `okay` (Phi-3.5 Q4); options the machine can't run are greyed out (§7) |
 | `mic_device` | **Doctor** | Selected input device |
-| `paste_hotkey` | internal (v1) | Rebindable (any 2-key combo); default **Alt+P**. Persisted but **not surfaced in v1** — the doctor-facing rebind control returns with the deferred hotkey hand-off (§13) |
 | `residency_mode` | internal | Co-resident vs swap, decided once (§7) |
+
+**`Internal settings`**
+
+| Key | Surfaced? | Meaning |
+|-----|-----------|---------|
 | `observed_total_ram` | internal | Cached probe; re-probed only on hardware change (§7) |
 | `vad_threshold` | internal | Fixed sensible default (§6.2) |
 | `idle_timeout` | internal | Auto-stop-on-silence default |
@@ -858,7 +683,7 @@ The backend owns all state; commands are requests, and state guards reject illeg
 | Notes | `generate_note`, `regenerate_note`, `cancel_generation`, `update_note`, `revert_version` | Produce/edit/cancel notes; flip the active version (§8.4–8.5) |
 | Records | `list_records`, `open_record`, `delete_record` | Saved-encounter browsing (FR-13); `delete_record` is permanent (NFR-9) |
 | Settings | `get_settings`, `update_settings` | Read/patch the JSON store, including mic device |
-| Hand-off | `copy_to_clipboard` | Copy a SOAP section's plain text to the clipboard for manual paste into the EMR (§8.6). `paste_section` (one-key hotkey paste) is built but dormant, reserved for the deferred overlay (§13) |
+| Hand-off | `copy_to_clipboard` | Copy a SOAP section's plain text to the clipboard for manual paste into the EMR. `paste_section` (one-key hotkey paste) is built but dormant, reserved for the deferred overlay (§13) |
 
 ### 9.5 Tauri events (backend → UI `emit`)
 
@@ -870,18 +695,6 @@ The backend owns all state; commands are requests, and state guards reject illeg
 | `state-changed` | `{ state }` | IDLE / RECORDING / PROCESSING / GENERATING transitions; GENERATING→IDLE signals the note is done and the UI loads the active note |
 | `error` | `{ code, message }` | Recoverable failures (e.g. RAM guard trips, §8.4) |
 
-### 9.6 Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| Store split | Encrypted SQLite (PHI) + plain JSON (settings) | Encrypt what's sensitive; settings carry no PHI |
-| Encounter identity | Single opaque free-text `label`; no structured patient record | Find encounters without storing MRN/DOB; minimizes PHI |
-| Transcript shape | Single text blob on `records`; segments not persisted | Segments are transient transport; the document is what matters (FR-3) |
-| Note history | One `notes` row per generation; one `is_active` | Retain-and-revert (§8.5) |
-| Doctor-facing settings | Model, Microphone, Paste key only | Doctor isn't an engineer; everything else auto/fixed |
-| State ownership | Backend owns state; commands are guarded requests | Single source of truth (§6.6) |
-| Stream transport | `generation-token` events, not a returned blob | Live UX during long CPU generation (§8.5) |
-
 ## 10. Security & Compliance
 
 The product's core promise is that patient data stays on the device, encrypted, and never leaks. This section records how the key is protected, how access is controlled, and the compliance posture under Canadian law (PHIPA/PIPEDA).
@@ -892,54 +705,40 @@ The clinical DB is encrypted with SQLCipher (AES-256, §9.1). The open question 
 
 **Choice: Windows DPAPI, no passphrase.** On first run the app generates a random AES-256 key, then hands it to **Windows DPAPI** (`CryptProtectData`) scoped to the logged-in Windows user. DPAPI returns a wrapped (encrypted) blob, which is all that's stored on disk; the raw key is never persisted in readable form. On launch the app calls DPAPI to unwrap the key and opens the DB with it — no password prompt.
 
-- **Frictionless:** the doctor logs into Windows as usual; nothing else to type across 50 visits/day.
+- **Frictionless:** the doctor logs into Windows as usual.
 - **Bound to the account:** the wrapped key is meaningless on another Windows account or machine, so a stolen laptop's DB file is unreadable.
 - **Trade-off (backup caveat):** because the key is tied to the Windows user account, losing that account (OS reinstall, profile wipe) makes existing encrypted data unrecoverable. Device/account backup is the clinic's responsibility.
 
-A doctor passphrase was rejected for v1: it adds a prompt every launch and "forgot password = permanent data loss," for marginal benefit on a single-clinician device.
-
-### 10.2 Access control
-
-**Windows login is the access boundary; the app adds no second lock.** Given one clinician per device (§1 assumption), the OS sign-in is treated as the door — anyone authorized to use the laptop is authorized to use the app. No separate app PIN to manage. (A device left unlocked and unattended is a physical-security matter for the clinic, not something a second prompt meaningfully fixes.)
-
-### 10.3 Data residency & telemetry
+### 10.2 Data residency
 
 **Zero PHI egress (NFR-6).** The app is fully functional offline and makes no network calls that carry patient data. Transcripts, notes, and the patient label never leave the device.
+
+### 10.3 Telemetry
 
 **Automatic technical telemetry (no PHI).** To know the product works on real devices and to fix it early, the app sends **technical-only** events automatically — no opt-in, disclosed once in a short privacy notice. This preserves NFR-6, which concerns *PHI* egress: these events carry none. It covers both crashes and a small set of usage/health events.
 
 - **Allowlist, never blocklist.** Each event is built from a fixed set of non-PHI fields — app version, OS, arch, detected RAM tier, active model tier, event name, coarse timings, and for errors the error *type/message string only* (`TechnicalContext`). Nothing else is attachable by construction.
 - **Scrub backstop (defense-in-depth).** Every outgoing event still passes through `scrub_event`, which recursively strips any field whose key looks like PHI (`transcript`, `soap`, `note`, `label`, `record`) — so a future richer payload can never leak one.
-- **Events:** `app_launched`, `setup_started` / `model_download_done` / `model_download_failed`, `note_generated` (+ ms), `correction_pass_ran`, `error` (sanitized), `crash` (stack trace + `TechnicalContext`). Never the transcript, note, audio, or patient label.
-- **Transport:** a single HTTPS POST of the event JSON to **our own** ingest endpoint (§14.4) — fire-and-forget, queued locally and retried, never blocks the UI, silent on failure. It is off unless the ingest URL is compiled into the build (`MEDSCRIBE_TELEMETRY_URL`), so a URL-less build stays fully offline. No third-party analytics vendor is involved.
+- **Events:** `app_launched`, `setup_started` / `model_download_done` / `model_download_failed`, `note_generated` (+ ms), `correction_pass_ran`, `error` (sanitized), `crash` (stack trace + `TechnicalContext`).
+- **Transport:** the **Sentry Rust SDK** sends each event to **our own self-hosted GlitchTip** instance (§14.4) — the SDK queues, batches, and retries in a background thread, never blocks the UI, and is silent on failure. Every event still passes the `scrub_event` backstop via the SDK's `before_send` hook before it leaves the process. It is off unless **both** the `crash-reporting` cargo feature is enabled **and** a DSN is compiled into the build (`MEDSCRIBE_CRASH_DSN`), so the default build has no client, sends nothing, and stays fully offline. GlitchTip is Sentry-API-compatible and self-hosted, so no third-party analytics vendor receives any data.
 
 ### 10.4 Data lifecycle
 
 - **Audio:** discarded immediately after each segment is transcribed; never persisted (NFR-9, §8.5).
 - **Transcripts & notes:** retained encrypted until the doctor deletes them; **deletion is permanent** — no recycle bin, no cloud copy (NFR-9).
-- **Clipboard:** EMR hand-off places a section on the system clipboard, which is **auto-cleared a few seconds after paste** (§8.6), limiting how long PHI lingers in a shared buffer.
+- **Clipboard:** EMR hand-off places a section on the system clipboard, which is **auto-cleared a few seconds after paste**, limiting how long PHI lingers in a shared buffer.
 
 ### 10.5 Compliance posture (PHIPA/PIPEDA)
 
 The clinic/clinician is the **custodian** of the health information; the app is the tool they use. The design supports their obligations: data minimization (no audio retention, opaque label, no extra patient metadata), encryption at rest (§10.1), and no third-party disclosure (zero PHI egress). **No audit log in v1** — with one clinician per device there is no separate party to audit; per-access logging is deferred to Future Considerations should a multi-user clinic ever require a trail.
 
-### 10.6 Decisions
-
-| Decision | Choice | Rationale |
-|----------|--------|-----------|
-| DB key protection | Windows DPAPI, no passphrase | Frictionless; key bound to the Windows account, useless on a stolen device |
-| App-level lock | None; rely on Windows login | One clinician per device; OS sign-in is the boundary |
-| Telemetry | Automatic, technical-only; allowlist + `scrub_event` backstop; POST to our own endpoint (§14.4) | Signal on real-device health without breaking zero-PHI-egress (NFR-6); no third-party analytics vendor |
-| Audit log | Out of scope for v1 | Single-user device; deferred to Future Considerations |
-| Custodianship | Clinician is custodian; app is the tool | Aligns responsibility with PHIPA/PIPEDA |
-
 ## 11. Trade-offs & Alternatives
 
-### Prompt-prefix caching: state save/restore vs a persistent context (§8.7)
+### Prompt-prefix caching: state save/restore vs a persistent context (§8.6)
 
 - **Decision:** How to reuse the fixed prompt prefix's KV so it isn't re-prefilled on every note.
 - **Options:**
-  1. **Persistent context + KV trim** — hold one long-lived `LlamaContext` in the engine, prefill the prefix into it once, append each transcript, and trim the KV cache back to the prefix boundary between notes. This is what §8.7 originally planned.
+  1. **Persistent context + KV trim** — hold one long-lived `LlamaContext` in the engine, prefill the prefix into it once, append each transcript, and trim the KV cache back to the prefix boundary between notes. This is what §8.6 originally planned.
   2. **State save/restore into a fresh context** — prefill the prefix once, snapshot its KV state to an in-memory buffer, and restore that snapshot into a fresh throwaway context per note before decoding the transcript tail.
 - **Chosen:** Option 2 (save/restore).
 - **Rationale:** In `llama-cpp-2`, a `LlamaContext` borrows the loaded `LlamaModel`, so storing a persistent context beside the owned model in the engine struct is **self-referential** — safe Rust won't allow it without `unsafe`/lifetime hacks or an extra self-referencing crate. Both options skip the same expensive step (running the prefix through every model layer — seconds of CPU), which is the entire point of the feature. Option 2 reuses the fresh-context-per-note path the engine already had, so it needs no new lifetime machinery; it also makes reset-to-boundary and cancel/error cleanup **automatic** (the snapshot is never mutated and each note's context is discarded), removing the mandatory-trim invariant Option 1 carries. Its only extra cost is a per-note memory copy of the snapshot — **milliseconds against the seconds saved** — so the win is effectively identical while the code stays simpler and safer. The binding exposes both APIs (0.1.150), so this is a design choice, not a capability limit.
@@ -973,7 +772,7 @@ The economics are a direct consequence of the on-device design: there is **no ma
 
 **No recurring cost.** Unlike cloud scribe products that charge per-seat monthly subscriptions, this app incurs no ongoing fee for the clinic. Compute, storage, and inference all happen on hardware the clinic already owns. This is the core "no subscription / cost-effective" value proposition.
 
-The only resource the clinic provides is the laptop itself (Windows 11, 16–32 GB RAM), which is assumed to already exist.
+The natural fit is a **one-time purchase or flat per-device license**.
 
 ### 12.2 Vendor-side costs
 
@@ -983,13 +782,6 @@ The vendor carries a small, **fixed** operating cost — independent of how many
 |------|--------|-------|
 | Crash-reporting service | Low monthly | Receives the scrubbed, PHI-free crash reports (§10.3); a hosted service (e.g. Sentry-class). Scales with crash volume, not patient volume |
 | Windows code-signing certificate | Annual | Keeps the installer trusted/unflagged on Windows |
-| Model & runtime licensing | $0 | All bundled models and runtimes are permissively licensed (NFR-15) |
-
-Because these are fixed and unrelated to patient throughput, the vendor's cost per clinic does not grow with usage.
-
-### 12.3 Commercial model
-
-The natural fit is a **one-time purchase or flat per-device license** rather than usage-based pricing, since there is no usage-based cost to recover. The exact price point is a go-to-market decision and out of scope for this design.
 
 ## 13. Future Considerations
 
@@ -997,8 +789,7 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 
 | Item | What it adds | Why deferred from v1 |
 |------|--------------|----------------------|
-| **One-key EMR paste (no-activate overlay)** | A global hotkey (default **Alt+P**) that opens a non-activating, always-on-top **S/O/A/P picker** and pastes the chosen section into the focused EMR field (clipboard + simulated Ctrl+V), with clipboard auto-clear and already-pasted sections greyed out | Needs native Windows-specific work — see the technical note below. v1 ships **manual copy/paste** (§8.6) instead, which is reliable and needs no native focus handling |
-| **EMR integration** | Direct integration with the EMR (field auto-mapping or an EMR API) instead of manual paste | v1 has no EMR API integration; the manual hand-off (§8.6) is reliable and EMR-agnostic |
+| **EMR integration** | Direct integration with the EMR (field auto-mapping or an EMR API) instead of manual paste | v1 has no EMR API integration; the manual hand-off is reliable and EMR-agnostic |
 | **Fine-tuned models** | Note model fine-tuned on SOAP datasets for more consistent output | Few-shot prompting (§8.3) is a cheaper, reversible lever; no evidence yet that fine-tuning is needed |
 | **AI engineering for larger context** | Context-handling techniques (e.g. chunking, summarization, retrieval) for transcripts that exceed the model window | The model window far exceeds a realistic consult (§8.3), so the whole transcript fits in one prompt today; needed only for much longer inputs |
 | **Selectable alternate STT engine** | A user-selectable higher-accuracy / weaker-hardware STT option (e.g. a Whisper-family model) alongside the default Parakeet engine | A native-build constraint, not a product objection — see the note below. Parakeet (§6.4) covers EN+FR well, so a second engine is a refinement, not a v1 need |
@@ -1022,7 +813,7 @@ How the app reaches users, how they get updates, and where the technical telemet
 ### 14.2 Download website
 
 - A static page on **Vercel** with a "Download for Windows" button linking to the release asset via the **`/releases/latest/download/<asset>`** redirect, so the link never goes stale across versions.
-- The same Vercel project hosts the telemetry ingest function (§14.4) — one deploy, one domain covers both the site and the endpoint.
+- Telemetry ingest is **not** hosted here — it lands on a separate self-hosted GlitchTip instance (§14.4).
 
 ### 14.3 Updates
 
@@ -1040,29 +831,12 @@ Two paths ship: an automatic in-app updater (default), with manual re-install al
 
 The client-side policy (what is collected, the allowlist, the scrub backstop) is §10.3; this is where events land.
 
-- **Ingest:** a **Vercel serverless function** receives the POSTed event JSON, validates it against the allowlisted shape (**rejecting any unexpected keys** — a second, server-side backstop against PHI), and inserts one row.
-- **Storage: Neon Postgres.** Low-volume, append-mostly desktop telemetry — a single managed Postgres is ample. One `events` table:
-
-  | column | type | note |
-  |--------|------|------|
-  | `id` | bigserial PK | |
-  | `received_at` | timestamptz default `now()` | server clock |
-  | `event` | text | event name (allowlisted) |
-  | `app_version` | text | |
-  | `os` / `arch` | text | |
-  | `ram_tier` / `model_tier` | text | nullable |
-  | `duration_ms` | integer | nullable |
-  | `error_kind` | text | nullable, sanitized string |
-  | `install_id` | uuid | random per **install**, not per patient |
-  | `payload` | jsonb | remaining allowlisted fields |
-
-- **`install_id`** is a random UUID generated once per install and stored in the settings file. It identifies a *device*, never a patient, so distinct-device counts and per-device error rates are possible without any PHI or personal identifier.
-- **Hardening (the endpoint is public).** Two guards keep the ingest URL from being spammed: a **shared secret token** the app sends in a header (the function rejects requests without it), and **rate-limiting** per source. Prevents junk rows and runaway cost.
-- The whole path — endpoint and database — is infrastructure we own; no third-party analytics SDK is embedded in the app.
+- **Backend: self-hosted GlitchTip.** GlitchTip is an open-source, Sentry-API-compatible error-tracking server we run ourselves (its own container + Postgres). Because it speaks the Sentry protocol, the app uses the stock **Sentry Rust SDK** as the client — no custom ingest endpoint, no bespoke schema. Crashes, `error` events, doctor feedback, and the named product events (`app_launched`, `note_generated`, `correction_pass_ran`, …) all arrive as Sentry events; `TechnicalContext` and per-event `props` ride along as event extras/tags, and error/crash reports carry the stack trace.
+- **DSN, not a public POST URL.** The app is configured with a **DSN** (`MEDSCRIBE_CRASH_DSN`), a send-only client ingest key that names the GlitchTip project and authenticates submissions. It is baked in at compile time (`option_env!`) and safe to ship in the binary. GlitchTip's own per-project rate-limiting and DSN scoping guard the endpoint — there is no separate shared-secret header to manage.
+- **`install_id`** is a random UUID generated once per install and stored in the settings file, attached to events as the Sentry user/device id. It identifies a *device*, never a patient, so distinct-device counts and per-device error rates are possible without any PHI or personal identifier.
+- The whole path — GlitchTip server and its database — is infrastructure we own and host; only the Sentry *SDK* (a client library speaking an open protocol) is embedded in the app, and no third-party analytics vendor receives any data.
 
 ### 14.5 Release pipeline & versioning
 
 - **CI/CD (GitHub Actions).** On every push/PR, CI runs `cargo test` + `bun test` + a compile (catch breakage early). On a **version tag**, CD spins up a Windows runner → `tauri build` → code-sign → publish the GitHub Release with the installer, the signed updater bundle, and `latest.json` (§14.3). This removes the manual, error-prone per-release steps and guarantees every release is signed and complete.
 - **Version-bump discipline.** The auto-updater decides "is there an update?" by comparing the installed `tauri.conf.json` version against the released one. **The version must be bumped before every release** or the updater sees no change and users never receive it. CD enforces this by tagging = the source of the version, so a release can't be cut without a new number.
-
-**Why the one-key EMR paste is deferred (technical note).** The hotkey hand-off's core requirement is **focus preservation**: the paste must land in the EMR field the clinician selected, so the picker must appear **without stealing focus** from that field. A normal pop-up window activates when shown — Windows moves keyboard focus to it, the EMR field loses the caret, and the simulated Ctrl+V then pastes nowhere useful. Solving this needs two pieces of native, Windows-specific work: (1) a **non-activating, always-on-top overlay** — the Win32 `WS_EX_NOACTIVATE` extended window style, which the app framework does not expose and which must be set on the window handle directly; and (2) because a window that never holds focus also never receives keyboard events, the picker can't be driven by ordinary in-page key handling — the navigation keys (S/O/A/P, arrows, Enter, Esc) must be captured **globally by the backend** while the overlay is visible and **forwarded** to it, then unregistered when it closes. Both pieces only do anything on a real Windows machine and can't be validated on the Linux/WSL build host, so they are best built and verified in a Windows session. v1 therefore ships the **manual copy/paste** hand-off (§8.6); the backend command surface for the hotkey path (`paste_section`, global-shortcut registration) is built but dormant, so adding the overlay later is additive rather than a rework.
