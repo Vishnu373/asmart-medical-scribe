@@ -3,7 +3,6 @@ import RecordingControls from "@/components/RecordingControls";
 import StatusBadge from "@/components/StatusBadge";
 import LevelMeter from "@/components/LevelMeter";
 import TranscriptEditor from "@/components/TranscriptEditor";
-import CorrectionSuggestions from "@/components/CorrectionSuggestions";
 import NotePanel from "@/components/NotePanel";
 
 /** Recording view: controls, live status, input-level meter, the live editable
@@ -31,7 +30,6 @@ export default function RecordingView() {
         <div className="flex flex-1 flex-col">
           <TranscriptEditor />
         </div>
-        <CorrectionSuggestions />
       </div>
 
       <NotePanel />

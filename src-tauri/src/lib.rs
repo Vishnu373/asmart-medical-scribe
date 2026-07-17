@@ -22,9 +22,9 @@ mod trial;
 use std::sync::Arc;
 use std::time::Duration;
 
-use tauri::{Emitter, Manager};
+use tauri::Manager;
 
-use llm::{LlmEngine, LlmModel, RealCorrectionSuggester, RealNoteGenerator};
+use llm::{LlmEngine, LlmModel, RealNoteGenerator};
 use orchestrator::{emit_app_event, Coordinator, RealPipeline};
 use residency::ResidencyMode;
 use settings::Settings;
@@ -102,42 +102,32 @@ pub fn run() {
             // dir (D1); the installer bundles no LLM, so it comes from the download dir.
             let llm_model = LlmModel::Gemma;
             let model_dirs = models::model_dirs(app.handle()).map_err(|e| e.to_string())?;
-            let n_threads = std::thread::available_parallelism()
-                .map(|n| n.get() as i32)
-                .unwrap_or(4);
+            // LLM thread count (design §8.2): token-by-token decode is memory-bandwidth-
+            // bound and stops scaling — often regresses — past a fraction of the cores,
+            // so use physical // 2. The same count caps prefill (see `engine::new_context`)
+            // so it can't fall to the llama.cpp default of 4. When the physical count is
+            // unavailable, estimate it as half the logical count (assume 2-way SMT) so the
+            // fallback still targets physical // 2 rather than 2× it.
+            let n_threads = sysinfo::System::new()
+                .physical_core_count()
+                .or_else(|| std::thread::available_parallelism().map(|n| n.get() / 2).ok())
+                .map(|physical| (physical / 2).max(1) as i32)
+                .unwrap_or(1);
             let llm_engine = Arc::new(
-                LlmEngine::new(llm_model, model_dirs.clone(), n_threads).map_err(|e| e.to_string())?,
+                LlmEngine::new(llm_model, model_dirs.clone(), n_threads)
+                    .map_err(|e| e.to_string())?,
             );
             let swap_mode = mode == ResidencyMode::Swap;
-            if !swap_mode {
-                // Co-resident: warm the model so the first Generate is instant, but
-                // do it on a background thread — the multi-GB GGUF load + warmup is
-                // seconds long and `setup` runs on the main thread before the webview
-                // paints, so warming here synchronously froze the window ("not
-                // responding") on launch (design §8.2, startup fix). The UI shows a
-                // "preparing" status until the `llm-status` event flips to `ready`.
-                // A load failure is non-fatal — the first generation retries and
-                // surfaces the error then.
-                let engine = llm_engine.clone();
-                let status_handle = app.handle().clone();
-                std::thread::spawn(move || {
-                    let _ = status_handle
-                        .emit("llm-status", serde_json::json!({ "status": "loading" }));
-                    match engine.ensure_loaded() {
-                        Ok(()) => {
-                            let _ = status_handle
-                                .emit("llm-status", serde_json::json!({ "status": "ready" }));
-                        }
-                        Err(e) => {
-                            log::warn!("LLM preload failed (will retry on first generation): {e}");
-                            let _ = status_handle.emit(
-                                "llm-status",
-                                serde_json::json!({ "status": "error", "message": e.to_string() }),
-                            );
-                        }
-                    }
-                });
-            }
+            // Co-resident wants a warm model so the first Generate is instant, but the
+            // multi-GB GGUF load + warmup is seconds long, and starting it here — in
+            // `setup`, before the webview paints — starved WebView2's first paint and
+            // froze the window ("not responding") on launch, even on a background
+            // thread. So the warm is deferred: the gate holds the engine until the
+            // frontend reports it has fully mounted (`frontend_ready`), then warms once
+            // off the main thread. The UI shows a "preparing" status until the
+            // `llm-status` event flips to `ready`. Disabled in swap mode (loads lazily
+            // per generation). (design §8.2, startup fix.)
+            app.manage(commands::PreloadGate::new(llm_engine.clone(), !swap_mode));
 
             let handle = app.handle().clone();
             let pipeline = RealPipeline::new(
@@ -151,16 +141,11 @@ pub fn run() {
             // Managed so the `get_llm_status` command can report load readiness (§8.2
             // startup fix): it and the generator share the same `Arc<LlmEngine>`.
             app.manage(llm_engine.clone());
-            // Correction (§6.7) reuses the same resident engine; it holds its own
-            // clone so it and the note generator share one loaded model.
-            let suggester =
-                RealCorrectionSuggester::new(handle.clone(), llm_engine.clone(), swap_mode);
             let generator =
                 RealNoteGenerator::new(handle.clone(), llm_engine, store.clone(), swap_mode);
             let coordinator = Coordinator::new(
                 Box::new(pipeline),
                 Box::new(generator),
-                Box::new(suggester),
                 Box::new(move |event| emit_app_event(&handle, event)),
             );
             // Managed as an `Arc` so the async `generate_note` command can move an
@@ -196,12 +181,12 @@ pub fn run() {
             commands::delete_record,
             commands::generate_note,
             commands::regenerate_note,
-            commands::suggest_corrections,
             commands::cancel_generation,
             commands::update_note,
             commands::revert_version,
             commands::get_settings,
             commands::get_llm_status,
+            commands::frontend_ready,
             commands::update_settings,
             commands::list_input_devices,
             commands::submit_feedback,

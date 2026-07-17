@@ -26,12 +26,11 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::LlamaStateSeqFlags;
 
-use super::correction;
 use super::prompt;
 
 /// The note-generation model (design §8.2). A single on-device model —
 /// `gemma-4-E2B-it-UD-Q4_K_XL` — behind the `NoteGenerator` interface. Kept as an
-/// enum (one variant today) so `prompt` / `correction` / [`PrefixCache`] keep a
+/// enum (one variant today) so `prompt` / [`PrefixCache`] keep a
 /// typed dispatch point if a second model is ever added. The installer bundles no
 /// LLM; it is downloaded once at first-run Setup (D3, `models`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -54,10 +53,20 @@ impl LlmModel {
 // Tuning constants (design §8.2 "set at implementation via benchmarking"): kept
 // conservative so the context fits a realistic consult without reserving RAM the
 // §7 budget needs.
-const N_CTX: u32 = 8192; // prompt + transcript + note; well under the model maxima
-const MAX_OUTPUT_TOKENS: i32 = 1536; // generous ceiling for a SOAP note
-const MAX_CORRECTION_TOKENS: i32 = 512; // JSON-lines suggestions are short; decode-light (§6.7)
+const N_CTX: u32 = 8192; // prompt + transcript + reasoning + note; well under the model maxima
+const MAX_OUTPUT_TOKENS: i32 = 1536; // ceiling for the SOAP note itself (post-reasoning)
+const MAX_REASONING_TOKENS: i32 = 1024; // separate cap for the <think> scratchpad (§8.3) so a
+                                        // verbose CoT can't eat the note's budget; tunable (§8.2)
 const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hallucination
+
+/// Generate-path reasoning suppression (design §8.3): the boundary string that ends
+/// the `<think>` block, plus a cap on the reasoning phase. The note is given its own
+/// `max_tokens` *after* the boundary, so a long scratchpad can never truncate it.
+struct Suppress<'a> {
+    open: &'a str,
+    boundary: &'a str,
+    max_reasoning_tokens: i32,
+}
 
 /// Serialized KV state of the fixed prompt prefix (system + one-shot example, §8.3)
 /// for one model. Restoring this into a fresh context skips re-decoding the prefix
@@ -89,6 +98,8 @@ pub struct LlmEngine {
     /// Model-file search dirs, in priority order (D1): the app-data download dir
     /// first (optional models the doctor pulled), then the bundled resource dir.
     model_dirs: Vec<PathBuf>,
+    /// Decode-phase threads (physical // 2); prefill left at the llama.cpp default
+    /// (design §8.2 — decode is bandwidth-bound and stops scaling; prefill is not).
     n_threads: i32,
     /// Serializes [`ensure_loaded`] so the co-resident background preload (design
     /// §8.2 startup fix) and an early Generate can't both load the model at once.
@@ -99,7 +110,8 @@ pub struct LlmEngine {
 impl LlmEngine {
     /// Create the engine for `kind`, resolving the model file across `model_dirs`
     /// (first existing wins). The model itself is not loaded until [`ensure_loaded`];
-    /// `n_threads` is scaled to the machine's physical cores (design §8.2).
+    /// `n_threads` (physical // 2, design §8.2) is applied to both decode and prefill
+    /// (see [`new_context`]).
     pub fn new(kind: LlmModel, model_dirs: Vec<PathBuf>, n_threads: i32) -> Result<Self> {
         let backend = LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
         Ok(Self {
@@ -171,8 +183,10 @@ impl LlmEngine {
     }
 
     /// Generate a SOAP note from `transcript`, streaming each decoded piece to
-    /// `on_token` and polling `cancel` between tokens. Returns the full note
-    /// markdown, or `None` if cancelled (the caller discards the partial, §8.4).
+    /// `on_token` and polling `cancel` between tokens. Returns the note markdown, or
+    /// `None` if cancelled (the caller discards the partial, §8.4). The model reasons
+    /// in a private `<think>` block first; only the note after
+    /// [`prompt::REASONING_BOUNDARY`] is streamed and returned (§8.3).
     ///
     /// The prompt is built as the fixed prefix + this transcript's tail; when the
     /// prefix's KV state is cached (§8.7) it is restored into the fresh context and
@@ -198,17 +212,19 @@ impl LlmEngine {
         let tokens = model
             .str_to_token(&prompt, AddBos::Always)
             .map_err(|e| anyhow!("failed to tokenize prompt: {e}"))?;
-        // Reserve room for the note itself: the KV cache holds prompt + generated
-        // tokens, so the prompt must leave at least `MAX_OUTPUT_TOKENS` of headroom
-        // under N_CTX. Checking the prompt alone would let a long-but-fitting
-        // transcript stream a partial note and then fail mid-decode at position
-        // N_CTX. Unchanged by caching — the tail still occupies the same positions.
-        let prompt_budget = N_CTX as i32 - MAX_OUTPUT_TOKENS;
+        // Reserve room for *both* phases: the KV cache holds prompt + reasoning +
+        // note, so the prompt must leave MAX_REASONING_TOKENS + MAX_OUTPUT_TOKENS of
+        // headroom under N_CTX. Reserving the note budget alone (or checking the
+        // prompt alone) would let a verbose <think> block push the note past N_CTX and
+        // truncate it mid-decode. Unchanged by caching — the tail still occupies the
+        // same positions.
+        let output_budget = MAX_REASONING_TOKENS + MAX_OUTPUT_TOKENS;
+        let prompt_budget = N_CTX as i32 - output_budget;
         if tokens.len() as i32 >= prompt_budget {
             return Err(anyhow!(
                 "transcript is too long for the model context ({} tokens; the prompt \
-                 must stay under {prompt_budget} to leave room for the {MAX_OUTPUT_TOKENS}-token \
-                 note within the {N_CTX} context)",
+                 must stay under {prompt_budget} to leave room for the {output_budget}-token \
+                 reasoning+note within the {N_CTX} context)",
                 tokens.len()
             ));
         }
@@ -217,47 +233,24 @@ impl LlmEngine {
         // Restore the cached prefix KV if this prompt starts with exactly its
         // tokens; otherwise start from position 0 (full decode, the fallback).
         let start = self.restore_prefix(&mut ctx, kind, &tokens);
-        self.decode_and_generate(&mut ctx, model, &tokens, start, MAX_OUTPUT_TOKENS, on_token, cancel)
-    }
-
-    /// Run the post-ASR correction pass (design §6.7) over `transcript` on the
-    /// resident model, streaming each decoded piece to `on_token` (the caller
-    /// splits the stream into JSON-lines records) and polling `cancel`. Returns the
-    /// full raw output, or `None` if cancelled.
-    ///
-    /// Reuses the same streaming decode as [`generate`] but with the correction
-    /// prompt and a smaller token cap (suggestions are short). The correction prompt
-    /// is not the SOAP prefix, so the prefix cache (§8.7) can't apply — the whole
-    /// prompt is decoded from position 0.
-    pub fn suggest_corrections(
-        &self,
-        transcript: &str,
-        on_token: &dyn Fn(&str),
-        cancel: &Arc<AtomicBool>,
-    ) -> Result<Option<String>> {
-        self.ensure_loaded()?;
-        let kind = self.model_kind();
-        let prompt = correction::build_prompt(kind, transcript);
-
-        let guard = self.lock_model();
-        let model = guard
-            .as_ref()
-            .ok_or_else(|| anyhow!("LLM model is not loaded"))?;
-
-        let tokens = model
-            .str_to_token(&prompt, AddBos::Always)
-            .map_err(|e| anyhow!("failed to tokenize correction prompt: {e}"))?;
-        let prompt_budget = N_CTX as i32 - MAX_CORRECTION_TOKENS;
-        if tokens.len() as i32 >= prompt_budget {
-            return Err(anyhow!(
-                "transcript is too long for the correction pass ({} tokens; the prompt must \
-                 stay under {prompt_budget} within the {N_CTX} context)",
-                tokens.len()
-            ));
-        }
-
-        let mut ctx = self.new_context(model)?;
-        self.decode_and_generate(&mut ctx, model, &tokens, 0, MAX_CORRECTION_TOKENS, on_token, cancel)
+        let note = self.decode_and_generate(
+            &mut ctx,
+            model,
+            &tokens,
+            start,
+            MAX_OUTPUT_TOKENS,
+            Some(Suppress {
+                open: prompt::REASONING_OPEN,
+                boundary: prompt::REASONING_BOUNDARY,
+                max_reasoning_tokens: MAX_REASONING_TOKENS,
+            }),
+            on_token,
+            cancel,
+        )?;
+        // Deterministic scrub of any reasoning marker the model echoed after the note
+        // body (§8.5) — the streamed buffer may briefly flash it, but the persisted
+        // note never carries it. Cancellation returns `None` and is passed through.
+        Ok(note.map(|n| prompt::sanitize_note(&n)))
     }
 
     /// Prime the prefix cache (§8.7): decode the fixed prefix once and serialize the
@@ -330,6 +323,29 @@ impl LlmEngine {
     /// Decode `tokens[start..]` into `ctx` (positions `start..`, so a restored
     /// prefix lines up), then stream generated tokens until end-of-generation, the
     /// token cap, or cancellation. Shared by the cached and full-decode paths.
+    ///
+    /// `suppress` gates the chain-of-thought (design §8.3): when `Some` (the generate
+    /// path), decoded pieces are buffered and **not** streamed until the boundary
+    /// ([`prompt::REASONING_BOUNDARY`]) appears; only the note after it is streamed
+    /// and returned, so the `<think>` reasoning is never shown or persisted. `None`
+    /// streams every piece unfiltered.
+    ///
+    /// Three things keep the note from being truncated or lost:
+    /// - **Plain-note fallback.** If the model skips the format — its first content is
+    ///   not the `<think>` opener — there is no reasoning block, so streaming starts
+    ///   immediately and every token counts against the *note* budget. (Counting a
+    ///   plain note as reasoning is what used to cap it at `max_reasoning_tokens`.)
+    /// - **Note budget after the boundary.** Once reasoning closes, the note gets its
+    ///   own `max_tokens` regardless of how long the scratchpad ran.
+    /// - **Reasoning cap → forced boundary.** If the `<think>` block runs past
+    ///   `max_reasoning_tokens`, the boundary is force-decoded into the context so the
+    ///   model stops reasoning and writes the note, rather than erroring out — under
+    ///   near-greedy decoding that error would reproduce identically on every retry, a
+    ///   permanent wall.
+    ///
+    /// The only remaining no-boundary case is the model ending its turn (EOG)
+    /// mid-`<think>`: output that opened `<think>` but never closed it is pure
+    /// scratchpad → error out rather than persist the reasoning as the note (§8.3).
     #[allow(clippy::too_many_arguments)]
     fn decode_and_generate(
         &self,
@@ -338,6 +354,7 @@ impl LlmEngine {
         tokens: &[LlamaToken],
         start: i32,
         max_tokens: i32,
+        suppress: Option<Suppress>,
         on_token: &dyn Fn(&str),
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>> {
@@ -358,14 +375,58 @@ impl LlmEngine {
             LlamaSampler::greedy(),
         ]);
 
-        let mut out = String::new();
+        let mut raw = String::new(); // full generation, including any reasoning block
+        let mut note = String::new(); // the streamed/returned portion (post-boundary)
+        // With no suppression the whole stream is the note from the first token.
+        let mut boundary_passed = suppress.is_none();
         // Absolute next position: the prompt fills 0..tokens.len(), so generation
         // continues there regardless of how much of the prompt was cached.
         let mut n_cur = tokens.len() as i32;
-        let mut generated = 0;
-        while generated < max_tokens {
+        let mut note_tokens = 0; // counted against `max_tokens` (the note budget)
+        let mut reasoning_tokens = 0; // counted against the reasoning cap, while suppressing
+        // Cursor into `raw` for the boundary search: everything before it has already
+        // been scanned and can't be part of a first match, so each token only searches
+        // the newly-grown suffix instead of rescanning from 0 (avoids O(n²) on the
+        // decode hot path). The boundary may straddle two pieces, so we back the cursor
+        // up by `boundary.len() - 1` to keep the overlap where a match could complete.
+        let mut scan_from = 0usize;
+        loop {
             if cancel.load(Ordering::Relaxed) {
                 return Ok(None); // partial note discarded by the caller
+            }
+            // The note gets its own `max_tokens` regardless of how long the reasoning
+            // ran; the reasoning phase is separately capped so it can't consume the
+            // context reserved for the note (§8.3).
+            if boundary_passed {
+                if note_tokens >= max_tokens {
+                    break;
+                }
+            } else if let Some(s) = &suppress {
+                if reasoning_tokens >= s.max_reasoning_tokens {
+                    // Runaway scratchpad: the model is still reasoning past its cap. We
+                    // do *not* break here — under near-greedy decoding that would hit
+                    // the "produced only reasoning" error identically on every retry, a
+                    // permanent wall that could never produce a note (§8.3). Instead
+                    // force-close the `<think>` block by decoding the boundary tokens
+                    // into the context and switch to streaming, so the cap means "stop
+                    // thinking, write the note now" rather than "fail forever".
+                    let forced = model
+                        .str_to_token(s.boundary, AddBos::Never)
+                        .map_err(|e| anyhow!("failed to tokenize reasoning boundary: {e}"))?;
+                    batch.clear();
+                    let last = forced.len() as i32 - 1;
+                    for (j, t) in forced.iter().enumerate() {
+                        batch
+                            .add(*t, n_cur, &[0], j as i32 == last)
+                            .map_err(|e| anyhow!("failed to inject the reasoning boundary: {e}"))?;
+                        n_cur += 1;
+                    }
+                    ctx.decode(&mut batch)
+                        .map_err(|e| anyhow!("boundary injection decode failed: {e}"))?;
+                    raw.push_str(s.boundary);
+                    boundary_passed = true;
+                    continue; // next sample reads the boundary's logits → first note token
+                }
             }
 
             let token = sampler.sample(ctx, batch.n_tokens() - 1);
@@ -377,26 +438,113 @@ impl LlmEngine {
             let piece = model
                 .token_to_str(token, Special::Tokenize)
                 .map_err(|e| anyhow!("failed to decode a token: {e}"))?;
-            on_token(&piece);
-            out.push_str(&piece);
+            // Some Gemma GGUFs don't mark <end_of_turn> as an end-of-generation token,
+            // so is_eog_token misses it; under Special::Tokenize it then renders as the
+            // literal tag and would both leak into the note and let generation run on to
+            // max_tokens (wasted CPU). Each turn-control token is a single token → a
+            // single complete piece, so an exact match ends the turn here with no
+            // hold-back buffer, before the piece is streamed or appended.
+            if piece == "<end_of_turn>" || piece == "<start_of_turn>" {
+                break;
+            }
+            raw.push_str(&piece);
+
+            if boundary_passed {
+                on_token(&piece);
+                note.push_str(&piece);
+                note_tokens += 1;
+            } else if let Some(s) = &suppress {
+                let trimmed = raw.trim_start();
+                if !trimmed.is_empty()
+                    && !trimmed.starts_with(s.open)
+                    && !s.open.starts_with(trimmed)
+                {
+                    // The model skipped the two-phase format: its first content is not
+                    // the reasoning opener (and isn't a partial prefix of it still being
+                    // formed), so there is no `<think>` block and everything so far is a
+                    // plain note (the §8.3 fallback). Switch to note mode now — stream
+                    // what's buffered and count it against the *note* budget, not the
+                    // reasoning cap. Counting a plain note as reasoning is exactly what
+                    // capped it at `max_reasoning_tokens` and truncated notes longer than
+                    // that. Detection lands on the first content token, so `trimmed` is
+                    // effectively that one token.
+                    boundary_passed = true;
+                    on_token(trimmed);
+                    note.push_str(trimmed);
+                    note_tokens += 1;
+                } else if let Some(rel) = raw[scan_from..].find(s.boundary) {
+                    // Reasoning closed: everything up to the boundary was the private
+                    // scratchpad. Stream only the note text after it.
+                    boundary_passed = true;
+                    let idx = scan_from + rel;
+                    let tail = raw[idx + s.boundary.len()..].trim_start();
+                    if !tail.is_empty() {
+                        on_token(tail);
+                        note.push_str(tail);
+                        note_tokens += 1;
+                    }
+                } else {
+                    // Still inside the reasoning block, boundary not seen yet. It may
+                    // straddle two pieces, so keep buffering and search from `scan_from`
+                    // (which keeps the previous piece's tail overlap) rather than only
+                    // this piece. Advance the cursor to just before where the next token
+                    // could complete the boundary (the trailing overlap), then back off
+                    // to a char boundary so the next slice can't split a multibyte char
+                    // in the reasoning text.
+                    reasoning_tokens += 1;
+                    scan_from = raw.len().saturating_sub(s.boundary.len() - 1);
+                    while scan_from > 0 && !raw.is_char_boundary(scan_from) {
+                        scan_from -= 1;
+                    }
+                }
+            }
 
             batch.clear();
             batch
                 .add(token, n_cur, &[0], true)
                 .map_err(|e| anyhow!("failed to add a token to the batch: {e}"))?;
             n_cur += 1;
-            generated += 1;
             ctx.decode(&mut batch)
                 .map_err(|e| anyhow!("token decode failed: {e}"))?;
         }
 
-        Ok(Some(out))
+        if boundary_passed {
+            Ok(Some(note))
+        } else if raw.contains(prompt::REASONING_OPEN) {
+            // The model opened `<think>` and then ended its turn (EOG) before closing
+            // it — the only way to land here now that the reasoning cap force-closes the
+            // block instead of breaking. `raw` is the private scratchpad with no note
+            // after it. Streaming or persisting that would turn the model's internal
+            // reasoning into the clinician's saved note (a PHI-shaped leak), so fail
+            // loudly instead — the caller persists nothing and the clinician regenerates.
+            Err(anyhow!(
+                "note generation produced only reasoning (no {:?} boundary); discarding \
+                 the scratchpad rather than persisting it as a note",
+                prompt::REASONING_BOUNDARY
+            ))
+        } else {
+            // Degenerate output with no `<think>` and no note content routed inline (a
+            // plain note is caught during the loop and streamed live). This is reached
+            // only by all-whitespace or an unclosed partial `<think>` prefix at EOG —
+            // return whatever there is rather than nothing (design §8.3 edge case).
+            warn!(
+                "reasoning boundary {:?} not found in generation; returning full output",
+                suppress.as_ref().map(|s| s.boundary)
+            );
+            on_token(&raw);
+            Ok(Some(raw))
+        }
     }
 
     /// A fresh inference context sized to N_CTX on the engine's thread budget. One
     /// is built per note (and per prefix priming); the cached prefix state is
     /// restored into it, so nothing needs to hold a context across notes (§8.7).
     fn new_context<'a>(&'a self, model: &'a LlamaModel) -> Result<LlamaContext<'a>> {
+        // Both phases run on the tuned thread count (physical // 2, design §8.2): decode
+        // (`n_threads`) is memory-bandwidth-bound and regresses past a fraction of the
+        // cores, and we cap prefill (`n_threads_batch`) at the same count rather than let
+        // it fall to the llama.cpp default of 4 — 4 would throttle the transcript-tail
+        // prefill (the uncached part of every note) on any many-core machine.
         let ctx_params = LlamaContextParams::default()
             .with_n_ctx(NonZeroU32::new(N_CTX))
             .with_n_threads(self.n_threads)

@@ -392,31 +392,6 @@ The model is **not** unloaded here in v1 — it is left warm, and the idle-watch
 
 **Clean teardown & resilience.** Threads are stopped via a signal and **joined** (or parked for reuse) and the queue is closed, so no orphaned threads survive between encounters. If a thread **panics** (e.g. a model error), the coordinator catches it, surfaces an error to the UI, and returns the machine to a safe **IDLE** rather than wedging.
 
-### 6.7 Post-ASR correction suggestions
-
-This stage answers: **how do we help the clinician catch the mishearings that fuzzy word-fixing (§6.3) can't — errors that only a reader who understands the sentence would spot?** Deterministic cleanup corrects a single garbled word against a known list; it cannot repair a phrase that was transcribed as fluent-but-wrong English. 
-
-**Suggest, never rewrite.** The correction pass proposes edits; it does **not** change the transcript on its own. Each suggestion is surfaced in the UI and applied only if the clinician **accepts** it. This is the property that keeps the feature safe: the machine never silently alters what was said, so it cannot introduce a clinical fact the clinician didn't approve. It is the same anti-fabrication discipline as note generation (§8.3), enforced here by a human-in-the-loop gate rather than by a prompt alone.
-
-**When it runs — sequenced, on Stop, before Generate.** The pass is triggered automatically when recording stops, and slots into the review step of §8.1 (between Stop and Generate):
-
-```
-Stop ─► correction suggestions (auto) ─► clinician accepts/rejects ─► clicks Generate ─► note
-```
-
-**Reuses the resident model.** Correction uses the **same note-generation LLM** already governed by the residency strategy (§7).
-The cost is one extra inference over the transcript; because it is **prefill-heavy but decode-light** (long input, short structured output), it is meaningfully cheaper than the note itself, and it overlaps the clinician's own reading, so its latency is largely hidden.
-
-**Streamed, parse-as-you-go.** The model emits suggestions as a stream of small, independently-parseable units (one structured record per line), each naming an **original span** and its **replacement**. The UI shows each suggestion the instant its record completes, rather than waiting for the whole pass — so the first corrections appear early and perceived latency drops. Constraining the output to *replacements of spans that exist in the transcript* (not free-form text) is what keeps a "suggestion" from becoming an invention.
-
-**Non-blocking presentation — a review list beside the transcript.** Suggestions appear as a **list next to the transcript**, each row showing the flagged phrase and its proposed replacement with Accept / Reject in place, without obscuring the transcript. Accepting replaces that span in the editor and rides the existing debounced autosave (§6.5); rejecting dismisses it. The clinician can also ignore the whole pass — a **Cancel** path (reusing the generation cancel mechanism) lets them skip straight to editing and Generate.
-
-**Behavioral rules.**
-
-- **Duplicate spans** — if the same original phrase occurs more than once, a suggestion applies to the **first not-yet-accepted** occurrence. (Rare; a simple, predictable rule.)
-- **No suggestions** — if the pass finds nothing, nothing pops up and Generate simply becomes available. No error, no modal.
-- **Failure/cancel** — a model error or a Cancel returns to a plain editable transcript; the feature is strictly additive and never blocks note generation.
-
 ---
 
 ## 7. Model Residency Strategy
@@ -472,7 +447,7 @@ Phase two turns a verified transcript into a structured clinical note. This sect
 Note generation is **manual and explicit**, not automatic on Stop. The sequence is:
 
 1. **Stop** finalizes the transcript. In-flight audio is flushed and the last segments land in the transcript (the Processing→Idle drain described in §6.6). The complete transcript is shown in the UI and the machine is back at rest — no model is running.
-2. **The clinician reviews and edits the transcript**, assisted by the post-ASR correction suggestions that ran automatically on Stop (§6.7).
+2. **The clinician reviews and edits the transcript.**
 3. **The clinician clicks Generate.** *This* is the trigger that starts note generation, operating on the transcript exactly as the user left it.
 
 Making generation an explicit, post-review action is a deliberate clinical-safety choice: the clinician verifies the source text before a note is built from it, and the expensive LLM step is decoupled from recording.
@@ -586,6 +561,10 @@ This section covers how the streamed note reaches the screen and how it is store
 
 **Reasoning is withheld from the stream (v0.1.2).** With chain-of-thought (§8.3) the model emits reasoning before the note. The generator does not forward those tokens: it withholds streaming until the reasoning→note boundary, then streams only the note. So both the streamed buffer and the persisted note contain the note alone — the clinician never sees the chain-of-thought, and it is never written to the encrypted store.
 
+**Control tokens end the turn at the source (v0.1.2).** Some Gemma GGUFs don't include `<end_of_turn>` in their end-of-generation set, so `is_eog_token` misses it; rendered with special tokens enabled it would otherwise leak into the note *and* let decoding run on to the full token budget (wasted CPU). Each chat-template turn token (`<end_of_turn>`, `<start_of_turn>`) is a single token → a single complete decoded piece, so the decode loop ends the turn on an exact string match — no hold-back buffer needed — before the piece is streamed or appended.
+
+**Deterministic marker scrub on the persisted note (v0.1.2).** The decode loop stops the turn at `<end_of_turn>` and the boundary suppression strips reasoning up to the *first* `</think>`; but a small quantized model sometimes echoes the structural tags again after the note body (typically a stray trailing `</think>`), which then flow through as note text. Before the note is persisted, a plain non-AI check-and-remove pass (`prompt::sanitize_note`) truncates at any residual turn marker and deletes any `<think>…</think>` span or orphan tag. It runs **once** on the finished note, so it adds no per-token latency, and it guarantees the saved clinical record is clean. *Future consideration:* the same deterministic scrub could be applied to the **live stream** so a stray marker never briefly flashes in the streaming view before generation completes — this needs a small hold-back tail buffer (a multi-token marker can split across two token pieces, the same reason the boundary search buffers), so it is deferred as cosmetic polish; the persisted note is already clean without it.
+
 **Storage engine.** All clinical data is held in a single **SQLite database encrypted with SQLCipher**, so the note, its versions, and the transcript are encrypted at rest and never leave the device. Application settings remain in the separate plain JSON store (no PHI), as decided for Phase 1.
 
 **Audio retention.** The audio recording is **discarded** once the transcript is finalized — it is never written to the database. This minimizes the PHI footprint: the most sensitive raw artifact does not persist. Re-transcription from audio is therefore not possible in v1, which is an accepted trade-off.
@@ -624,7 +603,7 @@ The few-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 
 **Interaction with residency (§7).** This helps **co-resident** mode only. In **swap** mode the model is unloaded after each generation to free RAM for STT (§8.4), which destroys the context and its cached prefix — so the next note re-prefills from cold regardless. That is acceptable: swap mode is the RAM-constrained path where keeping a model (and context) warm isn't affordable anyway. 
 
-**Dependency & fallback.** Reuse needs the `llama-cpp-2` binding to expose **sequence-scoped state save/restore** (`state_seq_get_size_ext` / `state_seq_get_data_ext` / `state_seq_set_data_ext`), confirmed present in the pinned version (0.1.150). The sequence-scoped variants (over the whole-context `get_state_size` / `copy_state_data`) are what keep the snapshot sized to the prefix's cells rather than the full N_CTX cache. The binding *also* exposes KV-cache trim (`clear_kv_cache_seq`), which the persistent-context alternative would have used — but the save/restore path is what we build (see the trade-off below). The **fallback** is the current behavior — prefill the full prompt per note — and it is entered automatically whenever the snapshot is missing (not yet primed, or after `unload`) or the boundary check fails, so the feature degrades to "correct but not cached" rather than breaking generation. The same fixed-prefix lever is shared by the correction pass (§6.7), so both benefit from one implementation.
+**Dependency & fallback.** Reuse needs the `llama-cpp-2` binding to expose **sequence-scoped state save/restore** (`state_seq_get_size_ext` / `state_seq_get_data_ext` / `state_seq_set_data_ext`), confirmed present in the pinned version (0.1.150). The sequence-scoped variants (over the whole-context `get_state_size` / `copy_state_data`) are what keep the snapshot sized to the prefix's cells rather than the full N_CTX cache. The binding *also* exposes KV-cache trim (`clear_kv_cache_seq`), which the persistent-context alternative would have used — but the save/restore path is what we build (see the trade-off below). The **fallback** is the current behavior — prefill the full prompt per note — and it is entered automatically whenever the snapshot is missing (not yet primed, or after `unload`) or the boundary check fails, so the feature degrades to "correct but not cached" rather than breaking generation.
 
 **Non-goals.** No cross-*session* (on-disk) cache — the prefix is cheap to prefill once per app run, and persisting KV state to disk adds complexity and a versioning/staleness surface for no material gain. No caching of the transcript or generated tokens (they are unique per note).
 
@@ -733,7 +712,7 @@ The clinical DB is encrypted with SQLCipher (AES-256, §9.1). The open question 
 
 - **Allowlist, never blocklist.** Each event is built from a fixed set of non-PHI fields — app version, OS, arch, detected RAM tier, active model tier, event name, coarse timings, and for errors the error *type/message string only* (`TechnicalContext`). Nothing else is attachable by construction.
 - **Scrub backstop (defense-in-depth).** Every outgoing event still passes through `scrub_event`, which recursively strips any field whose key looks like PHI (`transcript`, `soap`, `note`, `label`, `record`) — so a future richer payload can never leak one.
-- **Events:** `app_launched`, `setup_started` / `model_download_done` / `model_download_failed`, `note_generated` (+ ms), `correction_pass_ran`, `error` (sanitized), `crash` (stack trace + `TechnicalContext`).
+- **Events:** `app_launched`, `setup_started` / `model_download_done` / `model_download_failed`, `note_generated` (+ ms), `error` (sanitized), `crash` (stack trace + `TechnicalContext`).
 - **Transport:** the **Sentry Rust SDK** sends each event to **our own self-hosted GlitchTip** instance (§14.4) — the SDK queues, batches, and retries in a background thread, never blocks the UI, and is silent on failure. Every event still passes the `scrub_event` backstop via the SDK's `before_send` hook before it leaves the process. It is off unless **both** the `crash-reporting` cargo feature is enabled **and** a DSN is compiled into the build (`MEDSCRIBE_CRASH_DSN`), so the default build has no client, sends nothing, and stays fully offline. GlitchTip is Sentry-API-compatible and self-hosted, so no third-party analytics vendor receives any data.
 
 ### 10.4 Data lifecycle
@@ -758,16 +737,6 @@ The clinic/clinician is the **custodian** of the health information; the app is 
 - **Rationale:** In `llama-cpp-2`, a `LlamaContext` borrows the loaded `LlamaModel`, so storing a persistent context beside the owned model in the engine struct is **self-referential** — safe Rust won't allow it without `unsafe`/lifetime hacks or an extra self-referencing crate. Both options skip the same expensive step (running the prefix through every model layer — seconds of CPU), which is the entire point of the feature. Option 2 reuses the fresh-context-per-note path the engine already had, so it needs no new lifetime machinery; it also makes reset-to-boundary and cancel/error cleanup **automatic** (the snapshot is never mutated and each note's context is discarded), removing the mandatory-trim invariant Option 1 carries. Its only extra cost is a per-note memory copy of the snapshot — **milliseconds against the seconds saved** — so the win is effectively identical while the code stays simpler and safer. The binding exposes both APIs (0.1.150), so this is a design choice, not a capability limit.
 - **Revisit if:** profiling on Windows shows the per-note snapshot restore is a meaningful share of latency (it shouldn't be), or the prefix grows large enough (e.g. few-shot, §8.3) that the snapshot's memory/copy cost matters — then reconsider a persistent context via a self-referential wrapper.
 
-### Correction suggestions: review list vs inline anchored popups (§6.7)
-
-- **Decision:** How to present streamed post-ASR correction suggestions over the editable transcript.
-- **Options:**
-  1. **Inline anchored popups** — anchor each suggestion as a non-blocking popup next to its flagged phrase, exactly where the mishearing sits in the text. This is what §6.7 originally described.
-  2. **Review list beside the transcript** — show the suggestions as a list next to the transcript, each row `original → replacement` with Accept / Reject; Accept patches the span in place.
-- **Chosen:** Option 2 (review list).
-- **Rationale:** The transcript editor is a plain `<textarea>`. A textarea cannot host overlay elements at arbitrary character offsets — Option 1 would require replacing it with a mirror-overlay or `contentEditable` surface and tracking each suggestion's character offset as the clinician edits the text underneath it (the offsets shift on every insertion/deletion, and a stale offset anchors the popup to the wrong span). That offset-bookkeeping is exactly the fragility flagged as the phase's open risk. The review list carries **no offsets**: a suggestion is `{original, replacement}`, and Accept simply replaces the first occurrence of `original` in the current transcript — correct regardless of intervening edits, and if the span is gone the suggestion is silently dropped. Both options are equally *suggest-only* and non-blocking (the safety property is unchanged); the list trades literal spatial adjacency for robustness and a far smaller, testable implementation. The streamed, parse-as-you-go delivery (§6.7) is identical either way — only the anchoring differs.
-- **Revisit if:** clinicians find the list hard to correlate with the phrase in a long transcript — then add lightweight highlighting (scroll-to / transient mark on hover) or move to a rich-text editor where true inline anchoring, with proper offset-mapping, becomes affordable.
-
 ### Beta trial gate: compiled-in expiry vs a server-enforced license
 
 - **Decision:** How to enforce a fixed end date on the time-limited beta, after which the app stops working.
@@ -775,7 +744,7 @@ The clinic/clinician is the **custodian** of the health information; the app is 
   1. **Compiled-in expiry** — bake the trial end date into the binary as a constant; on launch, compare the system clock to it and block the app once past it. No account, no network.
   2. **Server-enforced license** — put signup/login (e.g. Supabase Auth) in front of the app, mint a per-user ID, and check the trial server-side, caching a session for offline grace.
 - **Chosen:** Option 1 (compiled-in expiry).
-- **Rationale:** The beta is a handful of **trusted** clinicians for roughly a month, so the threat model is "make the honest stop honest," not "defeat a determined attacker." Option 1 needs no backend, no login screen, and — critically — keeps the app **fully offline**, preserving the core no-PHI-egress / no-network posture (NFR-6); Option 2 would force at least one online authentication, turning the app network-dependent for a purely administrative gate. The date is evaluated in Rust and enforced in **two** places so the UI isn't the only guard: the frontend shows an expired screen before anything renders, and the work-initiating backend commands (`start_recording`, note generation, correction) reject once expired, so driving the IPC bridge directly is also blocked. The accepted weakness is **local-clock rollback** — a user could set their PC date back — which is unfixable without the very server Option 1 avoids; acceptable for trusted testers and consistent with the deferred code-signing risk posture.
+- **Rationale:** The beta is a handful of **trusted** clinicians for roughly a month, so the threat model is "make the honest stop honest," not "defeat a determined attacker." Option 1 needs no backend, no login screen, and — critically — keeps the app **fully offline**, preserving the core no-PHI-egress / no-network posture (NFR-6); Option 2 would force at least one online authentication, turning the app network-dependent for a purely administrative gate. The date is evaluated in Rust and enforced in **two** places so the UI isn't the only guard: the frontend shows an expired screen before anything renders, and the work-initiating backend commands (`start_recording`, note generation) reject once expired, so driving the IPC bridge directly is also blocked. The accepted weakness is **local-clock rollback** — a user could set their PC date back — which is unfixable without the very server Option 1 avoids; acceptable for trusted testers and consistent with the deferred code-signing risk posture.
 - **Revisit if:** the app moves beyond a trusted beta to a paid or wider release where clock-rollback or license-sharing actually matters — then a server-enforced license (Option 2), naturally paired with the account system that a commercial launch needs anyway, becomes worth its cost.
 
 ## 12. Pricing
@@ -845,7 +814,7 @@ Two paths ship: an automatic in-app updater (default), with manual re-install al
 
 The client-side policy (what is collected, the allowlist, the scrub backstop) is §10.3; this is where events land.
 
-- **Backend: self-hosted GlitchTip.** GlitchTip is an open-source, Sentry-API-compatible error-tracking server we run ourselves (its own container + Postgres). Because it speaks the Sentry protocol, the app uses the stock **Sentry Rust SDK** as the client — no custom ingest endpoint, no bespoke schema. Crashes, `error` events, doctor feedback, and the named product events (`app_launched`, `note_generated`, `correction_pass_ran`, …) all arrive as Sentry events; `TechnicalContext` and per-event `props` ride along as event extras/tags, and error/crash reports carry the stack trace.
+- **Backend: self-hosted GlitchTip.** GlitchTip is an open-source, Sentry-API-compatible error-tracking server we run ourselves (its own container + Postgres). Because it speaks the Sentry protocol, the app uses the stock **Sentry Rust SDK** as the client — no custom ingest endpoint, no bespoke schema. Crashes, `error` events, doctor feedback, and the named product events (`app_launched`, `note_generated`, …) all arrive as Sentry events; `TechnicalContext` and per-event `props` ride along as event extras/tags, and error/crash reports carry the stack trace.
 - **DSN, not a public POST URL.** The app is configured with a **DSN** (`MEDSCRIBE_CRASH_DSN`), a send-only client ingest key that names the GlitchTip project and authenticates submissions. It is baked in at compile time (`option_env!`) and safe to ship in the binary. GlitchTip's own per-project rate-limiting and DSN scoping guard the endpoint — there is no separate shared-secret header to manage.
 - **`install_id`** is a random UUID generated once per install and stored in the settings file, attached to events as the Sentry user/device id. It identifies a *device*, never a patient, so distinct-device counts and per-device error rates are possible without any PHI or personal identifier.
 - The whole path — GlitchTip server and its database — is infrastructure we own and host; only the Sentry *SDK* (a client library speaking an open protocol) is embedded in the app, and no third-party analytics vendor receives any data.

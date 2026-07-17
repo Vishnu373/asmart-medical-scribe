@@ -12,7 +12,5 @@
 mod coordinator;
 mod pipeline;
 
-pub use coordinator::{
-    AppEvent, Coordinator, CorrectionSuggester, NoteGenerator, Pipeline, RecordingState,
-};
+pub use coordinator::{AppEvent, Coordinator, NoteGenerator, Pipeline, RecordingState};
 pub use pipeline::{emit_app_event, RealPipeline};

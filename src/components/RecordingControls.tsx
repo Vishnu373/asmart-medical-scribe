@@ -1,10 +1,4 @@
-import {
-  pauseRecording,
-  resumeRecording,
-  startRecording,
-  stopRecording,
-  suggestCorrections,
-} from "@/bridge";
+import { pauseRecording, resumeRecording, startRecording, stopRecording } from "@/bridge";
 import { useAppStore } from "@/state";
 
 /**
@@ -22,7 +16,6 @@ export default function RecordingControls() {
   const setNotes = useAppStore((s) => s.setNotes);
   const setStreamingNote = useAppStore((s) => s.setStreamingNote);
   const setCurrentRecordId = useAppStore((s) => s.setCurrentRecordId);
-  const clearSuggestions = useAppStore((s) => s.clearSuggestions);
   const pushToast = useAppStore((s) => s.pushToast);
 
   // Run a command; surface any rejection (the backend's `Err(String)`) as a toast.
@@ -42,7 +35,6 @@ export default function RecordingControls() {
       setNotes([]);
       setStreamingNote("");
       setCurrentRecordId(null);
-      clearSuggestions();
       await startRecording();
       setPaused(false);
     });
@@ -52,13 +44,6 @@ export default function RecordingControls() {
       const id = await stopRecording();
       setCurrentRecordId(id);
       setPaused(false);
-      // Auto-run the post-ASR correction pass on the finalized transcript (§6.7).
-      // Fire-and-forget: it drives its own CORRECTING state and streams suggestions,
-      // and is strictly additive, so a failure is swallowed rather than toasted.
-      if (id) {
-        clearSuggestions();
-        suggestCorrections(id).catch(() => {});
-      }
     });
 
   const onPause = () =>

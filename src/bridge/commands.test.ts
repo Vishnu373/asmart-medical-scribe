@@ -37,9 +37,6 @@ describe("command wrappers call invoke with the right name and args", () => {
     await cmd.generateNote("r1");
     expect(mockInvoke).toHaveBeenCalledWith("generate_note", { recordId: "r1" });
 
-    await cmd.suggestCorrections("r1");
-    expect(mockInvoke).toHaveBeenCalledWith("suggest_corrections", { recordId: "r1" });
-
     await cmd.updateNote("n1", "## Subjective\n...");
     expect(mockInvoke).toHaveBeenCalledWith("update_note", {
       id: "n1",

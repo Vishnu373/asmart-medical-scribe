@@ -27,16 +27,12 @@ export default function NotePanel() {
   const llmStatus = useAppStore((s) => s.llmStatus);
 
   const generating = recordingState === "GENERATING";
-  // Hold Generate until the §6.7 correction pass has ended (streamed/cancelled/
-  // failed) — the machine leaves CORRECTING back to IDLE — preserving the
-  // "sequenced, never concurrent" invariant on the UI side too.
-  const correcting = recordingState === "CORRECTING";
   const active = notes.find((n) => n.is_active) ?? notes[0] ?? null;
-  // Also hold while the co-resident preload is still warming the model (§8.2 startup
-  // fix); an `error` status leaves Generate enabled so the first attempt retries and
-  // surfaces the load error itself.
+  // Hold Generate while the co-resident preload is still warming the model (§8.2
+  // startup fix); an `error` status leaves Generate enabled so the first attempt
+  // retries and surfaces the load error itself.
   const modelWarming = llmStatus === "loading";
-  const ready = recordId !== null && !generating && !correcting && !modelWarming;
+  const ready = recordId !== null && !generating && !modelWarming;
 
   const refresh = () =>
     recordId &&

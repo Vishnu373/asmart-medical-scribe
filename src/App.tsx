@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { getLlmStatus, ping, setupStatus, trialStatus } from "@/bridge";
+import { frontendReady, getLlmStatus, ping, setupStatus, trialStatus } from "@/bridge";
 import { useAppStore } from "@/state";
 import { useBackendEvents } from "@/hooks/useBackendEvents";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
@@ -48,6 +48,14 @@ function App() {
     ping("ready")
       .then(() => setBridgeOk(true))
       .catch(() => setBridgeOk(false));
+  }, []);
+
+  // Tell the backend the UI has mounted so the co-resident note-model warm starts
+  // *after* the window has painted, not during launch — warming inside `setup`
+  // ghosted the window as "not responding" (§8.2 startup fix). Fire-and-forget;
+  // a no-op in swap mode and idempotent on the backend.
+  useEffect(() => {
+    void frontendReady().catch(() => {});
   }, []);
 
   // Compiled-in beta expiry (§1). Checked before the setup gate. On error, treat

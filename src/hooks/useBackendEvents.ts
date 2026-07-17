@@ -1,7 +1,6 @@
 import { useEffect } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
-  onCorrectionSuggestion,
   onError,
   onGenerationToken,
   onInputLevel,
@@ -21,7 +20,6 @@ export function useBackendEvents() {
   const setInputLevel = useAppStore((s) => s.setInputLevel);
   const addSegment = useAppStore((s) => s.addSegment);
   const appendStreamingToken = useAppStore((s) => s.appendStreamingToken);
-  const addSuggestion = useAppStore((s) => s.addSuggestion);
   const setLlmStatus = useAppStore((s) => s.setLlmStatus);
   const pushToast = useAppStore((s) => s.pushToast);
 
@@ -39,10 +37,6 @@ export function useBackendEvents() {
       onInputLevel((p) => setInputLevel(p.level)),
       onTranscriptSegment((p) => addSegment(p)),
       onGenerationToken((p) => appendStreamingToken(p.text)),
-      // Post-ASR correction (§6.7): each streamed record joins the pending list;
-      // the terminal done/error just returns the machine to IDLE (via state-changed),
-      // which is the additive, non-blocking behavior — no toast on failure.
-      onCorrectionSuggestion((p) => addSuggestion(p)),
       // Note-model readiness (§8.2 startup fix): flip the "preparing" hint to ready,
       // or toast a preload failure (the first Generate still retries and re-surfaces it).
       onLlmStatus((p) => {
@@ -65,7 +59,6 @@ export function useBackendEvents() {
     setInputLevel,
     addSegment,
     appendStreamingToken,
-    addSuggestion,
     setLlmStatus,
     pushToast,
   ]);

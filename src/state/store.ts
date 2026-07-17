@@ -9,7 +9,6 @@ import { create } from "zustand";
 import type { Update } from "@tauri-apps/plugin-updater";
 import type {
   AppState,
-  CorrectionSuggestion,
   LlmStatus,
   Note,
   RecordSummary,
@@ -55,20 +54,6 @@ interface TranscriptSlice {
   addSegment: (segment: TranscriptSegmentEvent) => void;
   setSegments: (segments: TranscriptSegmentEvent[]) => void;
   setTranscript: (transcript: string) => void;
-}
-
-interface CorrectionsSlice {
-  /**
-   * Pending post-ASR correction suggestions (§6.7), streamed in via
-   * `correction-suggestion` as each record completes. A suggestion leaves the list
-   * when the clinician accepts it (patching the transcript) or rejects it. Cleared
-   * at the start of a new consult and a new pass.
-   */
-  suggestions: CorrectionSuggestion[];
-  addSuggestion: (suggestion: CorrectionSuggestion) => void;
-  /** Remove the suggestion at `index` (an Accept or Reject dismisses it). */
-  removeSuggestion: (index: number) => void;
-  clearSuggestions: () => void;
 }
 
 interface NotesSlice {
@@ -159,7 +144,6 @@ interface ToastSlice {
 export type AppStore = UiSlice &
   RecordingSlice &
   TranscriptSlice &
-  CorrectionsSlice &
   NotesSlice &
   RecordsSlice &
   SettingsSlice &
@@ -195,13 +179,6 @@ export const useAppStore = create<AppStore>((set) => ({
     }),
   setSegments: (segments) => set({ segments }),
   setTranscript: (transcript) => set({ transcript }),
-
-  // Corrections (§6.7)
-  suggestions: [],
-  addSuggestion: (suggestion) => set((s) => ({ suggestions: [...s.suggestions, suggestion] })),
-  removeSuggestion: (index) =>
-    set((s) => ({ suggestions: s.suggestions.filter((_, i) => i !== index) })),
-  clearSuggestions: () => set({ suggestions: [] }),
 
   // Notes
   notes: [],

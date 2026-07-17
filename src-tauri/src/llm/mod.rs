@@ -8,10 +8,9 @@
 //! `NoteGenerator` trait, so the GENERATING state machine stays testable with a
 //! mock and no model.
 
-mod correction;
 mod engine;
 mod generator;
 mod prompt;
 
 pub use engine::{LlmEngine, LlmModel};
-pub use generator::{RealCorrectionSuggester, RealNoteGenerator};
+pub use generator::RealNoteGenerator;

@@ -17,15 +17,29 @@ const note: Note = {
 
 beforeEach(() => mockInvoke.mockClear().mockResolvedValue(null));
 
+/** Reveal the raw textarea (the editor defaults to the rendered Preview). */
+const enterEdit = () => fireEvent.click(screen.getByRole("tab", { name: "edit" }));
+
 describe("SoapEditor", () => {
-  it("renders the whole note in a single editable window", () => {
+  it("renders the note as formatted markdown in the default Preview", () => {
     render(<SoapEditor note={note} />);
+    // The `## Subjective` header renders as a real heading, not raw text.
+    expect(screen.getByRole("heading", { name: "Subjective" })).toBeInTheDocument();
+    expect(screen.queryByText("## Subjective")).not.toBeInTheDocument();
+    // No editable textarea until the clinician switches to Edit.
+    expect(screen.queryByRole("textbox", { name: "SOAP note" })).not.toBeInTheDocument();
+  });
+
+  it("shows the raw note in a single editable window in Edit mode", () => {
+    render(<SoapEditor note={note} />);
+    enterEdit();
     expect(screen.getByRole("textbox", { name: "SOAP note" })).toHaveValue(note.soap_data);
   });
 
   it("debounce-saves edits via update_note with the verbatim note", async () => {
     vi.useFakeTimers();
     render(<SoapEditor note={note} />);
+    enterEdit();
     const edited = note.soap_data.replace("## Objective\n", "## Objective\ntemp 38\n");
     fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
       target: { value: edited },
@@ -56,6 +70,7 @@ describe("SoapEditor", () => {
 
   it("flushes a pending edit on unmount", () => {
     render(<SoapEditor note={note} />);
+    enterEdit();
     fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
       target: { value: note.soap_data + "\nfollow up" },
     });

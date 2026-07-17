@@ -63,12 +63,6 @@ export function cancelGeneration(): Promise<void> {
   return invoke("cancel_generation");
 }
 
-/** Run the post-ASR correction pass over the record's transcript (§6.7). Auto-invoked
- * on Stop; streams `correction-suggestion` events, resolves when the pass ends. */
-export function suggestCorrections(recordId: string): Promise<void> {
-  return invoke("suggest_corrections", { recordId });
-}
-
 export function updateNote(id: string, soapData: string): Promise<void> {
   return invoke("update_note", { id, soapData });
 }
@@ -113,6 +107,14 @@ export function updateSettings(settings: Settings): Promise<void> {
  * preload warms the model, else `"ready"`. */
 export function getLlmStatus(): Promise<LlmStatus> {
   return invoke<LlmStatus>("get_llm_status");
+}
+
+/** Signal the backend that the frontend has fully mounted (§8.2 startup fix), so the
+ * co-resident note-model warm can begin *after* the window has painted rather than
+ * during launch (which ghosted the window as "not responding"). A no-op in swap mode
+ * and idempotent on the backend. Fire-and-forget. */
+export function frontendReady(): Promise<void> {
+  return invoke("frontend_ready");
 }
 
 /** Enumerate capture devices for the mic picker (§9.3, FR-12). */

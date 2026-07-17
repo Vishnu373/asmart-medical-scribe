@@ -17,7 +17,6 @@ export default function RecordsView() {
   const setSegments = useAppStore((s) => s.setSegments);
   const setNotes = useAppStore((s) => s.setNotes);
   const setStreamingNote = useAppStore((s) => s.setStreamingNote);
-  const clearSuggestions = useAppStore((s) => s.clearSuggestions);
   const pushToast = useAppStore((s) => s.pushToast);
 
   // The record id armed for deletion, if any — one at a time.
@@ -42,9 +41,6 @@ export default function RecordsView() {
       setSegments([]); // a loaded record edits its saved transcript, no live stream
       setTranscript(record.transcript);
       setStreamingNote("");
-      // Drop any correction suggestions from the prior consult — they belong to a
-      // different transcript, and Accept would otherwise patch the wrong record (§6.7).
-      clearSuggestions();
       setNotes(notes);
       setView("recording");
     } catch (e) {

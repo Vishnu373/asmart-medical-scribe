@@ -4,9 +4,10 @@
 //! guards reject illegal transitions, returning an `Err(String)` the frontend
 //! surfaces (design §6.6/§9.4).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
-use tauri::State;
+use tauri::{AppHandle, Emitter, State};
 
 use crate::llm::LlmEngine;
 use crate::orchestrator::Coordinator;
@@ -132,28 +133,7 @@ pub async fn regenerate_note(
         .map_err(|e| e.to_string())?
 }
 
-/// IDLE → CORRECTING → IDLE: run the post-ASR correction pass over the record's
-/// finalized transcript (design §6.7). Auto-invoked by the UI on Stop. Streams
-/// `correction-suggestion` events and a terminal `correction-done`/`correction-error`;
-/// resolves once the pass ends. Blocks note generation until it does (the sequencing
-/// invariant). Like `generate_note`, runs on a blocking thread so the IPC thread stays
-/// free to dispatch `cancel_generation`.
-#[tauri::command]
-pub async fn suggest_corrections(
-    coordinator: State<'_, Arc<Coordinator>>,
-    store: State<'_, SharedStore>,
-    record_id: String,
-) -> Result<(), String> {
-    crate::trial::ensure_active()?;
-    let transcript = load_transcript(&store, &record_id)?;
-    let coordinator = coordinator.inner().clone();
-    tauri::async_runtime::spawn_blocking(move || coordinator.suggest_corrections(&transcript))
-        .await
-        .map_err(|e| e.to_string())?
-}
-
-/// Cancel the in-flight generation *or* correction pass; a partial note is discarded,
-/// a cancelled correction leaves the transcript plain (§8.4/§6.7).
+/// Cancel the in-flight generation; the partial note is discarded (§8.4).
 #[tauri::command]
 pub fn cancel_generation(coordinator: State<'_, Arc<Coordinator>>) -> Result<(), String> {
     coordinator.cancel_generation()
@@ -215,6 +195,60 @@ pub fn get_llm_status(
     } else {
         "loading".to_string()
     }
+}
+
+/// Deferred co-resident LLM preload (§8.2 startup fix). Built in `setup` but *not*
+/// run there: warming the multi-GB GGUF (mmap + warmup decode) inside `setup`
+/// starves WebView2's first paint, so Windows ghosts the window as "not
+/// responding" on launch even though the warm runs off the main thread. The gate
+/// holds the engine until the frontend reports it has mounted ([`frontend_ready`]),
+/// then warms once. Disabled in swap mode, which loads lazily per generation.
+pub struct PreloadGate {
+    engine: Arc<LlmEngine>,
+    /// Co-resident wants a warm model; swap mode never preloads.
+    enabled: bool,
+    /// Flipped the first time [`frontend_ready`] fires, so re-mounts don't re-warm.
+    started: AtomicBool,
+}
+
+impl PreloadGate {
+    pub fn new(engine: Arc<LlmEngine>, enabled: bool) -> Self {
+        Self {
+            engine,
+            enabled,
+            started: AtomicBool::new(false),
+        }
+    }
+}
+
+/// Frontend → backend: the React app has finished mounting (§8.2 startup fix).
+/// Kicks off the co-resident model warm exactly once, on a background thread,
+/// emitting the same `llm-status` loading/ready/error events the mount query seeds
+/// from. Deferring the warm to here — rather than `setup` — keeps the heavy GGUF
+/// load off the launch path so the window paints before it starts. A no-op in swap
+/// mode, or if a prior call already started it (dev remounts / HMR). A load failure
+/// is non-fatal: the first generation retries and surfaces the error then.
+#[tauri::command]
+pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
+    if !gate.enabled || gate.started.swap(true, Ordering::SeqCst) {
+        return;
+    }
+    let engine = gate.engine.clone();
+    std::thread::spawn(move || {
+        let _ = app.emit("llm-status", serde_json::json!({ "status": "loading" }));
+        match engine.ensure_loaded() {
+            Ok(()) => {
+                let _ = app.emit("llm-status", serde_json::json!({ "status": "ready" }));
+            }
+            Err(e) => {
+                log::warn!("LLM preload failed (will retry on first generation): {e}");
+                let _ = app.emit(
+                    "llm-status",
+                    serde_json::json!({ "status": "error", "message": e.to_string() }),
+                );
+            }
+        }
+    });
 }
 
 /// Persist patched settings (§9.3/§9.4). The frontend sends the full object

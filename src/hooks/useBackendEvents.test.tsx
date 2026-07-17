@@ -10,7 +10,6 @@ const captured = vi.hoisted(() => {
     level?: (p: { level: number[] }) => void;
     segment?: (p: { seq: number; text: string }) => void;
     token?: (p: { text: string }) => void;
-    suggestion?: (p: { original: string; replacement: string }) => void;
     llmStatus?: (p: { status: string; message?: string }) => void;
     error?: (p: { code: string; message: string }) => void;
   };
@@ -31,10 +30,6 @@ vi.mock("@/bridge", () => ({
   },
   onGenerationToken: (h: (p: { text: string }) => void) => {
     captured.token = h;
-    return Promise.resolve(() => {});
-  },
-  onCorrectionSuggestion: (h: (p: { original: string; replacement: string }) => void) => {
-    captured.suggestion = h;
     return Promise.resolve(() => {});
   },
   onLlmStatus: (h: (p: { status: string; message?: string }) => void) => {
@@ -59,7 +54,6 @@ beforeEach(() =>
     segments: [],
     transcript: "",
     streamingNote: "",
-    suggestions: [],
     llmStatus: "loading",
     llmStatusLive: false,
     toasts: [],
@@ -98,14 +92,6 @@ describe("useBackendEvents wires §9.5 events into the store", () => {
     act(() => captured.token!({ text: "## Sub" }));
     act(() => captured.token!({ text: "jective" }));
     expect(useAppStore.getState().streamingNote).toBe("## Subjective");
-  });
-
-  it("correction-suggestion appends to the pending suggestions", () => {
-    render(<Probe />);
-    act(() => captured.suggestion!({ original: "tie the null", replacement: "Tylenol" }));
-    expect(useAppStore.getState().suggestions).toEqual([
-      { original: "tie the null", replacement: "Tylenol" },
-    ]);
   });
 
   it("llm-status ready flips the note-model flag off loading", () => {

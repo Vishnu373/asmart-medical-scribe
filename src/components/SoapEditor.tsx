@@ -3,22 +3,30 @@ import { copyToClipboard, updateNote, type Note } from "@/bridge";
 import { useAppStore } from "@/state";
 import { stripMarkdown } from "@/lib/soap";
 import { useAutoGrow } from "@/hooks/useAutoGrow";
+import Markdown from "@/components/Markdown";
 
 const SAVE_DEBOUNCE_MS = 600;
 
+type Mode = "preview" | "edit";
+
 /**
- * Single-window editor for the active SOAP note (§8.5). The whole note is edited
- * as one scrollable markdown field and debounce-saved verbatim via `update_note`;
- * a pending save is flushed on unmount or when the note switches (regenerate /
- * revert) so the last edit is never lost.
+ * Single-window editor for the active SOAP note (§8.5). The note is one markdown
+ * document with an Obsidian-style Edit ⇄ Preview toggle: Preview renders it as
+ * formatted, read-only HTML (the default — clinicians read far more than they
+ * edit); Edit drops back to the raw textarea, debounce-saved verbatim via
+ * `update_note`. A pending save is flushed on unmount or when the note switches
+ * (regenerate / revert) so the last edit is never lost.
  */
 export default function SoapEditor({ note }: { note: Note }) {
   const pushToast = useAppStore((s) => s.pushToast);
   const [text, setText] = useState(note.soap_data);
+  const [mode, setMode] = useState<Mode>("preview");
 
   const ref = useRef<HTMLTextAreaElement>(null);
   // Grow with content so the note is never a squeezed scroll-box; the page scrolls.
-  useAutoGrow(ref, text);
+  // `mode` is folded into the trigger so the textarea also re-grows the moment it
+  // mounts (entering Edit) rather than only on the next keystroke.
+  useAutoGrow(ref, `${mode}:${text}`);
 
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pending = useRef<{ id: string; data: string } | null>(null);
@@ -64,7 +72,27 @@ export default function SoapEditor({ note }: { note: Note }) {
 
   return (
     <div className="flex flex-col gap-1">
-      <div className="flex items-center justify-end">
+      <div className="flex items-center justify-between">
+        <div
+          role="tablist"
+          aria-label="Note view"
+          className="flex rounded-md border border-neutral-800 p-0.5 text-xs"
+        >
+          {(["preview", "edit"] as const).map((m) => (
+            <button
+              key={m}
+              type="button"
+              role="tab"
+              aria-selected={mode === m}
+              onClick={() => setMode(m)}
+              className={`rounded px-2 py-0.5 capitalize ${
+                mode === m ? "bg-neutral-700 text-neutral-100" : "text-neutral-400 hover:text-neutral-200"
+              }`}
+            >
+              {m}
+            </button>
+          ))}
+        </div>
         <button
           type="button"
           onClick={onCopy}
@@ -74,13 +102,26 @@ export default function SoapEditor({ note }: { note: Note }) {
           Copy
         </button>
       </div>
-      <textarea
-        ref={ref}
-        aria-label="SOAP note"
-        value={text}
-        onChange={(e) => onEdit(e.target.value)}
-        className="min-h-64 resize-none overflow-hidden rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm leading-relaxed text-neutral-100 focus:border-neutral-600 focus:outline-none"
-      />
+      {mode === "preview" ? (
+        <div
+          aria-label="SOAP note preview"
+          className="min-h-64 rounded-md border border-neutral-800 bg-neutral-900 p-3"
+        >
+          {text.trim() ? (
+            <Markdown>{text}</Markdown>
+          ) : (
+            <p className="text-sm text-neutral-500">Empty note.</p>
+          )}
+        </div>
+      ) : (
+        <textarea
+          ref={ref}
+          aria-label="SOAP note"
+          value={text}
+          onChange={(e) => onEdit(e.target.value)}
+          className="min-h-64 resize-none overflow-hidden rounded-md border border-neutral-800 bg-neutral-900 p-3 text-sm leading-relaxed text-neutral-100 focus:border-neutral-600 focus:outline-none"
+        />
+      )}
     </div>
   );
 }
