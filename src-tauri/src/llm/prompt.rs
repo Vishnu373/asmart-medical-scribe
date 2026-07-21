@@ -3,7 +3,7 @@
 //! safety — is unit-testable without loading a model.
 //!
 //! The verbatim prompt (system instruction + worked few-shot examples) lives in
-//! `soap_prompt.txt` and is embedded at compile time with `include_str!`, so the
+//! `soap_r_prompt.md` and is embedded at compile time with `include_str!`, so the
 //! shipped bytes are exactly the reviewed file — no hand-copied string can drift
 //! from it. The examples run in two phases: a private `<think>…</think>` reasoning
 //! block (Phase 1) followed by the note (Phase 2); [`REASONING_BOUNDARY`] marks the
@@ -22,7 +22,7 @@ use super::LlmModel;
 /// The verbatim prompt source (design §8.3), embedded at build time so the binary
 /// carries exactly these bytes. Sections are delimited by `=== NAME ===` lines:
 /// `SYSTEM`, then paired `EXAMPLE_TRANSCRIPT*` / `EXAMPLE_NOTE*` few-shot turns.
-const RAW_PROMPT: &str = include_str!("soap_prompt.txt");
+const RAW_PROMPT: &str = include_str!("soap_r_prompt.md");
 
 /// The Phase-1 → Phase-2 delimiter used in the supplied prompt: the model first
 /// emits its private `<think>…</think>` reasoning, then the note. Generation buffers
@@ -43,7 +43,7 @@ pub const REASONING_OPEN: &str = "<think>";
 /// boundary between [`prefix`] and [`transcript_tail`].
 const USER_LEAD_IN: &str = "Consultation transcript:\n\n";
 
-/// The parsed `soap_prompt.txt`: the system instruction and the ordered few-shot
+/// The parsed `soap_r_prompt.md`: the system instruction and the ordered few-shot
 /// `(transcript, note)` pairs.
 struct SoapPrompt {
     system: String,
@@ -96,19 +96,19 @@ fn parsed() -> &'static SoapPrompt {
         // programmer/asset error, so fail loudly rather than ship an empty prompt.
         assert!(
             !system.is_empty(),
-            "soap_prompt.txt is missing its SYSTEM section"
+            "soap_r_prompt.md is missing its SYSTEM section"
         );
         assert_eq!(
             transcripts.len(),
             notes.len(),
-            "soap_prompt.txt has unpaired EXAMPLE_TRANSCRIPT/EXAMPLE_NOTE sections"
+            "soap_r_prompt.md has unpaired EXAMPLE_TRANSCRIPT/EXAMPLE_NOTE sections"
         );
         let examples = transcripts.into_iter().zip(notes).collect();
         SoapPrompt { system, examples }
     })
 }
 
-/// The system instruction, verbatim from `soap_prompt.txt`'s `SYSTEM` section
+/// The system instruction, verbatim from `soap_r_prompt.md`'s `SYSTEM` section
 /// (design §8.3). Pins the five SOAP-R headers, the per-section placement rules, the
 /// two-phase reason-then-note format, and — most importantly — forbids anything not
 /// in the transcript (a fabricated clinical fact is the worst failure).
