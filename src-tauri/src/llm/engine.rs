@@ -12,6 +12,7 @@ use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use anyhow::{anyhow, Result};
 use log::{info, warn};
@@ -82,8 +83,8 @@ struct PrefixCache {
 }
 
 /// Owns the loaded GGUF model. The `LlamaBackend` is process-wide and created
-/// once; the model is loaded lazily (swap mode) or at startup (co-resident) and
-/// can be unloaded to release RAM. Generation builds a fresh context each run,
+/// once; the model is warmed at startup (co-resident, §7) and can be unloaded to
+/// release RAM. Generation builds a fresh context each run,
 /// restoring the cached prefix KV state into it (§8.7) when available.
 pub struct LlmEngine {
     backend: LlamaBackend,
@@ -113,7 +114,13 @@ impl LlmEngine {
     /// `n_threads` (physical // 2, design §8.2) is applied to both decode and prefill
     /// (see [`new_context`]).
     pub fn new(kind: LlmModel, model_dirs: Vec<PathBuf>, n_threads: i32) -> Result<Self> {
-        let backend = LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
+        let mut backend =
+            LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
+        // llama.cpp/ggml dump per-tensor load and context noise straight to C++ stderr,
+        // bypassing Rust's `log` filter. `void_logs` installs a no-op callback via
+        // `llama_log_set`, which forwards to `ggml_log_set` — covers both. Errors still
+        // come back as `Result`s. Comment out to get the firehose back when debugging.
+        backend.void_logs();
         Ok(Self {
             backend,
             model: Mutex::new(None),
@@ -160,17 +167,31 @@ impl LlmEngine {
         })?;
         guard_available_ram(&path)?;
 
+        info!("[startup] loading SLM: {file}");
+        let t_load = Instant::now();
         let params = LlamaModelParams::default(); // mmap default; CPU-only build
         let model = LlamaModel::load_from_file(&self.backend, &path, &params)
             .map_err(|e| anyhow!("failed to load LLM model {}: {e}", path.display()))?;
         *self.lock_model() = Some(model);
-        info!("Loaded LLM model: {:?}", kind);
+        info!(
+            "[startup] SLM weights loaded in {:.1}s",
+            t_load.elapsed().as_secs_f32()
+        );
+        // info!("Loaded LLM model: {:?}", kind);
 
         // Warmup: the first inference after a load is slow (cold weights/buffers);
         // a tiny throwaway pass keeps the clinician's first real note at full
         // speed (design §8.4). Failure here is non-fatal — log and continue.
+        // Timed separately from the weight load: priming decodes the whole fixed
+        // prefix, so it is a real slice of startup and worth seeing on its own.
+        let t_warm = Instant::now();
         if let Err(e) = self.warmup() {
             warn!("LLM warmup pass failed (non-fatal): {e}");
+        } else {
+            info!(
+                "[startup] SLM prefix KV cache primed in {:.1}s",
+                t_warm.elapsed().as_secs_f32()
+            );
         }
         Ok(())
     }
@@ -200,6 +221,9 @@ impl LlmEngine {
         on_token: &dyn Fn(&str),
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>> {
+        // Generate-path instrumentation. Every value is a count or a duration — no
+        // transcript text is ever logged (NFR-6/PHI).
+        let t_total = Instant::now();
         self.ensure_loaded()?;
         let kind = self.model_kind();
         let prompt = prompt::build_prompt(kind, transcript);
@@ -229,10 +253,28 @@ impl LlmEngine {
             ));
         }
 
+        info!(
+            "[generate] start — transcript {} chars, prompt {} tokens",
+            transcript.len(),
+            tokens.len()
+        );
+
         let mut ctx = self.new_context(model)?;
         // Restore the cached prefix KV if this prompt starts with exactly its
         // tokens; otherwise start from position 0 (full decode, the fallback).
         let start = self.restore_prefix(&mut ctx, kind, &tokens);
+        if start > 0 {
+            info!(
+                "[generate] prefix cache HIT — {start} of {} tokens restored, {} to prefill",
+                tokens.len(),
+                tokens.len() as i32 - start
+            );
+        } else {
+            info!(
+                "[generate] prefix cache MISS — all {} tokens must be prefilled",
+                tokens.len()
+            );
+        }
         let note = self.decode_and_generate(
             &mut ctx,
             model,
@@ -247,6 +289,7 @@ impl LlmEngine {
             on_token,
             cancel,
         )?;
+        info!("[generate] total {:.1}s", t_total.elapsed().as_secs_f32());
         // Deterministic scrub of any reasoning marker the model echoed after the note
         // body (§8.5) — the streamed buffer may briefly flash it, but the persisted
         // note never carries it. Cancellation returns `None` and is passed through.
@@ -284,9 +327,11 @@ impl LlmEngine {
         // seq 0 — see the batch below). The sequence-scoped size is the cells actually
         // used (~the prefix), not the N_CTX maximum the whole-context `get_state_size`
         // reports — so priming doesn't briefly allocate and zero ~1 GB right after the
-        // model load, which would spike RAM at the §7 co-resident/swap threshold.
+        // model load, which would spike RAM against the §7 co-resident budget.
         let mut state = vec![0u8; ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty())];
-        let written = unsafe { ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty()) };
+        let written = unsafe {
+            ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty())
+        };
         state.truncate(written);
 
         *self.prefix_cache.lock().unwrap() = Some(PrefixCache {
@@ -358,6 +403,12 @@ impl LlmEngine {
         on_token: &dyn Fn(&str),
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>> {
+        // Phase clock. `t_phase` is reset at each phase boundary; `t_gen` measures from
+        // the top so the "first visible word" line reports what the clinician actually
+        // waits for after clicking Generate.
+        let t_gen = Instant::now();
+        let mut t_phase = Instant::now();
+
         let mut batch = LlamaBatch::new(N_CTX as usize, 1);
         let last = tokens.len() as i32 - 1;
         for i in start..tokens.len() as i32 {
@@ -367,16 +418,22 @@ impl LlmEngine {
         }
         ctx.decode(&mut batch)
             .map_err(|e| anyhow!("prompt decode failed: {e}"))?;
+        let prefilled = tokens.len() as i32 - start;
+        info!(
+            "[generate] prefill done — {prefilled} tokens in {:.2}s ({:.0} tok/s)",
+            t_phase.elapsed().as_secs_f32(),
+            rate(prefilled, t_phase.elapsed())
+        );
+        t_phase = Instant::now();
 
         // Low temperature for near-deterministic, low-hallucination clinical text
         // (design §8.2/§8.3).
-        let mut sampler = LlamaSampler::chain_simple([
-            LlamaSampler::temp(SAMPLE_TEMP),
-            LlamaSampler::greedy(),
-        ]);
+        let mut sampler =
+            LlamaSampler::chain_simple([LlamaSampler::temp(SAMPLE_TEMP), LlamaSampler::greedy()]);
 
         let mut raw = String::new(); // full generation, including any reasoning block
         let mut note = String::new(); // the streamed/returned portion (post-boundary)
+
         // With no suppression the whole stream is the note from the first token.
         let mut boundary_passed = suppress.is_none();
         // Absolute next position: the prompt fills 0..tokens.len(), so generation
@@ -384,13 +441,31 @@ impl LlmEngine {
         let mut n_cur = tokens.len() as i32;
         let mut note_tokens = 0; // counted against `max_tokens` (the note budget)
         let mut reasoning_tokens = 0; // counted against the reasoning cap, while suppressing
+
         // Cursor into `raw` for the boundary search: everything before it has already
         // been scanned and can't be part of a first match, so each token only searches
         // the newly-grown suffix instead of rescanning from 0 (avoids O(n²) on the
         // decode hot path). The boundary may straddle two pieces, so we back the cursor
         // up by `boundary.len() - 1` to keep the overlap where a match could complete.
         let mut scan_from = 0usize;
+        // `boundary_passed` flips at three separate sites (forced boundary, plain-note
+        // fallback, boundary found); logging the reasoning→note transition once from the
+        // top of the loop covers all three without duplicating the line at each.
+        let mut reasoning_logged = suppress.is_none();
         loop {
+            if boundary_passed && !reasoning_logged {
+                reasoning_logged = true;
+                info!(
+                    "[generate] reasoning done — {reasoning_tokens} tokens in {:.1}s ({:.1} tok/s)",
+                    t_phase.elapsed().as_secs_f32(),
+                    rate(reasoning_tokens, t_phase.elapsed())
+                );
+                info!(
+                    "[generate] FIRST VISIBLE WORD at {:.1}s",
+                    t_gen.elapsed().as_secs_f32()
+                );
+                t_phase = Instant::now();
+            }
             if cancel.load(Ordering::Relaxed) {
                 return Ok(None); // partial note discarded by the caller
             }
@@ -509,6 +584,11 @@ impl LlmEngine {
         }
 
         if boundary_passed {
+            info!(
+                "[generate] note done — {note_tokens} tokens in {:.1}s ({:.1} tok/s)",
+                t_phase.elapsed().as_secs_f32(),
+                rate(note_tokens, t_phase.elapsed())
+            );
             Ok(Some(note))
         } else if raw.contains(prompt::REASONING_OPEN) {
             // The model opened `<think>` and then ended its turn (EOG) before closing
@@ -556,6 +636,17 @@ impl LlmEngine {
 
     fn lock_model(&self) -> MutexGuard<'_, Option<LlamaModel>> {
         self.model.lock().unwrap_or_else(|p| p.into_inner())
+    }
+}
+
+/// Tokens per second, guarding the degenerate zero-elapsed case so a fast phase
+/// logs `0` rather than `inf`.
+fn rate(tokens: i32, elapsed: std::time::Duration) -> f32 {
+    let s = elapsed.as_secs_f32();
+    if s <= 0.0 {
+        0.0
+    } else {
+        tokens as f32 / s
     }
 }
 

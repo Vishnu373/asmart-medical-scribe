@@ -53,7 +53,7 @@ function App() {
   // Tell the backend the UI has mounted so the co-resident note-model warm starts
   // *after* the window has painted, not during launch — warming inside `setup`
   // ghosted the window as "not responding" (§8.2 startup fix). Fire-and-forget;
-  // a no-op in swap mode and idempotent on the backend.
+  // idempotent on the backend.
   useEffect(() => {
     void frontendReady().catch(() => {});
   }, []);

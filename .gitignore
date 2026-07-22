@@ -41,3 +41,6 @@ src-tauri/resources/models/*
 
 # Claude folders
 .claude/
+
+# Implementation file
+docs/implementation.md

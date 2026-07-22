@@ -77,7 +77,14 @@ impl SttEngine {
             let recording = recording.clone();
             let shutdown = shutdown.clone();
             thread::spawn(move || {
-                idle_watch(engine, current, last_activity, recording, shutdown, idle_timeout)
+                idle_watch(
+                    engine,
+                    current,
+                    last_activity,
+                    recording,
+                    shutdown,
+                    idle_timeout,
+                )
             })
         };
 
@@ -126,6 +133,8 @@ impl SttEngine {
 
     /// Load a model from `model_path`, replacing any currently loaded one.
     pub fn load(&self, kind: ModelKind, model_path: &Path) -> Result<()> {
+        info!("[startup] loading STT model: {}", kind.dir_name());
+        let t0 = Instant::now();
         let loaded = match kind {
             ModelKind::Parakeet => LoadedEngine::Parakeet(
                 ParakeetModel::load(model_path, &Quantization::Int8)
@@ -136,7 +145,12 @@ impl SttEngine {
         *self.lock_engine() = Some(loaded);
         *self.current.lock().unwrap() = Some(kind);
         self.touch_activity(); // don't let the watcher unload a just-loaded model
-        info!("Loaded STT model: {kind:?}");
+        info!(
+            "[startup] STT model loaded: {} in {:.1}s",
+            kind.dir_name(),
+            t0.elapsed().as_secs_f32()
+        );
+        // info!("Loaded STT model: {kind:?}");
         Ok(())
     }
 
@@ -228,7 +242,11 @@ impl Transcriber for SttEngine {
         };
 
         // Strip filler words / stutter artifacts (design's transcript cleanup).
-        Ok(filter_transcription_output(&text, base_lang(&language), &None))
+        Ok(filter_transcription_output(
+            &text,
+            base_lang(&language),
+            &None,
+        ))
     }
 }
 

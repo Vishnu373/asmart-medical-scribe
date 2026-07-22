@@ -54,7 +54,7 @@ A recording is a state machine — **IDLE → RECORDING → PROCESSING → IDLE*
 
 ### Note generation (post-recording)
 - **`llm/`** — in-process GGUF inference via `llama-cpp-2` (no server, no network). `generator.rs` produces the SOAP-R note on explicit **Generate**; `correction.rs` runs post-ASR suggestions on Stop (reuses the same resident model); `prompt.rs` holds the SOAP schema / anti-fabrication prompt; `engine.rs` owns the loaded model (shared `Arc<LlmEngine>` so a `model_choice` settings change retargets it without restart).
-- **`residency/`** — one-time startup decision (design §7): probe total RAM, choose **co-resident** (both STT+LLM warm) vs **swap** (load LLM at hand-off) to stay under the ~12 GB budget; cached in settings, re-probed only on hardware change.
+- **Model residency** — **co-resident always** (design §7): both STT and LLM stay warm for the life of the process. Targets a 16 GB (or higher) machine within the ~12 GB budget; there is no per-device mode decision or swap (no RAM probe).
 - **`models/`** — resolves model files across the download dir then the bundled resource dir; downloads required models on first run (**Setup** gate) and verifies each against a SHA-256 checksum. Installer ships no LLM/STT weights (only the small VAD model).
 
 ### Persistence & security

@@ -19,19 +19,11 @@ pub struct RealNoteGenerator {
     app: AppHandle,
     engine: Arc<LlmEngine>,
     store: SharedStore,
-    /// Residency Swap mode (design §7/§8.4): release the LLM after each generation
-    /// so the next recording's STT model has the RAM. Co-resident leaves it warm.
-    swap_mode: bool,
 }
 
 impl RealNoteGenerator {
-    pub fn new(app: AppHandle, engine: Arc<LlmEngine>, store: SharedStore, swap_mode: bool) -> Self {
-        Self {
-            app,
-            engine,
-            store,
-            swap_mode,
-        }
+    pub fn new(app: AppHandle, engine: Arc<LlmEngine>, store: SharedStore) -> Self {
+        Self { app, engine, store }
     }
 }
 
@@ -52,13 +44,6 @@ impl NoteGenerator for RealNoteGenerator {
             },
             &cancel,
         );
-
-        // In swap mode, free the LLM regardless of outcome so STT can reload for
-        // the next recording. Done before surfacing an error so a failure can't
-        // leave the model pinned.
-        if self.swap_mode {
-            self.engine.unload();
-        }
 
         // A cancelled run discards the partial note — nothing is persisted (§8.4).
         let markdown = match result? {

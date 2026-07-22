@@ -11,10 +11,6 @@ const mockInvoke = vi.mocked(invoke);
 
 const settings: Settings = {
   mic_device: null,
-  residency_mode: "co_resident",
-  residency_override: null,
-  observed_total_ram: 17000000000,
-  residency_calc_version: 2,
   vad_threshold: 0.5,
   idle_timeout: 30,
 };
@@ -37,10 +33,11 @@ describe("SettingsView", () => {
   it("loads settings and the device list", async () => {
     render(<SettingsView />);
     expect(await screen.findByRole("option", { name: /USB Mic/ })).toBeInTheDocument();
-    // The model picker is gone (§3 single-model); residency + mic remain.
+    // The model picker (§3 single-model) and residency control (§7 co-resident
+    // always) are gone; only the mic remains.
     expect(screen.queryByLabelText("Note model")).not.toBeInTheDocument();
+    expect(screen.queryByLabelText("Model residency")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Microphone")).toBeInTheDocument();
-    expect(screen.getByLabelText("Model residency")).toBeInTheDocument();
   });
 
   it("saves edits, preserving internal keys (read-modify-write)", async () => {

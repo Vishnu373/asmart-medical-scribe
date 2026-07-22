@@ -69,7 +69,7 @@ interface NotesSlice {
    * Generate (no click can trigger a blocking load) and shows the hint until the
    * mount seed reports the true state. The seed ships in the same binary so it
    * always resolves, and its error path falls back to `"ready"`, so a co-resident
-   * cold start reads honestly while swap/loaded machines clear the hint in ms.
+   * cold start reads honestly while an already-loaded model clears the hint in ms.
    */
   llmStatus: LlmStatus;
   /**

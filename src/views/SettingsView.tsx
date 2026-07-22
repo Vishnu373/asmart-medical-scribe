@@ -3,20 +3,13 @@ import { getSettings, listInputDevices, updateSettings } from "@/bridge";
 import type { InputDevice, Settings } from "@/bridge";
 import { useAppStore } from "@/state";
 
-/** Manual residency force (§7). `null` = use the automatic per-machine decision. */
-const RESIDENCY: { value: string; label: string }[] = [
-  { value: "", label: "Automatic (recommended)" },
-  { value: "co_resident", label: "Keep both models resident" },
-  { value: "swap", label: "Swap models (lower RAM)" },
-];
-
 /**
- * Settings view (§9.3, F6). The doctor-facing keys are microphone and the residency
- * override. (There is one note model now — §3 single-model refactor — so the model
- * picker is gone. The paste-hotkey control is likewise absent while EMR hand-off is
- * manual copy/paste, F7.) Internal keys (`residency_mode`, `observed_total_ram`, VAD,
- * idle timeout) are never shown and are preserved across save by spreading the loaded
- * object (read-modify-write).
+ * Settings view (§9.3, F6). The one doctor-facing key is the microphone. (There is
+ * one note model now — §3 single-model refactor — so the model picker is gone, and
+ * co-residency is always on — §7 — so the residency control is gone too. The
+ * paste-hotkey control is likewise absent while EMR hand-off is manual copy/paste,
+ * F7.) Internal keys (VAD, idle timeout) are never shown and are preserved across
+ * save by spreading the loaded object (read-modify-write).
  */
 export default function SettingsView() {
   const settings = useAppStore((s) => s.settings);
@@ -82,22 +75,6 @@ export default function SettingsView() {
             <option key={d.name} value={d.name}>
               {d.name}
               {d.is_default ? " (default)" : ""}
-            </option>
-          ))}
-        </select>
-      </label>
-
-      <label className="flex flex-col gap-1">
-        <span className="text-sm font-medium text-neutral-200">Model residency</span>
-        <select
-          aria-label="Model residency"
-          value={form.residency_override ?? ""}
-          onChange={(e) => patch({ residency_override: e.target.value || null })}
-          className="rounded-md border border-neutral-800 bg-neutral-900 px-3 py-2 text-sm text-neutral-100 focus:border-neutral-600 focus:outline-none"
-        >
-          {RESIDENCY.map((r) => (
-            <option key={r.value} value={r.value}>
-              {r.label}
             </option>
           ))}
         </select>

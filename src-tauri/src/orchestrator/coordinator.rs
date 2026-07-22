@@ -1,5 +1,6 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Instant;
 
 use anyhow::Result;
 
@@ -89,6 +90,10 @@ struct Inner {
     /// Set while GENERATING; `cancel_generation` flips it and the running
     /// generator polls it. Cleared when generation ends.
     cancel: Option<Arc<AtomicBool>>,
+    /// When the current recording started, for the stop-time duration log. `Instant`
+    /// (not `SystemTime`) so a wall-clock change can't report a negative or absurd
+    /// consult length; the log plugin already stamps each line with the wall clock.
+    started_at: Option<Instant>,
 }
 
 /// Single-threaded coordinator that owns the recording state and serializes all
@@ -113,6 +118,7 @@ impl Coordinator {
                 paused: false,
                 pipeline: Some(pipeline),
                 cancel: None,
+                started_at: None,
             }),
             generator,
             emit,
@@ -141,6 +147,8 @@ impl Coordinator {
         }
         inner.state = RecordingState::Recording;
         inner.paused = false;
+        inner.started_at = Some(Instant::now());
+        log::info!("[recording] started");
         // Emit while still holding the lock so the state change and its
         // notification are atomic: under rapid start/stop the next command can't
         // slip in and emit out of order (design §6.6 "UI can't desync"). The emit
@@ -160,6 +168,12 @@ impl Coordinator {
         }
         inner.state = RecordingState::Processing;
         inner.paused = false;
+        let elapsed = inner
+            .started_at
+            .take()
+            .map(|t| t.elapsed())
+            .unwrap_or_default();
+        log::info!("[recording] stopped — duration {}", fmt_duration(elapsed));
         let mut pipeline = inner
             .pipeline
             .take()
@@ -278,6 +292,12 @@ impl Coordinator {
     fn lock(&self) -> MutexGuard<'_, Inner> {
         self.inner.lock().unwrap_or_else(|p| p.into_inner())
     }
+}
+
+/// `8m 42s` — readable at a glance in the log, unlike raw seconds.
+fn fmt_duration(d: std::time::Duration) -> String {
+    let secs = d.as_secs();
+    format!("{}m {:02}s", secs / 60, secs % 60)
 }
 
 fn reject(action: &str, state: RecordingState) -> String {
@@ -474,7 +494,7 @@ mod tests {
         co.start_recording().unwrap();
         assert!(co.stop_recording().is_err());
         assert_eq!(co.state(), RecordingState::Idle); // recovered, not wedged
-        // Still walked through PROCESSING → IDLE, plus the error.
+                                                      // Still walked through PROCESSING → IDLE, plus the error.
         assert_eq!(
             *events.lock().unwrap(),
             vec![
@@ -526,7 +546,8 @@ mod tests {
 
         // Resolves with the persisted note id so the UI can edit / revert it.
         assert_eq!(
-            co.generate_note("rec-1", "patient reports a headache").unwrap(),
+            co.generate_note("rec-1", "patient reports a headache")
+                .unwrap(),
             Some("note-1".to_string())
         );
         assert_eq!(co.state(), RecordingState::Idle);

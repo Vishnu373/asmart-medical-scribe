@@ -4,8 +4,10 @@
 //! guards reject illegal transitions, returning an `Err(String)` the frontend
 //! surfaces (design §6.6/§9.4).
 
+use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::time::Instant;
 
 use tauri::{AppHandle, Emitter, State};
 
@@ -13,6 +15,7 @@ use crate::llm::LlmEngine;
 use crate::orchestrator::Coordinator;
 use crate::settings::{Settings, SharedSettings};
 use crate::store::{Note, Record, RecordSummary, SharedStore};
+use crate::stt::{ModelKind, SttEngine};
 
 /// Echoes a message back to the frontend with a prefix, proving the bridge works.
 #[tauri::command]
@@ -84,7 +87,10 @@ pub fn open_record(store: State<'_, SharedStore>, id: String) -> Result<Option<R
 /// loads these after a record opens and after GENERATING→IDLE (design §9.5).
 #[tauri::command]
 pub fn list_notes(store: State<'_, SharedStore>, record_id: String) -> Result<Vec<Note>, String> {
-    store.lock().list_notes(&record_id).map_err(|e| e.to_string())
+    store
+        .lock()
+        .list_notes(&record_id)
+        .map_err(|e| e.to_string())
 }
 
 /// Permanently delete a record and its notes (cascade via FK; NFR-9, §9.4).
@@ -176,21 +182,10 @@ pub fn get_settings(state: State<'_, SharedSettings>) -> Settings {
 /// fix, §9.5). Queried once at mount to seed the state before the async `llm-status`
 /// event flips it — the co-resident preload emits `loading` before the webview has a
 /// listener, so a mount query is how the UI reliably learns it is still warming.
-/// Returns `"ready"` when the model is loaded (or in swap mode, where it loads lazily
-/// per generation so generation is available immediately), else `"loading"`.
+/// Returns `"ready"` when the model is loaded, else `"loading"`.
 #[tauri::command]
-pub fn get_llm_status(
-    engine: State<'_, Arc<LlmEngine>>,
-    settings: State<'_, SharedSettings>,
-) -> String {
-    // Swap mode loads lazily per generation (no preload, so no `llm-status` event
-    // fires) — generation is available immediately, so report "ready". The effective
-    // mode must honor a residency *override*, which `resolve` applies without ever
-    // writing `residency_mode`; reading that field raw would report "loading" forever
-    // on a swap-by-override device (design §7).
-    let swap = crate::residency::effective_mode(&settings.get())
-        == Some(crate::residency::ResidencyMode::Swap);
-    if engine.is_loaded() || swap {
+pub fn get_llm_status(engine: State<'_, Arc<LlmEngine>>) -> String {
+    if engine.is_loaded() {
         "ready".to_string()
     } else {
         "loading".to_string()
@@ -202,20 +197,23 @@ pub fn get_llm_status(
 /// starves WebView2's first paint, so Windows ghosts the window as "not
 /// responding" on launch even though the warm runs off the main thread. The gate
 /// holds the engine until the frontend reports it has mounted ([`frontend_ready`]),
-/// then warms once. Disabled in swap mode, which loads lazily per generation.
+/// then warms once.
 pub struct PreloadGate {
+    /// Loaded first — see [`frontend_ready`].
+    stt: Arc<SttEngine>,
+    /// Model search dirs (D1) the STT load resolves Parakeet against.
+    stt_model_dirs: Vec<PathBuf>,
     engine: Arc<LlmEngine>,
-    /// Co-resident wants a warm model; swap mode never preloads.
-    enabled: bool,
     /// Flipped the first time [`frontend_ready`] fires, so re-mounts don't re-warm.
     started: AtomicBool,
 }
 
 impl PreloadGate {
-    pub fn new(engine: Arc<LlmEngine>, enabled: bool) -> Self {
+    pub fn new(stt: Arc<SttEngine>, stt_model_dirs: Vec<PathBuf>, engine: Arc<LlmEngine>) -> Self {
         Self {
+            stt,
+            stt_model_dirs,
             engine,
-            enabled,
             started: AtomicBool::new(false),
         }
     }
@@ -225,19 +223,31 @@ impl PreloadGate {
 /// Kicks off the co-resident model warm exactly once, on a background thread,
 /// emitting the same `llm-status` loading/ready/error events the mount query seeds
 /// from. Deferring the warm to here — rather than `setup` — keeps the heavy GGUF
-/// load off the launch path so the window paints before it starts. A no-op in swap
-/// mode, or if a prior call already started it (dev remounts / HMR). A load failure
-/// is non-fatal: the first generation retries and surfaces the error then.
+/// load off the launch path so the window paints before it starts. A no-op if a
+/// prior call already started it (dev remounts / HMR). A load failure is non-fatal:
+/// the first generation retries and surfaces the error then.
 #[tauri::command]
 pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
-    if !gate.enabled || gate.started.swap(true, Ordering::SeqCst) {
+    if gate.started.swap(true, Ordering::SeqCst) {
         return;
     }
     let engine = gate.engine.clone();
+    let stt = gate.stt.clone();
+    let stt_model_dirs = gate.stt_model_dirs.clone();
     std::thread::spawn(move || {
+        let t0 = Instant::now();
         let _ = app.emit("llm-status", serde_json::json!({ "status": "loading" }));
+        // STT first, then the SLM. A failure here is non-fatal — `RealPipeline::start`
+        // still calls `ensure_loaded` and will surface the error on Record.
+        if let Err(e) = stt.ensure_loaded(ModelKind::Parakeet, &stt_model_dirs) {
+            log::warn!("[startup] STT preload failed (will retry on Record): {e}");
+        }
         match engine.ensure_loaded() {
             Ok(()) => {
+                log::info!(
+                    "[startup] both models resident — READY in {:.1}s",
+                    t0.elapsed().as_secs_f32()
+                );
                 let _ = app.emit("llm-status", serde_json::json!({ "status": "ready" }));
             }
             Err(e) => {
@@ -256,10 +266,7 @@ pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
 /// value param is named `settings` to match the `invoke("update_settings", { settings })`
 /// arg; the managed handle is the type-resolved `state` param.
 #[tauri::command]
-pub fn update_settings(
-    state: State<'_, SharedSettings>,
-    settings: Settings,
-) -> Result<(), String> {
+pub fn update_settings(state: State<'_, SharedSettings>, settings: Settings) -> Result<(), String> {
     // There is one note model now, so settings changes never retarget the engine —
     // this only persists them (§3 single-model refactor).
     state.update(settings).map_err(|e| e.to_string())

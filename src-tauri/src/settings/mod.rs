@@ -17,17 +17,6 @@ use std::sync::{Arc, Mutex};
 pub struct Settings {
     /// Doctor-facing: selected input device, `None` = system default.
     pub mic_device: Option<String>,
-    /// Internal: co-resident vs swap, decided once and cached (§7).
-    pub residency_mode: Option<String>,
-    /// Doctor-facing: manual residency force; `None` = use the automatic decision.
-    /// Takes precedence over `residency_mode` when set (§7 override).
-    pub residency_override: Option<String>,
-    /// Internal: cached RAM probe in bytes; a mismatch re-triggers the decision (§7).
-    pub observed_total_ram: Option<u64>,
-    /// Internal: which residency decision rule produced `residency_mode`. Bumped when
-    /// the rule changes (e.g. the RAM threshold) so a new build re-decides on the same
-    /// hardware (§7).
-    pub residency_calc_version: Option<u32>,
     /// Internal: VAD speech threshold (§6.2).
     pub vad_threshold: f32,
     /// Internal: auto-stop-on-silence seconds.
@@ -38,10 +27,6 @@ impl Default for Settings {
     fn default() -> Self {
         Self {
             mic_device: None,
-            residency_mode: None,
-            residency_override: None,
-            observed_total_ram: None,
-            residency_calc_version: None,
             vad_threshold: 0.5,
             idle_timeout: 30,
         }

@@ -30,10 +30,6 @@ const { respond } = vi.hoisted(() => ({
       case "get_settings":
         return Promise.resolve({
           mic_device: null,
-          residency_mode: null,
-          residency_override: null,
-          observed_total_ram: null,
-          residency_calc_version: null,
           vad_threshold: 0.5,
           idle_timeout: 30,
         });

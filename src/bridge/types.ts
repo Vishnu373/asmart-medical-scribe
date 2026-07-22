@@ -36,10 +36,6 @@ export interface Note {
 /** Doctor-facing + internal settings (design §9.3). `settings::Settings`. */
 export interface Settings {
   mic_device: string | null;
-  residency_mode: string | null;
-  residency_override: string | null;
-  observed_total_ram: number | null;
-  residency_calc_version: number | null;
   vad_threshold: number;
   idle_timeout: number;
 }
@@ -93,7 +89,7 @@ export interface StateChangedEvent {
 }
 /** Note-model readiness (design §8.2 startup fix, §9.5). `loading` while the
  * co-resident preload warms the model on a background thread; `ready` once it is
- * loaded (or in swap mode, where it loads lazily per generation). */
+ * loaded. */
 export type LlmStatus = "loading" | "ready" | "error";
 /** `llm-status` payload; `message` carries the error text when `status === "error"`. */
 export interface LlmStatusEvent {

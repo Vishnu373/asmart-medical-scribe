@@ -111,8 +111,8 @@ export function getLlmStatus(): Promise<LlmStatus> {
 
 /** Signal the backend that the frontend has fully mounted (§8.2 startup fix), so the
  * co-resident note-model warm can begin *after* the window has painted rather than
- * during launch (which ghosted the window as "not responding"). A no-op in swap mode
- * and idempotent on the backend. Fire-and-forget. */
+ * during launch (which ghosted the window as "not responding"). Idempotent on the
+ * backend. Fire-and-forget. */
 export function frontendReady(): Promise<void> {
   return invoke("frontend_ready");
 }

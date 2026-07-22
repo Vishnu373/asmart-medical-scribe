@@ -35,7 +35,7 @@ This product lets the doctor focus on **one thing — treating the patient** —
 - Transcribe the conversation locally (speech-to-text).
 - Generate a structured **SOAP-R clinical note** from the transcript, fully on-device.
 - Keep the transcript locally so the doctor can revisit it; the doctor can delete transcripts at any time.
-- Run entirely on commodity clinician hardware: **Windows 11, 16 GB RAM or less, no GPU (CPU-only inference)**.
+- Run entirely on commodity clinician hardware: **Windows 11, 16 GB RAM or higher, no GPU (CPU-only inference)**.
 
 ### Non-goals (explicitly out of scope for v1)
 
@@ -45,7 +45,7 @@ This product lets the doctor focus on **one thing — treating the patient** —
 
 ### Key assumptions & constraints
 
-- Target hardware: **Windows 11, 16 RAM or less, CPU-only**. This is the binding constraint on model selection and on whether transcription is real-time vs. post-encounter.
+- Target hardware: **Windows 11, 16 GB RAM or higher, CPU-only**. This is the binding constraint on model selection and on whether transcription is real-time vs. post-encounter.
 - In-person capture uses a **single microphone** picking up both doctor and patient in the same room.
 - **Human-in-the-loop:** the doctor reviews and edits every note; the tool never auto-files anything.
 - **Audio is processed, not permanently retained**; the **transcript is retained locally** until the doctor deletes it.
@@ -83,14 +83,14 @@ The system works like a dictation tool tuned for a clinical visit. While the doc
 
 ## 3. Non-Functional Requirements
 
-All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or less, **CPU-only, no GPU**. Numbers are design targets to validate during benchmarking, not guarantees, given on-device model variability.
+All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or higher, **CPU-only, no GPU**. Numbers are design targets to validate during benchmarking, not guarantees, given on-device model variability.
 
 | # | Requirement | Target | Rationale |
 |---|------------|--------|-----------|
 | NFR-1 | **Per-segment transcription latency** | Captured text appears **< 2 s** after a speech pause (for a typical 5–15 s utterance) | Must feel near-instant so the doctor isn't waiting mid-visit; drives choice of a fast, CPU-light STT model (Parakeet TDT v3, §6.4) |
 | NFR-2 | **Note generation** | Runs in a **background queue**; doctor is not blocked and can start the next patient. Target completion **< 90 s** for a ~20-min encounter on the 16 GB profile | A 7–8B quantized LLM on CPU needs time; backgrounding hides it so throughput isn't affected |
 | NFR-3 | **Encounter length** | Handle encounters up to **~30 min** of audio without instability | Headroom over the ~20-min average; long visits must not exhaust memory |
-| NFR-4 | **Peak memory** | Total app + models peak **< 12 GB RAM** | Leaves ~4 GB for Windows + the doctor's EHR/browser on a 16 GB machine; STT + LLM may need to load/unload to coexist |
+| NFR-4 | **Peak memory** | Total app + models peak **< 12 GB RAM** | Leaves ~4 GB for Windows + the doctor's EHR/browser on a 16 GB machine; STT + LLM stay co-resident (§7) |
 | NFR-5 | **Encryption at rest** | All persisted PHI (transcripts, notes, app store) **encrypted at rest** (AES-256; key protected via Windows DPAPI tied to the user account) | Persistent local PHI must survive device loss/theft without exposure |
 | NFR-6 | **Durability / crash safety** | Captured transcript persisted incrementally so an app/OS crash mid-visit loses **≤ the last unsaved segment** | A 20-min visit's transcript must not vanish on a crash |
 | NFR-7 | **Data lifecycle** | Audio discarded immediately after each segment is transcribed; transcript/note retained until the doctor deletes them; deletions are **permanent** (no recycle/cloud copy) | Minimizes audio PHI footprint; gives the doctor full control over retained text |
@@ -207,7 +207,7 @@ sequenceDiagram
     Dr->>UI: Final transcript review/edit
     Dr->>UI: Click Generate Note
     UI->>LLM: generate_note(transcript, language) [background]
-    Note over LLM: STT may unload to free RAM (<12GB)
+    Note over LLM: STT + LLM co-resident (§7)
     LLM-->>UI: SOAP note
     UI-->>Dr: Show note for review/edit
     UI->>DB: Save note (encrypted)
@@ -388,7 +388,7 @@ The two hops differ by design: **capture → transcription is an mpsc queue** (a
 2. Let the worker **drain the queue** — transcribe every remaining segment and emit it.
 3. Once the last segment has been emitted to the UI, transition to **IDLE**.
 
-The model is **not** unloaded here in v1 — it is left warm, and the idle-watcher (§6.4) releases it later if the app sits unused. *(Phase two: PROCESSING is where the STT model is unloaded and the LLM loaded for note generation.)*
+The model is **not** unloaded here in v1 — it is left warm, and the idle-watcher (§6.4) releases it later if the app sits unused. *(Phase two: PROCESSING is where the co-resident LLM (§7) generates the note; both models stay warm.)*
 
 **Clean teardown & resilience.** Threads are stopped via a signal and **joined** (or parked for reuse) and the queue is closed, so no orphaned threads survive between encounters. If a thread **panics** (e.g. a model error), the coordinator catches it, surfaces an error to the UI, and returns the machine to a safe **IDLE** rather than wedging.
 
@@ -396,45 +396,11 @@ The model is **not** unloaded here in v1 — it is left warm, and the idle-watch
 
 ## 7. Model Residency Strategy
 
-The application runs two models on the same machine: the speech-to-text model used during recording, and the note-generation (LLM) model used after recording stops. Both are sizable, CPU-only, and resident in RAM while in use. On a roomy machine they can stay loaded **at the same time**, so the hand-off from transcription to note generation is instantaneous. On a tighter machine, keeping both resident risks pushing the operating system into **disk paging**, which degrades the whole system unpredictably — worse than a deliberate, momentary model reload. The residency strategy decides, per device, which of these two regimes to use.
+The application runs two models on the same machine: the speech-to-text model used during recording, and the note-generation (LLM) model used after recording stops. Both are sizable, CPU-only, and resident in RAM while in use.
 
-This section covers **only the one-time mode decision**. Run-time concerns — checking momentary free RAM right before a generation, loading/unloading on the swap path, and graceful degradation — belong to the lifecycle/orchestration design and are out of scope here.
+**Co-residency, always.** With a single small note model (§8.2), both models stay warm in RAM **at the same time** for the life of the session — no swapping, no per-device mode decision. The single ~3.2 GB Gemma model alongside the STT model fits comfortably on the target hardware, so the hand-off from transcription to note generation is instantaneous.
 
-### What we measure
-
-At first run we read the machine's **total physical RAM** (via a system-info probe). Total RAM is a stable, per-device property: it does not change between sessions and it alone determines whether co-residency is *ever* viable on this box. We deliberately do **not** base the mode on momentary *available* RAM, which fluctuates with whatever else the user has open and would make the decision flip-flop.
-
-### The decision rule
-
-With a single small note model (§8.2), the mode follows a plain **total-RAM threshold** rather than a per-model footprint sum:
-
-```
-co-resident   if total physical RAM ≥ 16 GB
-swap          otherwise (e.g. an 8 GB box)
-```
-
-Earlier versions summed the STT size, the RAM-keyed LLM size, and an OS headroom allowance, then required a margin above that total. The single ~3.2 GB Gemma model (§8.2) alongside the STT model fits comfortably on any 16 GB machine and needs a swap fallback only on 8 GB boxes, so the footprint arithmetic collapses to this one cutoff — simpler, and no longer dependent on a per-model size estimate. Because the rule changed, the cached decision's `residency_calc_version` is bumped so every device re-decides under the new threshold rather than trusting a stale cache.
-
-### The two modes
-
-| Mode | Behavior | Cost | When chosen |
-|------|----------|------|-------------|
-| **Co-resident** | Both STT and LLM stay warm in RAM throughout a session | Higher steady-state RAM use | Total RAM ≥ 16 GB |
-| **Swap** | One model resident at a time; the LLM is loaded at the transcription→generation hand-off | A few seconds of model-load latency at hand-off | Total RAM < 16 GB |
-
-Co-resident gives a zero-latency hand-off from Stop to note generation. Swap trades that latency for a substantially lower peak RAM footprint.
-
-### Threshold, not bare fit
-
-The 16 GB cutoff is deliberately above a bare technical fit. A device that only *just* fits both models invites disk paging the moment any transient memory pressure appears, so the threshold keeps a real buffer for the app, webview, OS, and the clinician's other applications rather than choosing co-residency on a machine that can barely hold the two models.
-
-### Decide once, cache it
-
-Because this is a per-device property, we probe **once on first run**, choose the mode, and **persist it** to the settings store alongside the total-RAM value we observed. Subsequent launches read the cached mode rather than re-probing. The single trigger for re-evaluation is a **hardware change**: if the stored total-RAM value no longer matches the current machine, we re-probe and re-cache. There is no per-launch probe.
-
-### Manual override
-
-The automatic decision is the default, but the user can force a mode in settings — e.g. force **Swap** to keep RAM free for other applications, or force **Co-resident** on a borderline machine they know performs fine. An explicit override takes precedence over the cached automatic decision.
+This assumes a **16 GB (or higher) machine** — the binding hardware profile (§2). Co-residency keeps a real buffer for the app, webview, OS, and the clinician's other applications on such a device; smaller machines are out of scope for now.
 
 ---
 
@@ -469,7 +435,7 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 - there is **no `model_choice` setting** and **no model picker** in Settings (§9.3);
 - there are **no on-demand tier downloads** — Setup fetches exactly one LLM;
-- the §7 residency probe still reads total RAM and still decides co-resident vs swap, but on a **flat 16 GB total-RAM threshold** — it no longer needs a per-model footprint estimate.
+- both models are **co-resident** on the 16 GB+ target hardware (§7) — no RAM probe, no per-model footprint estimate.
 
 | Model | Quant | On-disk size |
 |-------|-------|--------------|
@@ -485,7 +451,7 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 **Upgrade migration — delete the retired tier weights.** A device upgrading from a prior version still has the old GGUFs (`mistral.gguf`, `phi-q8.gguf`, `phi-q4.gguf`) in its app-data models dir — several GB that will never be loaded again. On first launch of v0.1.2 the app **deletes any of these that exist** from the writable models dir (the bundled resource dir is read-only and carries none), reclaiming the disk. The deletion is best-effort and idempotent: a missing file is a no-op, a failed unlink is logged and does not block startup.
 
-**Startup model load is non-blocking (v0.1.2 "not responding" fix).** In co-resident mode the model was previously loaded **synchronously inside the Tauri `setup` hook**, which runs on the main thread before the webview can paint — so a multi-GB GGUF load plus warmup left the window unresponsive ("not responding") for the whole load on every launch. In v0.1.2 the app **finishes starting first**: `setup` returns immediately and the window paints, and the co-resident preload (model load + prefix warmup, §8.6) runs on a **background thread**. The UI reflects load state via an `llm-status` event (`loading` → `ready`, or `error`; §9.5) so a status indicator can read "Preparing note model…" while it loads and enable Generate when ready. Swap mode is unaffected — it already loaded lazily per generation. A concurrent-load guard serializes the background preload against a Generate that arrives before it finishes, so the model is loaded at most once.
+**Startup model load is non-blocking (v0.1.2 "not responding" fix).** In co-resident mode the model was previously loaded **synchronously inside the Tauri `setup` hook**, which runs on the main thread before the webview can paint — so a multi-GB GGUF load plus warmup left the window unresponsive ("not responding") for the whole load on every launch. In v0.1.2 the app **finishes starting first**: `setup` returns immediately and the window paints, and the co-resident preload (model load + prefix warmup, §8.6) runs on a **background thread**. The UI reflects load state via an `llm-status` event (`loading` → `ready`, or `error`; §9.5) so a status indicator can read "Preparing note model…" while it loads and enable Generate when ready. A concurrent-load guard serializes the background preload against a Generate that arrives before it finishes, so the model is loaded at most once.
 
 **Tuning notes:**
 
@@ -534,24 +500,17 @@ IDLE ──Generate──► GENERATING ──complete / cancel / fail──► 
 
 While in GENERATING, recording is blocked and a second Generate is ignored — a single generation is in flight at a time. On any exit (success, cancel, or failure) the app returns to IDLE with the transcript preserved intact.
 
-**Model load timing — driven by the §7 residency mode.** The startup probe (§7) has already decided co-resident vs. swap; this section consumes that flag:
-
-| Mode | When LLM is loaded | On Generate | After generation |
-|------|--------------------|-------------|------------------|
-| **Co-resident** | Shortly after startup, on a **background thread** (not blocking the UI); stays resident | Already in RAM (or the UI waited on the `ready` status) — generation starts immediately | Stays resident |
-| **Swap** | Lazily, per generation | Unload STT → load LLM → generate | Unload LLM → reload STT for the next recording |
-
-In swap mode the load/unload is the RAM cost of running on a tight machine; in co-resident mode that cost is paid once, just after startup rather than inside it.
+**Model load timing — co-resident (§7).** The LLM is loaded **shortly after startup, on a background thread** (not blocking the UI) and stays resident. On Generate it is already in RAM (or the UI waited on the `ready` status), so generation starts immediately; it stays resident afterward for the next note. The one-time load cost is paid just after startup rather than inside it.
 
 **Startup load runs off the UI thread (v0.1.2).** The co-resident preload must not run inside the Tauri `setup` hook — that blocks the main thread and leaves the window "not responding" for the whole multi-GB load (§8.2). Instead `setup` returns immediately, the window paints, and the preload runs on a background thread that emits `llm-status` (`loading` → `ready` / `error`, §9.5). A concurrent-load guard makes a Generate arriving mid-preload wait on the same load rather than starting a second one.
 
-**Warmup.** The first inference after a model load is slower (cold weights, cold buffers). To keep the clinician's first real generation at full speed, a warmup pass runs immediately after each load — in co-resident mode this is the same background-thread step that primes the prompt-prefix KV cache (§8.6); in swap mode it runs right after the swap-load.
+**Warmup.** The first inference after a model load is slower (cold weights, cold buffers). To keep the clinician's first real generation at full speed, a warmup pass runs immediately after the load — the same background-thread step that primes the prompt-prefix KV cache (§8.6).
 
 **Cancellation.** A Cancel control stops generation mid-stream (via the decode loop's stop hook). On cancel, the partial note is **discarded** and the screen returns to its pre-Generate state; the transcript is untouched. Streamed output (below) keeps this responsive — the user sees tokens appear, so a cancel feels immediate.
 
 **Streaming.** Tokens are streamed to the UI as they are produced rather than shown only when complete. This makes the wait *feel* short and makes cancellation feel instant. 
 
-**Load-time RAM guard.** The §7 budget is a startup decision on *total* RAM; actual *available* RAM at generation time can be lower. Before loading the LLM, available RAM is checked. If it is insufficient, the load fails gracefully: the app surfaces the error, stays in IDLE, and preserves the transcript — never a silent out-of-memory crash.
+**Load-time RAM guard.** Even on a 16 GB+ machine, actual *available* RAM at load time can be low if the clinician has much else open. Before loading the LLM, available RAM is checked. If it is insufficient, the load fails gracefully: the app surfaces the error, stays in IDLE, and preserves the transcript — never a silent out-of-memory crash.
 
 ### 8.5 Delivery & persistence
 
@@ -589,7 +548,7 @@ The few-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 
 **What is being cached.** When the model reads tokens it produces per-token intermediate state (the attention **KV cache**) that generation then reads from. The prefix's KV entries depend only on the prefix tokens, so once computed they are valid for *any* transcript that follows — provided the prefix tokens are unchanged and sit at the same positions. That is the whole reason §8.3 orders the prompt `[system + example] → [transcript] → [assistant]`: **only the run of tokens before the first differing token is reusable**, so the fixed part must come first.
 
-1. **Prefill once, snapshot the state.** On load/warmup the engine tokenizes the fixed prefix (system + example + template scaffolding up to where the transcript begins), decodes it once into a context, then serializes the KV state **for that one sequence** into an in-memory byte buffer. It also records the **prefix token sequence**. The context is dropped. Using the *sequence-scoped* save (not the whole-context one) sizes the snapshot to the cells the prefix actually used (tens of MB), avoiding a transient ~1 GB allocation for the full N_CTX cache right after the model load — which would spike RAM exactly at the §7 residency threshold.
+1. **Prefill once, snapshot the state.** On load/warmup the engine tokenizes the fixed prefix (system + example + template scaffolding up to where the transcript begins), decodes it once into a context, then serializes the KV state **for that one sequence** into an in-memory byte buffer. It also records the **prefix token sequence**. The context is dropped. Using the *sequence-scoped* save (not the whole-context one) sizes the snapshot to the cells the prefix actually used (tens of MB), avoiding a transient ~1 GB allocation for the full N_CTX cache right after the model load.
 2. **Per note — restore, don't recompute.** Build a fresh context, load the snapshot into it (a memory copy of the prefix KV — no transformer math), then decode only the transcript tail at positions after the prefix and generate. The prefix is never re-prefilled.
 3. **Reset is automatic.** The snapshot bytes are never mutated and each note uses its own throwaway context, so there is nothing to trim between notes — the next note simply restores the same snapshot again. A cancelled or errored note drops its context with no effect on the cache.
 
@@ -600,8 +559,6 @@ The few-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 - **Prefix must be truly fixed.** If anything in the prefix changes, the snapshot is stale and must be rebuilt. With a single model (§8.2) the old **model-change** trigger is gone; the remaining trigger is a **prompt edit** (system prompt or examples) shipped in a new build, which changes the prefix tokens. The saved-prefix-tokens check catches any mismatch and falls back to a full decode, so a build whose prompt changed can never restore a stale snapshot.
 - **No accumulation.** Because every note uses a fresh context, transcript+note tokens never persist across notes, so nothing can accumulate toward the context window (§8.2) — the property the persistent-context alternative would have needed an explicit KV trim to hold.
 - **Single-flight.** Generation is already serialized behind the model lock (§8.4); the snapshot is guarded the same way, so two notes never share/mutate it concurrently.
-
-**Interaction with residency (§7).** This helps **co-resident** mode only. In **swap** mode the model is unloaded after each generation to free RAM for STT (§8.4), which destroys the context and its cached prefix — so the next note re-prefills from cold regardless. That is acceptable: swap mode is the RAM-constrained path where keeping a model (and context) warm isn't affordable anyway. 
 
 **Dependency & fallback.** Reuse needs the `llama-cpp-2` binding to expose **sequence-scoped state save/restore** (`state_seq_get_size_ext` / `state_seq_get_data_ext` / `state_seq_set_data_ext`), confirmed present in the pinned version (0.1.150). The sequence-scoped variants (over the whole-context `get_state_size` / `copy_state_data`) are what keep the snapshot sized to the prefix's cells rather than the full N_CTX cache. The binding *also* exposes KV-cache trim (`clear_kv_cache_seq`), which the persistent-context alternative would have used — but the save/restore path is what we build (see the trade-off below). The **fallback** is the current behavior — prefill the full prompt per note — and it is entered automatically whenever the snapshot is missing (not yet primed, or after `unload`) or the boundary check fails, so the feature degrades to "correct but not cached" rather than breaking generation.
 
@@ -651,8 +608,6 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 | Key | Surfaced? | Meaning |
 |-----|-----------|---------|
 | `mic_device` | **Doctor** | Selected input device |
-| `residency_override` | **Doctor** | Manual co-resident/swap force; empty = automatic (§7) |
-| `residency_mode` | internal | Co-resident vs swap, decided once (§7) |
 
 > `model_choice` was removed in v0.1.2 — there is a single note model (§8.2), so there is no model picker. An old settings file's `model_choice` key is ignored on load.
 
@@ -660,7 +615,6 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 
 | Key | Surfaced? | Meaning |
 |-----|-----------|---------|
-| `observed_total_ram` | internal | Cached probe; re-probed only on hardware change (§7) |
 | `vad_threshold` | internal | Fixed sensible default (§6.2) |
 | `idle_timeout` | internal | Auto-stop-on-silence default |
 
@@ -706,14 +660,77 @@ The clinical DB is encrypted with SQLCipher (AES-256, §9.1). The open question 
 
 **Zero PHI egress (NFR-6).** The app is fully functional offline and makes no network calls that carry patient data. Transcripts, notes, and the patient label never leave the device.
 
-### 10.3 Telemetry
+### 10.3 Observability (on-device logging + telemetry)
 
-**Automatic technical telemetry (no PHI).** To know the product works on real devices and to fix it early, the app sends **technical-only** events automatically — no opt-in, disclosed once in a short privacy notice. This preserves NFR-6, which concerns *PHI* egress: these events carry none. It covers both crashes and a small set of usage/health events.
+The app has **two sinks** for operational events, governed by one PHI policy:
 
-- **Allowlist, never blocklist.** Each event is built from a fixed set of non-PHI fields — app version, OS, arch, detected RAM tier, active model tier, event name, coarse timings, and for errors the error *type/message string only* (`TechnicalContext`). Nothing else is attachable by construction.
-- **Scrub backstop (defense-in-depth).** Every outgoing event still passes through `scrub_event`, which recursively strips any field whose key looks like PHI (`transcript`, `soap`, `note`, `label`, `record`) — so a future richer payload can never leak one.
-- **Events:** `app_launched`, `setup_started` / `model_download_done` / `model_download_failed`, `note_generated` (+ ms), `error` (sanitized), `crash` (stack trace + `TechnicalContext`).
+1. **On-device log** — a plaintext log file on the device, for local diagnosis and support.
+2. **Telemetry** — a *subset* of events sent off-device to our self-hosted GlitchTip.
+
+Every event carries **no PHI** regardless of sink. Because NFR-6 concerns PHI egress, telemetry is the stricter boundary — but the on-device log is held to the **same PHI bar**, since it is plaintext (unlike the AES-256 clinical DB, §10.1) and rides along in any support bundle a clinician sends.
+
+#### On-device log
+
+- **Transport.** `tauri-plugin-log` writes a rolling plaintext log to the app data dir. Our crate logs at **Info**; every dependency is muted to **Warn** so genuine failures still surface without the ONNX/llama.cpp chatter.
+- **PHI bar.** Only IDs, counts, durations, model names, and *sanitized* error strings are ever logged — **never** transcript or note text. Failure handlers log the DB/IO error, not the content being saved.
+- **Path/PII stripping.** Rust IO/ONNX/llama.cpp errors routinely embed `C:\Users\<name>\…`, and device errors embed the mic name — both PII. Any error string is stripped of the home-dir path before it is logged or sent.
+- **Correlation IDs.** `record_id` (the `id` column of the record table) and `note_id` (the `id` column of the note table) tag their respective lifecycle events. Note generation logs **both** once — `record_id → note_id` — so a note is always traceable back to the recording it came from.
+
+#### Telemetry (the off-device subset)
+
+**Automatic technical telemetry (no PHI).** To know the product works on real devices and to fix it early, the app sends **technical-only** events automatically — no opt-in, disclosed once in a short privacy notice. It covers crashes plus a small set of usage/health events (the telemetry-flagged rows of the catalog below).
+
+- **Allowlist, never blocklist.** Each event is built from a fixed set of non-PHI fields — app version, OS, arch, event name, coarse timings, and for errors the sanitized error *string only* (`TechnicalContext`). Nothing else is attachable by construction.
+- **Static event names.** Telemetry events use fixed names with variable data in `props`, **never** interpolated into the name — GlitchTip groups by message, so `{e}` in a name fragments one failure into many groups.
+- **Scrub backstop (defense-in-depth).** Every outgoing event still passes through `scrub_event`, which recursively strips any field whose key looks like PHI (`transcript`, `soap`, `note`, `label`, `record`) — so a future richer payload can never leak one, and so `props` keys must avoid those tokens (use `input_tokens`, not `transcript_tokens`).
 - **Transport:** the **Sentry Rust SDK** sends each event to **our own self-hosted GlitchTip** instance (§14.4) — the SDK queues, batches, and retries in a background thread, never blocks the UI, and is silent on failure. Every event still passes the `scrub_event` backstop via the SDK's `before_send` hook before it leaves the process. It is off unless **both** the `crash-reporting` cargo feature is enabled **and** a DSN is compiled into the build (`MEDSCRIBE_CRASH_DSN`), so the default build has no client, sends nothing, and stays fully offline. GlitchTip is Sentry-API-compatible and self-hosted, so no third-party analytics vendor receives any data.
+
+#### Log event catalog
+
+Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
+
+| Event | On-device | Telemetry |
+| --- | :---: | :---: |
+| `[LAUNCH] application started — v{version}, {os}` | ✓ | ✓ |
+| `[LAUNCH] downloading STT model {model_name}` | ✓ | ✓ |
+| `[LAUNCH] download STT model failed {e}` | ✓ | ✓ |
+| `[LAUNCH] STT model checksum mismatch` | ✓ | ✓ |
+| `[LAUNCH] downloading SLM model {model_name}` | ✓ | ✓ |
+| `[LAUNCH] download SLM model failed {e}` | ✓ | ✓ |
+| `[LAUNCH] SLM model checksum mismatch` | ✓ | ✓ |
+| `[LOAD] loading STT model: {model_name}` | ✓ | |
+| `[LOAD] STT model load failed: {e}` | ✓ | ✓ |
+| `[LOAD] STT model loaded: {duration}s` | ✓ | |
+| `[LOAD] loading SLM: {model_name}` | ✓ | |
+| `[LOAD] SLM load failed: {e}` | ✓ | ✓ |
+| `[LOAD] SLM model loaded: {duration}s` | ✓ | |
+| `[LOAD] both models resident, status changed to READY` | ✓ | |
+| `[RECORD] using device mic for recording: {mic_name}` | ✓ | |
+| `[RECORD] {record_id}, recording started` | ✓ | |
+| `[RECORD] {record_id}, recording failed {e}` | ✓ | ✓ |
+| `[RECORD] {record_id} audio device failed mid-recording` | ✓ | ✓ |
+| `[RECORD] {record_id}, recording complete — {M}m {SS}s` | ✓ | |
+| `[GENERATE] {record_id} → {note_id}, note generation started — {input_tokens}` | ✓ | |
+| `[GENERATE] {note_id}, note generation failed {e}` | ✓ | ✓ |
+| `[GENERATE] {note_id} prefill started` | ✓ | |
+| `[GENERATE] {note_id} prefill done — prefill duration {N}s` | ✓ | |
+| `[GENERATE] {note_id} reasoning started` | ✓ | |
+| `[GENERATE] {note_id} reasoning done — reasoning duration {N}s` | ✓ | |
+| `[GENERATE] {note_id} perceived TTFT at {N}s` | ✓ | |
+| `[GENERATE] {note_id} note generation complete — {generated_token_count}, total {N}s, {tokens/s}` | ✓ | |
+| `[EDIT] {record_id} transcript updated` | ✓ | |
+| `[EDIT] {record_id} transcript update failed {error message}` | ✓ | |
+| `[EDIT] {note_id} generated notes updated` | ✓ | |
+| `[EDIT] {note_id} generated notes update failed {error message}` | ✓ | |
+| `[UPDATE] update available` | ✓ | |
+| `[UPDATE] update downloaded` | ✓ | |
+| `[UPDATE] update download failed {error message}` | ✓ | ✓ |
+| `[UPDATE] update installed` | ✓ | |
+| `[UPDATE] update install failed {error message}` | ✓ | ✓ |
+| `[LAUNCH] application closed` | ✓ | |
+| `[DB] DPAPI key unwrap failed {error message}` | ✓ | ✓ |
+
+Notes: the mic name is PII, so it is on-device only. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
 
 ### 10.4 Data lifecycle
 
@@ -781,7 +798,7 @@ The r2.dev base URL should later swap to a custom domain (production polish, tie
 
 **Why the alternate STT engine is deferred (technical note).** The default STT engine (Parakeet) runs on an **ONNX** runtime, while the note-generation LLM (§8) runs on **llama.cpp**. A Whisper-family STT engine would run on **whisper.cpp**. Both whisper.cpp and llama.cpp statically embed their *own* copy of the same low-level tensor library (**ggml**); linking both into one executable produces duplicate-symbol link errors, so they cannot coexist in a single binary. v1 therefore ships exactly one ggml consumer — the LLM — and an ONNX-based STT (Parakeet) that carries no ggml, which links cleanly.
 
-Adding a whisper-based engine later is still possible without this conflict by running one engine **out-of-process** (a separate child process the app talks to locally), so each binary embeds its own ggml independently. That isolation pairs naturally with the **swap** residency mode (§7) — the alternate engine and the LLM would load one at a time, with the clinician shown a brief, plain-language "this may add a short delay" notice at the hand-off rather than any technical detail. This is a known, accepted limitation of the current single-binary design.
+Adding a whisper-based engine later is still possible without this conflict by running one engine **out-of-process** (a separate child process the app talks to locally), so each binary embeds its own ggml independently. This is a known, accepted limitation of the current single-binary design.
 
 ## 14. Distribution, Updates & Telemetry
 
