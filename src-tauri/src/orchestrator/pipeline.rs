@@ -89,7 +89,7 @@ impl RealPipeline {
 }
 
 impl Pipeline for RealPipeline {
-    fn start(&mut self) -> Result<()> {
+    fn start(&mut self, id: &str) -> Result<()> {
         // Ensure the STT model is loaded before capture starts, resolving the
         // bundled Parakeet model from the model dirs (no-op if already warm). Fail
         // here — before spinning up capture threads — so a missing model surfaces
@@ -152,6 +152,25 @@ impl Pipeline for RealPipeline {
                 let app = self.app.clone();
                 move |buckets: Vec<f32>| {
                     let _ = app.emit("input-level", json!({ "level": buckets }));
+                }
+            })
+            .with_error_callback({
+                // §10.3 `[RECORD] {record_id} audio device failed mid-recording`
+                // (+ telemetry + a UI notification). The bare catalog line is on-device
+                // only and the telemetry carries no error string: a cpal device error can
+                // embed the mic name, which is PII and never leaves the device (§10.3).
+                let app = self.app.clone();
+                let record_id = id.to_string();
+                move |_err: String| {
+                    log::error!("[RECORD] {record_id} audio device failed mid-recording");
+                    crate::telemetry::track_event("audio_device_failed", json!({}));
+                    let _ = app.emit(
+                        "error",
+                        json!({
+                            "code": "audio_device_failed",
+                            "message": "The microphone stopped working during recording.",
+                        }),
+                    );
                 }
             });
 

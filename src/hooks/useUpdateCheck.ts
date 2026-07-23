@@ -1,6 +1,7 @@
 import { useEffect } from "react";
 import { check } from "@tauri-apps/plugin-updater";
 import { useAppStore } from "@/state";
+import { logUpdateEvent } from "@/bridge";
 
 /**
  * Passively check the updater endpoint for a newer release on startup and stash
@@ -25,6 +26,7 @@ export function useUpdateCheck(): void {
         if (cancelled || !update) return; // up to date
         setUpdate(update);
         setUpdateStage("available");
+        void logUpdateEvent("available"); // §10.3 `[UPDATE] update available`
       } catch {
         // Update problems must never block the app; leave the button hidden.
       }

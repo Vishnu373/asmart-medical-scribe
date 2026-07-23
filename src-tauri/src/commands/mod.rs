@@ -64,10 +64,18 @@ pub fn update_transcript(
     id: String,
     transcript: String,
 ) -> Result<(), String> {
-    store
-        .lock()
-        .update_transcript(&id, &transcript)
-        .map_err(|e| e.to_string())
+    // §10.3 `[EDIT] {record_id} transcript updated / update failed` (on-device only —
+    // the id and any DB/IO error, never the transcript text).
+    match store.lock().update_transcript(&id, &transcript) {
+        Ok(()) => {
+            log::info!("[EDIT] {id} transcript updated");
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("[EDIT] {id} transcript update failed {e}");
+            Err(e.to_string())
+        }
+    }
 }
 
 /// List saved encounters, newest first (FR-13; §9.4).
@@ -152,10 +160,18 @@ pub fn update_note(
     id: String,
     soap_data: String,
 ) -> Result<(), String> {
-    store
-        .lock()
-        .update_note(&id, &soap_data)
-        .map_err(|e| e.to_string())
+    // §10.3 `[EDIT] {note_id} generated notes updated / update failed` (on-device only —
+    // the id and any DB/IO error, never the note text).
+    match store.lock().update_note(&id, &soap_data) {
+        Ok(()) => {
+            log::info!("[EDIT] {id} generated notes updated");
+            Ok(())
+        }
+        Err(e) => {
+            log::warn!("[EDIT] {id} generated notes update failed {e}");
+            Err(e.to_string())
+        }
+    }
 }
 
 /// Revert a record to an earlier note version, making it active again (§8.5).
@@ -240,12 +256,14 @@ pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
         // STT first, then the SLM. A failure here is non-fatal — `RealPipeline::start`
         // still calls `ensure_loaded` and will surface the error on Record.
         if let Err(e) = stt.ensure_loaded(ModelKind::Parakeet, &stt_model_dirs) {
-            log::warn!("[startup] STT preload failed (will retry on Record): {e}");
+            log::warn!("[LOAD] STT preload failed (will retry on Record): {e}");
         }
         match engine.ensure_loaded() {
             Ok(()) => {
+                // §10.3 co-resident ready line. (Catalog tags this `[CLOSE]`, which is a
+                // doc typo — it is a load-completion event, so it carries `[LOAD]`.)
                 log::info!(
-                    "[startup] both models resident — READY in {:.1}s",
+                    "[LOAD] both models resident, status changed to READY ({:.1}s)",
                     t0.elapsed().as_secs_f32()
                 );
                 let _ = app.emit("llm-status", serde_json::json!({ "status": "ready" }));
@@ -330,6 +348,38 @@ pub fn mark_setup_completed() {
 #[tauri::command]
 pub fn trial_status() -> crate::trial::TrialStatus {
     crate::trial::status()
+}
+
+/// Record an app-update lifecycle event (§10.3 `[UPDATE]` rows) on-device, plus
+/// telemetry for the two failure stages. The updater is driven entirely from the
+/// frontend (`useUpdateCheck` / `UpdateButton`), so the app logs these from where it
+/// drives the update rather than a plugin callback. `message` carries the JS error
+/// string for the failure stages; it is sanitized before either sink (§10.3 — it
+/// can embed a profile path). No PHI: update events are binary-only (§14).
+#[tauri::command]
+pub fn log_update_event(stage: String, message: Option<String>) {
+    match stage.as_str() {
+        "available" => log::info!("[UPDATE] update available"),
+        "downloaded" => log::info!("[UPDATE] update downloaded"),
+        "installed" => log::info!("[UPDATE] update installed"),
+        "download_failed" => {
+            let e = crate::telemetry::sanitize_error(message.as_deref().unwrap_or(""));
+            log::warn!("[UPDATE] update download failed {e}");
+            crate::telemetry::track_event(
+                "update_download_failed",
+                serde_json::json!({ "error": e }),
+            );
+        }
+        "install_failed" => {
+            let e = crate::telemetry::sanitize_error(message.as_deref().unwrap_or(""));
+            log::warn!("[UPDATE] update install failed {e}");
+            crate::telemetry::track_event(
+                "update_install_failed",
+                serde_json::json!({ "error": e }),
+            );
+        }
+        other => log::warn!("[UPDATE] unknown update stage: {other}"),
+    }
 }
 
 /// Load a record's transcript for generation, rejecting a missing record or an

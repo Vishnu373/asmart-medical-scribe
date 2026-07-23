@@ -133,12 +133,21 @@ impl SttEngine {
 
     /// Load a model from `model_path`, replacing any currently loaded one.
     pub fn load(&self, kind: ModelKind, model_path: &Path) -> Result<()> {
-        info!("[startup] loading STT model: {}", kind.dir_name());
+        info!("[LOAD] loading STT model: {}", kind.dir_name()); // §10.3
         let t0 = Instant::now();
         let loaded = match kind {
             ModelKind::Parakeet => LoadedEngine::Parakeet(
-                ParakeetModel::load(model_path, &Quantization::Int8)
-                    .map_err(|e| anyhow!("failed to load Parakeet model: {e}"))?,
+                ParakeetModel::load(model_path, &Quantization::Int8).map_err(|e| {
+                    // §10.3 `[LOAD] STT model load failed: {e}` (both sinks). Sanitized:
+                    // an ONNX load error embeds the model path (username = PII).
+                    let msg = crate::telemetry::sanitize_error(&e.to_string());
+                    log::error!("[LOAD] STT model load failed: {msg}");
+                    crate::telemetry::track_event(
+                        "stt_load_failed",
+                        serde_json::json!({ "error": msg }),
+                    );
+                    anyhow!("failed to load Parakeet model: {e}")
+                })?,
             ),
         };
 
@@ -146,7 +155,7 @@ impl SttEngine {
         *self.current.lock().unwrap() = Some(kind);
         self.touch_activity(); // don't let the watcher unload a just-loaded model
         info!(
-            "[startup] STT model loaded: {} in {:.1}s",
+            "[LOAD] STT model loaded: {} in {:.1}s", // §10.3
             kind.dir_name(),
             t0.elapsed().as_secs_f32()
         );

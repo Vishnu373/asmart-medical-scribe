@@ -179,3 +179,21 @@ export function markSetupCompleted(): Promise<void> {
 export function trialStatus(): Promise<TrialStatus> {
   return invoke<TrialStatus>("trial_status");
 }
+
+// — App update logging (§10.3 `[UPDATE]` rows). The updater is driven from the
+// frontend, so each lifecycle transition is reported to the backend for the on-device
+// log (and telemetry on the two failure stages). Binary-only, no PHI. Fire-and-forget.
+
+/** One of the §10.3 `[UPDATE]` lifecycle stages. */
+export type UpdateStage =
+  | "available"
+  | "downloaded"
+  | "download_failed"
+  | "installed"
+  | "install_failed";
+
+/** Log an app-update lifecycle event on-device (`message` = the error string for the
+ * `*_failed` stages, sanitized backend-side before either sink). Best-effort. */
+export function logUpdateEvent(stage: UpdateStage, message?: string): Promise<void> {
+  return invoke("log_update_event", { stage, message: message ?? null });
+}

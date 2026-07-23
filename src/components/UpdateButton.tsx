@@ -13,6 +13,7 @@
  */
 import { relaunch } from "@tauri-apps/plugin-process";
 import { useAppStore } from "@/state";
+import { logUpdateEvent } from "@/bridge";
 
 export default function UpdateButton() {
   const update = useAppStore((s) => s.update);
@@ -43,10 +44,12 @@ export default function UpdateButton() {
       });
       setProgress(100);
       setStage("ready");
+      void logUpdateEvent("downloaded"); // §10.3 `[UPDATE] update downloaded`
     } catch (err) {
       // Failed download → back to available so the doctor can retry.
       setStage("available");
       pushToast(`Update download failed: ${String(err)}`, "error");
+      void logUpdateEvent("download_failed", String(err)); // §10.3 (+ telemetry)
     }
   }
 
@@ -55,12 +58,14 @@ export default function UpdateButton() {
     setStage("installing");
     try {
       await update.install();
+      void logUpdateEvent("installed"); // §10.3 `[UPDATE] update installed` (before relaunch)
       await relaunch();
     } catch (err) {
       // Install failed — the downloaded update is still staged, so offer Install
       // again rather than forcing a fresh download.
       setStage("ready");
       pushToast(`Update install failed: ${String(err)}`, "error");
+      void logUpdateEvent("install_failed", String(err)); // §10.3 (+ telemetry)
     }
   }
 

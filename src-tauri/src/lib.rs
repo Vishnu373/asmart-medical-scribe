@@ -47,7 +47,10 @@ pub fn run() {
     // Crash reporting (§10.3) is compiled out by default (offline, NFR-6) and a
     // no-op unless the `crash-reporting` feature + a DSN are present.
     telemetry::init();
-    telemetry::track_event("app_launched", serde_json::json!({}));
+    // §10.3 catalog: `[LAUNCH] application started` — telemetry subset. The version/os
+    // ride along in every event's `TechnicalContext`; the on-device line (in `setup`)
+    // carries them inline for support.
+    telemetry::track_event("application_started", serde_json::json!({}));
 
     tauri::Builder::default()
         // Allow-list: every crate is muted to Warn (genuine failures still surface),
@@ -76,7 +79,12 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
-            log::info!("[startup] application starting");
+            // §10.3 `[LAUNCH] application started — v{version}, {os}` (on-device).
+            log::info!(
+                "[LAUNCH] application started — v{}, {}",
+                env!("CARGO_PKG_VERSION"),
+                std::env::consts::OS
+            );
             // The STT model is long-lived (warm across recordings); the per-
             // recording capture/segment/worker threads are spun up by the
             // pipeline on each Start (design §6.6).
@@ -96,8 +104,15 @@ pub fn run() {
             // saves a record on stop) and the records commands share this handle.
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
-            let key =
-                crypto::load_or_create_key(&data_dir.join("db.key")).map_err(|e| e.to_string())?;
+            // §10.3 `[DB] DPAPI key unwrap failed` — logged (both sinks) before the `?`
+            // bail so a key that won't unwrap isn't a silent hard-stop. Sanitized: the
+            // DPAPI error can embed the profile path (username = PII, §10.3).
+            let key = crypto::load_or_create_key(&data_dir.join("db.key")).map_err(|e| {
+                let msg = telemetry::sanitize_error(&e.to_string());
+                log::error!("[DB] DPAPI key unwrap failed {msg}");
+                telemetry::track_event("db_key_unwrap_failed", serde_json::json!({ "error": msg }));
+                e.to_string()
+            })?;
             let store = SharedStore::new(
                 Store::open(&data_dir.join("clinical.db"), &key).map_err(|e| e.to_string())?,
             );
@@ -225,6 +240,7 @@ pub fn run() {
             commands::submit_feedback,
             commands::mark_setup_completed,
             commands::trial_status,
+            commands::log_update_event,
             models::download_llm,
             models::setup_status,
             models::download_stt,
@@ -240,9 +256,13 @@ pub fn run() {
         // engines are managed `Arc`s; both `unload()`s are idempotent.
         .run(|handle, event| {
             if let tauri::RunEvent::Exit = event {
+                // §10.3 `[CLOSE]` shutdown family: unload each model, log each release,
+                // then the close line. Both `unload()`s are idempotent.
                 handle.state::<Arc<SttEngine>>().unload();
+                log::info!("[CLOSE] STT model unloaded");
                 handle.state::<Arc<LlmEngine>>().unload();
-                log::info!("[LAUNCH] application closed");
+                log::info!("[CLOSE] SLM model unloaded");
+                log::info!("[CLOSE] application closed");
             }
         });
 }

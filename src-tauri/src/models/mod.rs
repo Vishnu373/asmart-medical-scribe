@@ -157,6 +157,51 @@ fn remove_retired_in(dir: &Path) {
     }
 }
 
+/// §10.3 `[LAUNCH] downloading {STT|SLM} model {model_name}` (both sinks). `label`
+/// is the catalog's model kind (`"STT"` / `"SLM"`); `tier` is the telemetry key.
+fn log_downloading(label: &str, tier: &str, model_name: &str) {
+    log::info!("[LAUNCH] downloading {label} model {model_name}");
+    crate::telemetry::track_event("model_downloading", serde_json::json!({ "tier": tier }));
+}
+
+/// Emit the §10.3 terminal download rows for `label`/`tier` given the worker's
+/// result, and drive the UI `model-download-*` events. A checksum failure
+/// ([`stream_verified`] bails with a `"checksum mismatch"` message) is the distinct
+/// `checksum mismatch` catalog row; every other failure is `download … failed`. The
+/// error is sanitized before either sink (§10.3 — a download error can embed a path).
+fn finish_download(app: &AppHandle, label: &str, tier: &str, result: Result<()>) {
+    match result {
+        Ok(()) => {
+            crate::telemetry::track_event(
+                "model_download_completed",
+                serde_json::json!({ "tier": tier }),
+            );
+            let _ = app.emit("model-download-done", serde_json::json!({ "tier": tier }));
+        }
+        Err(e) => {
+            let raw = e.to_string();
+            let msg = crate::telemetry::sanitize_error(&raw);
+            if raw.contains("checksum mismatch") {
+                log::error!("[LAUNCH] {label} model checksum mismatch");
+                crate::telemetry::track_event(
+                    "model_checksum_mismatch",
+                    serde_json::json!({ "tier": tier }),
+                );
+            } else {
+                log::error!("[LAUNCH] download {label} model failed {msg}");
+                crate::telemetry::track_event(
+                    "model_download_failed",
+                    serde_json::json!({ "tier": tier, "error": msg }),
+                );
+            }
+            let _ = app.emit(
+                "model-download-error",
+                serde_json::json!({ "tier": tier, "message": raw }),
+            );
+        }
+    }
+}
+
 /// Progress for an in-flight download. `total` is 0 when the server omits a
 /// Content-Length (rare for HF); the UI then shows an indeterminate state.
 #[derive(Clone, Serialize)]
@@ -189,31 +234,14 @@ pub fn download_llm(app: AppHandle) -> Result<(), String> {
     }
 
     std::thread::spawn(move || {
+        log_downloading("SLM", &tier, file);
         let result = download_to(&app, &LLM, file, &dest_dir);
         // Release the claim before emitting the terminal event so a retry on error
         // (or a fresh download after done) isn't rejected as still in flight.
         if let Some(set) = IN_FLIGHT.lock().unwrap().as_mut() {
             set.remove(&tier);
         }
-        match result {
-            Ok(()) => {
-                crate::telemetry::track_event(
-                    "model_download_completed",
-                    serde_json::json!({ "tier": &tier }),
-                );
-                let _ = app.emit("model-download-done", serde_json::json!({ "tier": tier }));
-            }
-            Err(e) => {
-                crate::telemetry::track_event(
-                    "model_download_failed",
-                    serde_json::json!({ "tier": &tier, "reason": e.to_string() }),
-                );
-                let _ = app.emit(
-                    "model-download-error",
-                    serde_json::json!({ "tier": tier, "message": e.to_string() }),
-                );
-            }
-        }
+        finish_download(&app, "SLM", &tier, result);
     });
     Ok(())
 }
@@ -238,29 +266,12 @@ pub fn download_stt(app: AppHandle) -> Result<(), String> {
     }
 
     std::thread::spawn(move || {
+        log_downloading("STT", &tier, STT.dir_name);
         let result = download_stt_to(&app, &dest_dir);
         if let Some(set) = IN_FLIGHT.lock().unwrap().as_mut() {
             set.remove(&tier);
         }
-        match result {
-            Ok(()) => {
-                crate::telemetry::track_event(
-                    "model_download_completed",
-                    serde_json::json!({ "tier": &tier }),
-                );
-                let _ = app.emit("model-download-done", serde_json::json!({ "tier": tier }));
-            }
-            Err(e) => {
-                crate::telemetry::track_event(
-                    "model_download_failed",
-                    serde_json::json!({ "tier": &tier, "reason": e.to_string() }),
-                );
-                let _ = app.emit(
-                    "model-download-error",
-                    serde_json::json!({ "tier": tier, "message": e.to_string() }),
-                );
-            }
-        }
+        finish_download(&app, "STT", &tier, result);
     });
     Ok(())
 }

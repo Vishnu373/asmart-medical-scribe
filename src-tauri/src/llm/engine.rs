@@ -167,14 +167,20 @@ impl LlmEngine {
         })?;
         guard_available_ram(&path)?;
 
-        info!("[startup] loading SLM: {file}");
+        info!("[LOAD] loading SLM: {file}"); // §10.3
         let t_load = Instant::now();
         let params = LlamaModelParams::default(); // mmap default; CPU-only build
-        let model = LlamaModel::load_from_file(&self.backend, &path, &params)
-            .map_err(|e| anyhow!("failed to load LLM model {}: {e}", path.display()))?;
+        let model = LlamaModel::load_from_file(&self.backend, &path, &params).map_err(|e| {
+            // §10.3 `[LOAD] SLM load failed: {e}` (both sinks). Sanitized: the llama.cpp
+            // load error embeds the GGUF path (username = PII).
+            let msg = crate::telemetry::sanitize_error(&e.to_string());
+            log::error!("[LOAD] SLM load failed: {msg}");
+            crate::telemetry::track_event("slm_load_failed", serde_json::json!({ "error": msg }));
+            anyhow!("failed to load LLM model {}: {e}", path.display())
+        })?;
         *self.lock_model() = Some(model);
         info!(
-            "[startup] SLM weights loaded in {:.1}s",
+            "[LOAD] SLM model loaded: {:.1}s", // §10.3
             t_load.elapsed().as_secs_f32()
         );
         // info!("Loaded LLM model: {:?}", kind);
@@ -189,7 +195,7 @@ impl LlmEngine {
             warn!("LLM warmup pass failed (non-fatal): {e}");
         } else {
             info!(
-                "[startup] SLM prefix KV cache primed in {:.1}s",
+                "[LOAD] SLM prefix KV cache primed in {:.1}s",
                 t_warm.elapsed().as_secs_f32()
             );
         }
@@ -217,13 +223,15 @@ impl LlmEngine {
     /// an uncached one.
     pub fn generate(
         &self,
+        record_id: &str,
+        note_id: &str,
         transcript: &str,
         on_token: &dyn Fn(&str),
         cancel: &Arc<AtomicBool>,
     ) -> Result<Option<String>> {
         // Generate-path instrumentation. Every value is a count or a duration — no
-        // transcript text is ever logged (NFR-6/PHI).
-        let t_total = Instant::now();
+        // transcript text is ever logged (NFR-6/PHI). The per-phase and completion
+        // timings are emitted inside `decode_and_generate` (§10.3 `[GENERATE]` rows).
         self.ensure_loaded()?;
         let kind = self.model_kind();
         let prompt = prompt::build_prompt(kind, transcript);
@@ -253,9 +261,11 @@ impl LlmEngine {
             ));
         }
 
+        // §10.3 `[GENERATE] {record_id} → {note_id}, note generation started — {input_tokens}`.
+        // Emitted here (not in the generator) because the token count is only known after
+        // tokenization. No transcript text is logged — only its char/token counts.
         info!(
-            "[generate] start — transcript {} chars, prompt {} tokens",
-            transcript.len(),
+            "[GENERATE] {record_id} → {note_id}, note generation started — {} input tokens",
             tokens.len()
         );
 
@@ -265,17 +275,18 @@ impl LlmEngine {
         let start = self.restore_prefix(&mut ctx, kind, &tokens);
         if start > 0 {
             info!(
-                "[generate] prefix cache HIT — {start} of {} tokens restored, {} to prefill",
+                "[GENERATE] {note_id} prefix cache HIT — {start} of {} tokens restored, {} to prefill",
                 tokens.len(),
                 tokens.len() as i32 - start
             );
         } else {
             info!(
-                "[generate] prefix cache MISS — all {} tokens must be prefilled",
+                "[GENERATE] {note_id} prefix cache MISS — all {} tokens must be prefilled",
                 tokens.len()
             );
         }
         let note = self.decode_and_generate(
+            note_id,
             &mut ctx,
             model,
             &tokens,
@@ -289,7 +300,6 @@ impl LlmEngine {
             on_token,
             cancel,
         )?;
-        info!("[generate] total {:.1}s", t_total.elapsed().as_secs_f32());
         // Deterministic scrub of any reasoning marker the model echoed after the note
         // body (§8.5) — the streamed buffer may briefly flash it, but the persisted
         // note never carries it. Cancellation returns `None` and is passed through.
@@ -394,6 +404,7 @@ impl LlmEngine {
     #[allow(clippy::too_many_arguments)]
     fn decode_and_generate(
         &self,
+        note_id: &str,
         ctx: &mut LlamaContext,
         model: &LlamaModel,
         tokens: &[LlamaToken],
@@ -409,6 +420,7 @@ impl LlmEngine {
         let t_gen = Instant::now();
         let mut t_phase = Instant::now();
 
+        info!("[GENERATE] {note_id} prefill started"); // §10.3
         let mut batch = LlamaBatch::new(N_CTX as usize, 1);
         let last = tokens.len() as i32 - 1;
         for i in start..tokens.len() as i32 {
@@ -419,12 +431,19 @@ impl LlmEngine {
         ctx.decode(&mut batch)
             .map_err(|e| anyhow!("prompt decode failed: {e}"))?;
         let prefilled = tokens.len() as i32 - start;
+        // §10.3 `[GENERATE] {note_id} prefill done — prefill duration {N}s` (tok/s kept
+        // for on-device diagnostics).
         info!(
-            "[generate] prefill done — {prefilled} tokens in {:.2}s ({:.0} tok/s)",
+            "[GENERATE] {note_id} prefill done — {prefilled} tokens, prefill duration {:.2}s ({:.0} tok/s)",
             t_phase.elapsed().as_secs_f32(),
             rate(prefilled, t_phase.elapsed())
         );
         t_phase = Instant::now();
+        // §10.3 `[GENERATE] {note_id} reasoning started` — only when the two-phase
+        // (chain-of-thought) format is active; `suppress: None` streams with no reasoning.
+        if suppress.is_some() {
+            info!("[GENERATE] {note_id} reasoning started");
+        }
 
         // Low temperature for near-deterministic, low-hallucination clinical text
         // (design §8.2/§8.3).
@@ -455,13 +474,16 @@ impl LlmEngine {
         loop {
             if boundary_passed && !reasoning_logged {
                 reasoning_logged = true;
+                // §10.3 `[GENERATE] {note_id} reasoning done — reasoning duration {N}s`.
                 info!(
-                    "[generate] reasoning done — {reasoning_tokens} tokens in {:.1}s ({:.1} tok/s)",
+                    "[GENERATE] {note_id} reasoning done — {reasoning_tokens} tokens, reasoning duration {:.1}s ({:.1} tok/s)",
                     t_phase.elapsed().as_secs_f32(),
                     rate(reasoning_tokens, t_phase.elapsed())
                 );
+                // §10.3 `[GENERATE] {note_id} perceived TTFT at {N}s` — what the clinician
+                // waits before the first visible note word after clicking Generate.
                 info!(
-                    "[generate] FIRST VISIBLE WORD at {:.1}s",
+                    "[GENERATE] {note_id} perceived TTFT at {:.1}s",
                     t_gen.elapsed().as_secs_f32()
                 );
                 t_phase = Instant::now();
@@ -584,9 +606,12 @@ impl LlmEngine {
         }
 
         if boundary_passed {
+            // §10.3 `[GENERATE] {note_id} note generation complete — {generated_token_count},
+            // total {N}s, {tokens/s}`. `t_gen` (from the top of generation) is the total;
+            // `t_phase` (reset at the note boundary) gives the true note decode rate.
             info!(
-                "[generate] note done — {note_tokens} tokens in {:.1}s ({:.1} tok/s)",
-                t_phase.elapsed().as_secs_f32(),
+                "[GENERATE] {note_id} note generation complete — {note_tokens} tokens, total {:.1}s, {:.1} tok/s",
+                t_gen.elapsed().as_secs_f32(),
                 rate(note_tokens, t_phase.elapsed())
             );
             Ok(Some(note))

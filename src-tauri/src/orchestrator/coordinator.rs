@@ -51,8 +51,10 @@ pub type EmitFn = Box<dyn Fn(AppEvent) + Send + Sync>;
 /// and are only ever called by the single coordinator, one at a time.
 pub trait Pipeline: Send {
     /// Spin up capture and the STT worker. Returns once running — must not block
-    /// for the duration of the recording (design §6.6 "Start — spin up").
-    fn start(&mut self) -> Result<()>;
+    /// for the duration of the recording (design §6.6 "Start — spin up"). `id` is the
+    /// record id minted for this recording (§10.3 4c); the pipeline holds it so a
+    /// mid-recording device failure can be logged/reported against it.
+    fn start(&mut self, id: &str) -> Result<()>;
     /// Stop capture, tail-flush the open segment, and drain the worker. Blocks
     /// until every in-flight segment has been transcribed (design §6.6 "Stop").
     /// Persists the `records` row under the caller-supplied `id` (pre-minted at
@@ -142,19 +144,26 @@ impl Coordinator {
         if inner.state != RecordingState::Idle {
             return Err(reject("start_recording", inner.state));
         }
+        // Pre-mint the record id here (not at Stop where the row is written) so it can
+        // be logged at the start/failure of the recording, handed to the pipeline for a
+        // mid-recording device-failure report, and reused verbatim as the DB row id on
+        // Stop (§10.3 4c).
+        let records_id = crate::store::new_id();
         let pipeline = inner
             .pipeline
             .as_mut()
             .expect("pipeline is present whenever the machine is IDLE");
-        if let Err(e) = pipeline.start() {
+        if let Err(e) = pipeline.start(&records_id) {
+            // §10.3 `[RECORD] {record_id}, recording failed {e}` (both sinks).
             let msg = e.to_string();
+            log::error!("[RECORD] {records_id}, recording failed {msg}");
+            crate::telemetry::track_event(
+                "recording_start_failed",
+                serde_json::json!({ "error": crate::telemetry::sanitize_error(&msg) }),
+            );
             self.fail("recording_start_failed", &msg);
             return Err(msg);
         }
-        // Pre-mint the record id here (not at Stop where the row is written) so it
-        // can be logged at the start of the recording and reused verbatim as the DB
-        // row id on Stop (§10.3 4c).
-        let records_id = crate::store::new_id();
         inner.state = RecordingState::Recording;
         inner.paused = false;
         inner.started_at = Some(Instant::now());
@@ -355,7 +364,7 @@ mod tests {
     }
 
     impl Pipeline for MockPipeline {
-        fn start(&mut self) -> Result<()> {
+        fn start(&mut self, _id: &str) -> Result<()> {
             self.calls.lock().unwrap().started += 1;
             if self.fail_start {
                 anyhow::bail!("mic open failed");

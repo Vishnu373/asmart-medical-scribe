@@ -33,6 +33,10 @@ enum AudioChunk {
 type FrameCallback = Arc<dyn Fn(&[f32]) + Send + Sync + 'static>;
 /// Callback invoked with spectrum level buckets for the input-level meter.
 type LevelCallback = Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>;
+/// Callback invoked with the cpal stream's error string if the input device fails
+/// mid-stream (unplugged, driver reset). Lets the pipeline surface the §10.3
+/// `[RECORD] audio device failed mid-recording` row + a UI notification.
+type ErrorCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
 /// Captures microphone audio, downmixes to mono and resamples to 16 kHz f32.
 ///
@@ -45,6 +49,7 @@ pub struct AudioRecorder {
     worker_handle: Option<std::thread::JoinHandle<()>>,
     frame_cb: Option<FrameCallback>,
     level_cb: Option<LevelCallback>,
+    err_cb: Option<ErrorCallback>,
 }
 
 impl AudioRecorder {
@@ -55,6 +60,7 @@ impl AudioRecorder {
             worker_handle: None,
             frame_cb: None,
             level_cb: None,
+            err_cb: None,
         })
     }
 
@@ -76,6 +82,17 @@ impl AudioRecorder {
         self
     }
 
+    /// Receive the cpal error string if the input device fails mid-stream (§10.3
+    /// `[RECORD] audio device failed mid-recording`). Fires from cpal's stream error
+    /// handler; the callback must be cheap and non-blocking.
+    pub fn with_error_callback<F>(mut self, cb: F) -> Self
+    where
+        F: Fn(String) + Send + Sync + 'static,
+    {
+        self.err_cb = Some(Arc::new(cb));
+        self
+    }
+
     pub fn open(&mut self, device: Option<Device>) -> Result<(), Box<dyn std::error::Error>> {
         if self.worker_handle.is_some() {
             return Ok(()); // already open
@@ -93,9 +110,17 @@ impl AudioRecorder {
                 .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No input device found"))?,
         };
 
+        // §10.3 `[RECORD] using device mic for recording: {mic_name}` (on-device only —
+        // the mic name is PII, never telemetry).
+        log::info!(
+            "[RECORD] using device mic for recording: {}",
+            device.name().unwrap_or_else(|_| "<unknown>".to_string())
+        );
+
         let thread_device = device.clone();
         let frame_cb = self.frame_cb.clone();
         let level_cb = self.level_cb.clone();
+        let err_cb = self.err_cb.clone();
 
         let worker = std::thread::spawn(move || {
             let stop_flag = Arc::new(AtomicBool::new(false));
@@ -122,6 +147,7 @@ impl AudioRecorder {
                         sample_tx,
                         channels,
                         stop_flag_for_stream,
+                        err_cb,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::I8 => AudioRecorder::build_stream::<i8>(
@@ -130,6 +156,7 @@ impl AudioRecorder {
                         sample_tx,
                         channels,
                         stop_flag_for_stream,
+                        err_cb,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::I16 => AudioRecorder::build_stream::<i16>(
@@ -138,6 +165,7 @@ impl AudioRecorder {
                         sample_tx,
                         channels,
                         stop_flag_for_stream,
+                        err_cb,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::I32 => AudioRecorder::build_stream::<i32>(
@@ -146,6 +174,7 @@ impl AudioRecorder {
                         sample_tx,
                         channels,
                         stop_flag_for_stream,
+                        err_cb,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     cpal::SampleFormat::F32 => AudioRecorder::build_stream::<f32>(
@@ -154,6 +183,7 @@ impl AudioRecorder {
                         sample_tx,
                         channels,
                         stop_flag_for_stream,
+                        err_cb,
                     )
                     .map_err(|e| format!("Failed to build input stream: {e}"))?,
                     sample_format => {
@@ -241,6 +271,7 @@ impl AudioRecorder {
         sample_tx: mpsc::Sender<AudioChunk>,
         channels: usize,
         stop_flag: Arc<AtomicBool>,
+        err_cb: Option<ErrorCallback>,
     ) -> Result<cpal::Stream, cpal::BuildStreamError>
     where
         T: Sample + SizedSample + Send + 'static,
@@ -288,7 +319,13 @@ impl AudioRecorder {
         device.build_input_stream(
             &config.clone().into(),
             stream_cb,
-            |err| log::error!("Stream error: {}", err),
+            move |err| {
+                log::error!("Stream error: {}", err);
+                // Surface a mid-stream device failure to the pipeline (§10.3).
+                if let Some(cb) = &err_cb {
+                    cb(err.to_string());
+                }
+            },
             None,
         )
     }
