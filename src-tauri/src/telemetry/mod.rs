@@ -9,6 +9,9 @@
 //! build is fully offline (no DSN, nothing sent) and the fragile native build is
 //! untouched until a DSN exists.
 
+use std::sync::OnceLock;
+
+use regex::Regex;
 use serde::Serialize;
 use serde_json::Value;
 
@@ -61,6 +64,22 @@ fn scrub_in_place(value: &mut Value) {
 fn is_phi_key(key: &str) -> bool {
     let lower = key.to_ascii_lowercase();
     PHI_KEY_TOKENS.iter().any(|token| lower.contains(token))
+}
+
+/// Strip the user's home directory / username out of an error string before it is
+/// written to the on-device log or sent as telemetry (§10.3, 4c). Error strings
+/// here are usually file paths (a model failed to resolve/load), and a Windows
+/// profile path embeds the account name — PII we don't want in either sink.
+/// Best-effort: rewrites a Windows user-profile prefix (`C:\Users\<name>\`) and a
+/// Unix home (`/home/<name>/`, `/Users/<name>/`) to `~\` / `~/`, dropping the name.
+pub fn sanitize_error(msg: &str) -> String {
+    static WIN: OnceLock<Regex> = OnceLock::new();
+    static NIX: OnceLock<Regex> = OnceLock::new();
+    // `[^\\/]+` = the username segment, up to the next path separator.
+    let win = WIN.get_or_init(|| Regex::new(r"(?i)[a-z]:\\Users\\[^\\/]+\\").unwrap());
+    let nix = NIX.get_or_init(|| Regex::new(r"(?i)/(?:home|Users)/[^/]+/").unwrap());
+    let out = win.replace_all(msg, r"~\");
+    nix.replace_all(&out, "~/").into_owned()
 }
 
 /// Initialize crash reporting (§10.3). Disabled unless built with the
@@ -208,5 +227,33 @@ mod tests {
         }
         assert!(!dump.contains("patient says"));
         assert!(!dump.contains("John Doe"));
+    }
+
+    #[test]
+    fn sanitize_error_strips_windows_username() {
+        let msg = r"failed to load LLM model C:\Users\jane.doe\AppData\Roaming\medscribe\gemma.gguf: no such file";
+        let out = sanitize_error(msg);
+        assert!(!out.contains("jane.doe"), "username leaked: {out}");
+        assert!(
+            out.contains(r"~\AppData\Roaming\medscribe\gemma.gguf"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn sanitize_error_strips_unix_home() {
+        assert_eq!(
+            sanitize_error("open /home/jane/models/x.onnx failed"),
+            "open ~/models/x.onnx failed"
+        );
+        assert_eq!(
+            sanitize_error("open /Users/jane/models/x.onnx failed"),
+            "open ~/models/x.onnx failed"
+        );
+    }
+
+    #[test]
+    fn sanitize_error_leaves_plain_messages_untouched() {
+        assert_eq!(sanitize_error("disk full"), "disk full");
     }
 }

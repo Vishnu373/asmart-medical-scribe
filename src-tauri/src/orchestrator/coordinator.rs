@@ -55,9 +55,10 @@ pub trait Pipeline: Send {
     fn start(&mut self) -> Result<()>;
     /// Stop capture, tail-flush the open segment, and drain the worker. Blocks
     /// until every in-flight segment has been transcribed (design §6.6 "Stop").
-    /// Returns the id of the persisted `records` row, or `None` when nothing was
-    /// transcribed (an empty consult isn't saved).
-    fn stop(&mut self) -> Result<Option<String>>;
+    /// Persists the `records` row under the caller-supplied `id` (pre-minted at
+    /// Start so it could be logged there, §10.3 4c) and returns it, or `None` when
+    /// nothing was transcribed (an empty consult isn't saved — the id is dropped).
+    fn stop(&mut self, id: &str) -> Result<Option<String>>;
     /// Gate capture without tearing the pipeline down (pause/resume mid-consult).
     fn set_paused(&mut self, paused: bool);
 }
@@ -90,6 +91,10 @@ struct Inner {
     /// Set while GENERATING; `cancel_generation` flips it and the running
     /// generator polls it. Cleared when generation ends.
     cancel: Option<Arc<AtomicBool>>,
+    /// `records.id` for the in-flight recording, pre-minted on Start so it can be
+    /// logged at `[RECORD] … recording started` (§10.3 4c) and then handed to the
+    /// pipeline on Stop so the persisted row uses it. `None` outside RECORDING.
+    records_id: Option<String>,
     /// When the current recording started, for the stop-time duration log. `Instant`
     /// (not `SystemTime`) so a wall-clock change can't report a negative or absurd
     /// consult length; the log plugin already stamps each line with the wall clock.
@@ -118,6 +123,7 @@ impl Coordinator {
                 paused: false,
                 pipeline: Some(pipeline),
                 cancel: None,
+                records_id: None,
                 started_at: None,
             }),
             generator,
@@ -145,10 +151,15 @@ impl Coordinator {
             self.fail("recording_start_failed", &msg);
             return Err(msg);
         }
+        // Pre-mint the record id here (not at Stop where the row is written) so it
+        // can be logged at the start of the recording and reused verbatim as the DB
+        // row id on Stop (§10.3 4c).
+        let records_id = crate::store::new_id();
         inner.state = RecordingState::Recording;
         inner.paused = false;
         inner.started_at = Some(Instant::now());
-        log::info!("[recording] started");
+        log::info!("[RECORD] {records_id}, recording started");
+        inner.records_id = Some(records_id);
         // Emit while still holding the lock so the state change and its
         // notification are atomic: under rapid start/stop the next command can't
         // slip in and emit out of order (design §6.6 "UI can't desync"). The emit
@@ -173,7 +184,12 @@ impl Coordinator {
             .take()
             .map(|t| t.elapsed())
             .unwrap_or_default();
-        log::info!("[recording] stopped — duration {}", fmt_duration(elapsed));
+        // The id minted on Start; handed to the pipeline so the saved row uses it.
+        let records_id = inner.records_id.take().unwrap_or_default();
+        log::info!(
+            "[RECORD] {records_id}, recording complete — {}",
+            fmt_duration(elapsed)
+        );
         let mut pipeline = inner
             .pipeline
             .take()
@@ -184,14 +200,14 @@ impl Coordinator {
         (self.emit)(AppEvent::StateChanged(RecordingState::Processing));
         drop(inner);
 
-        let result = pipeline.stop();
+        let result = pipeline.stop(&records_id);
 
         let mut inner = self.lock();
         inner.pipeline = Some(pipeline);
         inner.state = RecordingState::Idle;
         (self.emit)(AppEvent::StateChanged(RecordingState::Idle));
         match result {
-            Ok(record_id) => Ok(record_id),
+            Ok(saved) => Ok(saved),
             Err(e) => {
                 // The drain steps swallow their own errors; the only failure
                 // `stop()` surfaces is persisting the record (the pipeline has
@@ -346,7 +362,7 @@ mod tests {
             }
             Ok(())
         }
-        fn stop(&mut self) -> Result<Option<String>> {
+        fn stop(&mut self, _id: &str) -> Result<Option<String>> {
             self.calls.lock().unwrap().stopped += 1;
             if self.fail_stop {
                 anyhow::bail!("disk full");

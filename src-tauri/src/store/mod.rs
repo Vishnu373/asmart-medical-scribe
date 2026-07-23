@@ -76,9 +76,15 @@ impl Store {
     // --- Records ---------------------------------------------------------
 
     /// Inserts a new encounter and returns it.
-    pub fn create_record(&self, label: &str, language: &str, transcript: &str) -> Result<Record> {
+    pub fn create_record(
+        &self,
+        id: &str,
+        label: &str,
+        language: &str,
+        transcript: &str,
+    ) -> Result<Record> {
         let record = Record {
-            id: new_id(),
+            id: id.to_string(),
             label: label.to_string(),
             language: language.to_string(),
             created_at: now(),
@@ -163,9 +169,9 @@ impl Store {
     // --- Notes -----------------------------------------------------------
 
     /// Inserts a new note for a record and makes it the active version (§8.5).
-    pub fn insert_note(&self, record_id: &str, soap_data: &str) -> Result<Note> {
+    pub fn insert_note(&self, id: &str, record_id: &str, soap_data: &str) -> Result<Note> {
         let note = Note {
-            id: new_id(),
+            id: id.to_string(),
             record_id: record_id.to_string(),
             soap_data: soap_data.to_string(),
             created_at: now(),
@@ -310,7 +316,11 @@ fn migrations() -> Migrations<'static> {
     )])
 }
 
-fn new_id() -> String {
+/// Mint an opaque row id. Exposed to the crate so the coordinator/generator can
+/// pre-mint a `record_id`/`note_id` (§10.3, 4c) *before* the row is written — the
+/// id is logged at recording/generation start, then handed to the insert so the
+/// persisted row carries exactly that id.
+pub(crate) fn new_id() -> String {
     uuid::Uuid::new_v4().to_string()
 }
 
@@ -355,7 +365,9 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("c.db"), &test_key(2)).unwrap();
 
-        let rec = store.create_record("Visit A", "en", "hello").unwrap();
+        let rec = store
+            .create_record(&new_id(), "Visit A", "en", "hello")
+            .unwrap();
         let loaded = store.open_record(&rec.id).unwrap().unwrap();
         assert_eq!(loaded.label, "Visit A");
         assert_eq!(loaded.transcript, "hello");
@@ -372,10 +384,10 @@ mod tests {
     fn notes_track_single_active_version() {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("c.db"), &test_key(3)).unwrap();
-        let rec = store.create_record("V", "en", "t").unwrap();
+        let rec = store.create_record(&new_id(), "V", "en", "t").unwrap();
 
-        let n1 = store.insert_note(&rec.id, "## S\n1").unwrap();
-        let n2 = store.insert_note(&rec.id, "## S\n2").unwrap();
+        let n1 = store.insert_note(&new_id(), &rec.id, "## S\n1").unwrap();
+        let n2 = store.insert_note(&new_id(), &rec.id, "## S\n2").unwrap();
 
         let notes = store.list_notes(&rec.id).unwrap();
         assert_eq!(notes.len(), 2);
@@ -421,8 +433,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let store = Store::open(&dir.path().join("c.db"), &test_key(6)).unwrap();
 
-        let rec = store.create_record("V", "en", "t").unwrap();
-        store.insert_note(&rec.id, "## S\n note").unwrap();
+        let rec = store.create_record(&new_id(), "V", "en", "t").unwrap();
+        store
+            .insert_note(&new_id(), &rec.id, "## S\n note")
+            .unwrap();
         assert_eq!(store.list_notes(&rec.id).unwrap().len(), 1);
 
         store.delete_record(&rec.id).unwrap();
@@ -435,7 +449,7 @@ mod tests {
         let path = dir.path().join("c.db");
         {
             let store = Store::open(&path, &test_key(4)).unwrap();
-            store.create_record("V", "en", "secret").unwrap();
+            store.create_record(&new_id(), "V", "en", "secret").unwrap();
         }
         // A different key must fail to decrypt the existing DB.
         assert!(Store::open(&path, &test_key(5)).is_err());

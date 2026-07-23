@@ -34,6 +34,12 @@ impl NoteGenerator for RealNoteGenerator {
         transcript: &str,
         cancel: Arc<AtomicBool>,
     ) -> Result<Option<String>> {
+        // Pre-mint the note id so it can be logged at generation start and reused
+        // verbatim as the notes.id row on insert (§10.3 4c). `record_id` is the
+        // incoming reference to the record this note belongs to.
+        let notes_id = crate::store::new_id();
+        log::info!("[GENERATE] {record_id} → {notes_id}, note generation started");
+
         // Stream each decoded piece to the UI as raw text; the frontend renders
         // the markdown once on completion (design §8.5).
         let app = self.app.clone();
@@ -52,7 +58,10 @@ impl NoteGenerator for RealNoteGenerator {
         };
 
         // Each generation is a new, immutable, active version (§8.5).
-        let note = self.store.lock().insert_note(record_id, &markdown)?;
+        let note = self
+            .store
+            .lock()
+            .insert_note(&notes_id, record_id, &markdown)?;
         Ok(Some(note.id))
     }
 }

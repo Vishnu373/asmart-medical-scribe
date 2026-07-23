@@ -179,7 +179,7 @@ impl Pipeline for RealPipeline {
         Ok(())
     }
 
-    fn stop(&mut self) -> Result<Option<String>> {
+    fn stop(&mut self, id: &str) -> Result<Option<String>> {
         let Some(running) = self.running.take() else {
             return Ok(None);
         };
@@ -224,7 +224,12 @@ impl Pipeline for RealPipeline {
             return Ok(None);
         }
         // Label starts empty; the doctor titles the encounter in the Records view.
-        match self.store.lock().create_record("", DEFAULT_LANGUAGE, &text) {
+        // Uses the id pre-minted on Start so the row matches the logged record id.
+        match self
+            .store
+            .lock()
+            .create_record(id, "", DEFAULT_LANGUAGE, &text)
+        {
             Ok(record) => Ok(Some(record.id)),
             Err(e) => {
                 // The transcript only ever lived in memory — don't let a DB error

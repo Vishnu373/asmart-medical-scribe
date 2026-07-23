@@ -22,6 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use tauri::Manager;
+use tauri_plugin_log::{Target, TargetKind};
 
 use llm::{LlmEngine, LlmModel, RealNoteGenerator};
 use orchestrator::{emit_app_event, Coordinator, RealPipeline};
@@ -55,6 +56,16 @@ pub fn run() {
         // dependency. Native C++ stderr bypasses this — see `LlmEngine::new`.
         .plugin(
             tauri_plugin_log::Builder::new()
+                // Persist the on-device log (§10.3) to a named file in the app log
+                // dir so the §10.3 catalog lines survive across runs, alongside the
+                // dev-time stdout stream. Set explicitly (rather than relying on the
+                // plugin default) so the filename is deterministic for support.
+                .targets([
+                    Target::new(TargetKind::Stdout),
+                    Target::new(TargetKind::LogDir {
+                        file_name: Some("medscribe".into()),
+                    }),
+                ])
                 .level(log::LevelFilter::Warn)
                 .level_for(env!("CARGO_CRATE_NAME"), log::LevelFilter::Info)
                 .build(),
