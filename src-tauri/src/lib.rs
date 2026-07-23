@@ -147,6 +147,11 @@ pub fn run() {
                 llm_engine.clone(),
             ));
 
+            // Managed so the app-exit hook (below) can unload STT on shutdown
+            // (Phase 2, §7). The pipeline takes ownership of the original `engine`
+            // Arc on the next line, so the exit hook resolves this clone from state.
+            app.manage(engine.clone());
+
             let handle = app.handle().clone();
             let pipeline = RealPipeline::new(
                 handle.clone(),
@@ -216,6 +221,17 @@ pub fn run() {
             handoff::rebind_paste_hotkey,
             handoff::copy_to_clipboard,
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running tauri application");
+        .build(tauri::generate_context!())
+        .expect("error while building tauri application")
+        // Both models stay resident for the whole session and are unloaded only
+        // here, on the final (non-cancellable) exit (Phase 2, §7). The OS reclaims
+        // process RAM regardless, so this is a graceful, explicit release. Both
+        // engines are managed `Arc`s; both `unload()`s are idempotent.
+        .run(|handle, event| {
+            if let tauri::RunEvent::Exit = event {
+                handle.state::<Arc<SttEngine>>().unload();
+                handle.state::<Arc<LlmEngine>>().unload();
+                log::info!("[LAUNCH] application closed");
+            }
+        });
 }

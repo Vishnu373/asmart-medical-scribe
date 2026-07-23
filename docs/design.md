@@ -687,7 +687,7 @@ Every event carries **no PHI** regardless of sink. Because NFR-6 concerns PHI eg
 
 #### Log event catalog
 
-Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
+Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
 
 | Event | On-device | Telemetry |
 | --- | :---: | :---: |
@@ -704,7 +704,7 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERAT
 | `[LOAD] loading SLM: {model_name}` | ✓ | |
 | `[LOAD] SLM load failed: {e}` | ✓ | ✓ |
 | `[LOAD] SLM model loaded: {duration}s` | ✓ | |
-| `[LOAD] both models resident, status changed to READY` | ✓ | |
+| `[CLOSE] both models resident, status changed to READY` | ✓ | |
 | `[RECORD] using device mic for recording: {mic_name}` | ✓ | |
 | `[RECORD] {record_id}, recording started` | ✓ | |
 | `[RECORD] {record_id}, recording failed {e}` | ✓ | ✓ |
@@ -727,7 +727,9 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERAT
 | `[UPDATE] update download failed {error message}` | ✓ | ✓ |
 | `[UPDATE] update installed` | ✓ | |
 | `[UPDATE] update install failed {error message}` | ✓ | ✓ |
-| `[LAUNCH] application closed` | ✓ | |
+| `[CLOSE] STT model unloaded` | ✓ | |
+| `[CLOSE] SLM model unloaded` | ✓ | |
+| `[CLOSE] application closed` | ✓ | |
 | `[DB] DPAPI key unwrap failed {error message}` | ✓ | ✓ |
 
 Notes: the mic name is PII, so it is on-device only. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
