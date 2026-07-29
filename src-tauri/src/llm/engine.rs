@@ -101,7 +101,10 @@ pub struct LlmEngine {
     model_dirs: Vec<PathBuf>,
     /// Decode-phase threads (physical // 2); prefill left at the llama.cpp default
     /// (design §8.2 — decode is bandwidth-bound and stops scaling; prefill is not).
-    n_threads: i32,
+    /// `None` when the physical core count was unavailable — both phases then fall
+    /// back to llama.cpp's own defaults rather than a guessed count.
+    n_threads: Option<i32>,
+    // n_threads: i32,
     /// Serializes [`ensure_loaded`] so the co-resident background preload (design
     /// §8.2 startup fix) and an early Generate can't both load the model at once.
     /// Held only across the load itself, never nested inside the `model` lock.
@@ -112,8 +115,8 @@ impl LlmEngine {
     /// Create the engine for `kind`, resolving the model file across `model_dirs`
     /// (first existing wins). The model itself is not loaded until [`ensure_loaded`];
     /// `n_threads` (physical // 2, design §8.2) is applied to both decode and prefill
-    /// (see [`new_context`]).
-    pub fn new(kind: LlmModel, model_dirs: Vec<PathBuf>, n_threads: i32) -> Result<Self> {
+    /// (see [`new_context`]); `None` leaves both at the llama.cpp defaults.
+    pub fn new(kind: LlmModel, model_dirs: Vec<PathBuf>, n_threads: Option<i32>) -> Result<Self> {
         let mut backend =
             LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
         // llama.cpp/ggml dump per-tensor load and context noise straight to C++ stderr,
@@ -127,7 +130,8 @@ impl LlmEngine {
             prefix_cache: Mutex::new(None),
             kind,
             model_dirs,
-            n_threads: n_threads.max(1),
+            n_threads: n_threads.map(|n| n.max(1)),
+            // n_threads: n_threads.max(1),
             load_lock: Mutex::new(()),
         })
     }
@@ -650,10 +654,16 @@ impl LlmEngine {
         // cores, and we cap prefill (`n_threads_batch`) at the same count rather than let
         // it fall to the llama.cpp default of 4 — 4 would throttle the transcript-tail
         // prefill (the uncached part of every note) on any many-core machine.
-        let ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_n_threads(self.n_threads)
-            .with_n_threads_batch(self.n_threads);
+        // When the physical core count was unavailable, neither is set and llama.cpp
+        // uses its own defaults.
+        let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(N_CTX));
+        if let Some(n) = self.n_threads {
+            ctx_params = ctx_params.with_n_threads(n).with_n_threads_batch(n);
+        }
+        // let ctx_params = LlamaContextParams::default()
+        //     .with_n_ctx(NonZeroU32::new(N_CTX))
+        //     .with_n_threads(self.n_threads)
+        //     .with_n_threads_batch(self.n_threads);
         model
             .new_context(&self.backend, ctx_params)
             .map_err(|e| anyhow!("failed to create LLM context: {e}"))
