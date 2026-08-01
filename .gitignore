@@ -39,8 +39,6 @@ src-tauri/resources/models/*
 # Local secrets (R2 upload credentials)
 .env
 
-# Claude folders
+# Claude files
 .claude/
-
-# Implementation file
-docs/implementation.md
+CLAUDE.md
