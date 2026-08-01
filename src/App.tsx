@@ -1,5 +1,5 @@
 import { useEffect, useState } from "react";
-import { frontendReady, getLlmStatus, ping, setupStatus, trialStatus } from "@/bridge";
+import { frontendReady, getLlmStatus, ping, setupStatus } from "@/bridge";
 import { useAppStore } from "@/state";
 import { useBackendEvents } from "@/hooks/useBackendEvents";
 import { useUpdateCheck } from "@/hooks/useUpdateCheck";
@@ -11,7 +11,7 @@ import RecordingView from "@/views/RecordingView";
 import RecordsView from "@/views/RecordsView";
 import SettingsView from "@/views/SettingsView";
 import SetupView from "@/views/SetupView";
-import ExpiredView from "@/views/ExpiredView";
+// import ExpiredView from "@/views/ExpiredView";
 
 function ActiveView() {
   const view = useAppStore((s) => s.view);
@@ -27,9 +27,8 @@ function ActiveView() {
 
 function App() {
   const [bridgeOk, setBridgeOk] = useState<boolean | null>(null);
-  // Trial gate (§1): `null` while checking, then the compiled-in verdict. Once
-  // expired, the app hard-stops on ExpiredView before anything else renders.
-  const [trial, setTrial] = useState<{ expired: boolean; endDate: string } | null>(null);
+  // Trial gate removed: the app no longer hard-stops on a compiled-in end date.
+  // const [trial, setTrial] = useState<{ expired: boolean; endDate: string } | null>(null);
   // First-run gate (D3): `null` while checking, `false` until the required models
   // are downloaded (show Setup), `true` once the app can run.
   const [setupReady, setSetupReady] = useState<boolean | null>(null);
@@ -58,13 +57,11 @@ function App() {
     void frontendReady().catch(() => {});
   }, []);
 
-  // Compiled-in beta expiry (§1). Checked before the setup gate. On error, treat
-  // as not-expired so a transient failure never locks a legitimate tester out.
-  useEffect(() => {
-    trialStatus()
-      .then((s) => setTrial({ expired: s.expired, endDate: s.end_date }))
-      .catch(() => setTrial({ expired: false, endDate: "" }));
-  }, []);
+  // useEffect(() => {
+  //   trialStatus()
+  //     .then((s) => setTrial({ expired: s.expired, endDate: s.end_date }))
+  //     .catch(() => setTrial({ expired: false, endDate: "" }));
+  // }, []);
 
   // Are the required models present? If not, Setup downloads them first (D3).
   useEffect(() => {
@@ -84,12 +81,13 @@ function App() {
       .catch(() => seedLlmStatus("ready"));
   }, [seedLlmStatus]);
 
-  if (trial === null || setupReady === null) {
+  // if (trial === null || setupReady === null) {
+  if (setupReady === null) {
     return <div className="h-screen bg-neutral-950" aria-label="loading" />;
   }
-  if (trial.expired) {
-    return <ExpiredView endDate={trial.endDate} />;
-  }
+  // if (trial.expired) {
+  //   return <ExpiredView endDate={trial.endDate} />;
+  // }
   if (!setupReady) {
     return <SetupView onReady={() => setSetupReady(true)} />;
   }

@@ -448,6 +448,7 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 - **Gated until ready.** On launch the app checks whether the required models are present; if not, it shows the Setup screen and does not proceed into recording/generation until both are downloaded and verified. Once present, Setup is skipped entirely.
 - **Integrity-checked.** Each download is verified against a known SHA-256 checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
 - **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function.
+- **Primes the prefix KV before handing over.** Once both downloads verify, Setup performs one further step in-app: load the models, prefill the fixed prompt prefix, and write the KV blob to disk (§8.7). It is shown as its own "Preparing note model…" step because it takes ~22s, and the models are **left loaded** afterwards so the clinician's first session starts immediately. Every later launch reads the blob instead (~0.01s). Mechanically this is the ordinary co-resident preload (§8.2 startup fix), re-run: the preload gate fires once at window mount, which on a first run is *before* the weights exist, so that attempt fails and **re-arms** the gate; Setup triggers it again once both downloads verify, and waits on the same `llm-status` event the main screen uses.
 
 **Upgrade migration — delete the retired tier weights.** A device upgrading from a prior version still has the old GGUFs (`mistral.gguf`, `phi-q8.gguf`, `phi-q4.gguf`) in its app-data models dir — several GB that will never be loaded again. On first launch of v0.1.2 the app **deletes any of these that exist** from the writable models dir (the bundled resource dir is read-only and carries none), reclaiming the disk. The deletion is best-effort and idempotent: a missing file is a no-op, a failed unlink is logged and does not block startup.
 
@@ -562,7 +563,42 @@ The few-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 
 **Dependency & fallback.** Reuse needs the `llama-cpp-2` binding to expose **sequence-scoped state save/restore** (`state_seq_get_size_ext` / `state_seq_get_data_ext` / `state_seq_set_data_ext`), confirmed present in the pinned version (0.1.150). The sequence-scoped variants (over the whole-context `get_state_size` / `copy_state_data`) are what keep the snapshot sized to the prefix's cells rather than the full N_CTX cache. The binding *also* exposes KV-cache trim (`clear_kv_cache_seq`), which the persistent-context alternative would have used — but the save/restore path is what we build (see the trade-off below). The **fallback** is the current behavior — prefill the full prompt per note — and it is entered automatically whenever the snapshot is missing (not yet primed, or after `unload`) or the boundary check fails, so the feature degrades to "correct but not cached" rather than breaking generation.
 
-**Non-goals.** No cross-*session* (on-disk) cache — the prefix is cheap to prefill once per app run, and persisting KV state to disk adds complexity and a versioning/staleness surface for no material gain. No caching of the transcript or generated tokens (they are unique per note).
+**Non-goals.** No caching of the transcript or generated tokens (they are unique per note).
+
+> **Superseded (v0.1.3).** This section originally declared a cross-*session* (on-disk) cache a non-goal, on the assumption that "the prefix is cheap to prefill once per app run." Measurement disproved that: the v0.1.2 prefix costs **~22s** to prefill, which is most of a ~28s startup. The on-disk cache is now part of the design — see **§8.7**.
+
+### 8.7 Cross-session prefix KV cache (on-disk)
+
+§8.6 prefills the prefix once per **process** and throws the snapshot away at exit. The KV bytes depend only on the prefix tokens and the inference build, neither of which changes between launches, so recomputing them every launch is pure waste.
+
+**The mechanism.** The `PrefixCache.state` buffer from §8.6 is written to a file in the writable app-data models dir. On load the engine reads that file and populates `PrefixCache` directly — tokenizing the prefix (cheap, no decode) for the boundary check, creating no context and decoding nothing. Measured: **~22s prefill → ~0.01s read**, startup **28.4s → 3.5s**, blob **16.5 MB**.
+
+**Staleness is handled by the filename, not by a version check.** The blob is a raw llama.cpp memory dump with no internal version tag, so there is nothing to compare. Instead the file *name* encodes everything the bytes depend on:
+
+```
+prefix_kv_<gguf file name>_<sha256 of prompt::prefix()[..8]>_<llama-cpp-sys-2 version>.bin
+```
+
+A changed prompt or a changed inference build therefore looks for a name that does not exist. "Stale" collapses into "absent", which is already the fallback path — no comparison logic, no migration step, nothing to remember at release time.
+
+- **The version string comes from `Cargo.lock`, read by `build.rs` at compile time** and baked into the binary. It must not be hand-maintained and must not come from `Cargo.toml`: the manifest carries a **range** (`"0.1.122"` means `>=0.1.122, <0.2.0`) and had in fact already drifted — the lockfile resolves to 0.1.150. Only the lockfile states what is actually compiled in. It cannot be read at runtime because it is a source file and is not shipped in the installer.
+- **Superseded blobs are deleted** whenever the current blob is established — after a new one is written, and again after an existing one is read back on load, since a launch that restores from disk never re-primes and would otherwise leave the orphan forever. A prompt edit or a dependency bump therefore does not leave 16.5 MB orphans accumulating in app-data across updates.
+- **The blob is written atomically** — to a sibling `.tmp`, then renamed into place. A re-prime writes the *same* filename as the existing blob, and a direct write truncates it first, so an interrupted write would leave a short blob under the correct name. That file reads back cleanly, which would make the restore path succeed, skip the prefill, and then silently fail to apply — a permanent slow path reported in the log as a successful restore. The rename makes the real name hold either the whole previous blob or the whole new one.
+- **A too-short state is rejected on both sides.** `state_seq_get_data_ext` reports a byte count with no error channel and returns 0 on internal failure, so the serialize step is checked against a floor (64 KiB, against a real ~16.5 MB state) before anything is written, and the read side applies the same floor to the file. This is the one case the atomic write cannot cover: the bytes are short *before* they are handed to the writer, so writing them atomically only makes a bad blob permanent. Rejecting instead re-primes, which also overwrites the bad file.
+
+**Failure is always backwards, never wrong.** Every failure mode degrades to pre-cache *speed*, never to an incorrect note: a missing or unreadable file falls through to the §8.6 prefill; a failed write only means the next launch prefills again; and if the bytes are somehow accepted by the reader but do not apply, the existing `state_seq_set_data_ext` → `clear_kv_cache()` → full-decode path in §8.6 catches it. That last case is the only one that is *silently* backwards — the note is correct but pays the full prefill, while the load-time log has already reported a successful restore — so the rejected restore is logged where it happens. The blob contains only shipped prompt text run through the model — **no PHI**, so it needs no encryption (§10.1) and is safe to leave in app-data.
+
+**When the blob is computed.** Never on a doctor's first session — the ~22s is always paid somewhere the clinician is not waiting on it:
+
+| Path | Primes when | Model afterwards |
+| --- | --- | --- |
+| **Fresh install** | In-app Setup (§8.2), immediately after the model downloads finish, as a visible "Preparing …" step | **Stays loaded.** Setup is already inside the running app, so unloading would only pay the model load twice. Both engines are warm and the clinician can start the first session right away. |
+| **Update that bumps `llama-cpp-sys-2`** | The installer runs `asmart-medical-scribe.exe --prime-kv` as a post-install step — a short-lived headless process that loads the model, primes, writes the blob, and exits | **Released with the process.** Priming happens while the installer is still on screen and the app is not running, so the ~3 GB has the machine to itself with no co-residency pressure (§7). The app then launches normally and hits the 3.5s path. |
+| **Every normal launch** | Never — the blob is read (~0.01s) | Loaded as today (§8.4) |
+
+`--prime-kv` exits in milliseconds when the correctly-named blob already exists, so an update that does *not* touch `llama-cpp-sys-2` costs nothing. It also no-ops on a fresh install, where the models have not been downloaded yet — that case is Setup's job.
+
+**The launch-time fallback stays.** If the installer step is skipped or fails, or the blob is absent for any other reason, the background preload thread (§8.4) primes exactly as it does today and writes the blob for next time. This is what keeps a failed install step from producing a permanently slow app; the cost is one launch showing "Preparing note model…" for ~22s, during which recording and transcription are unaffected and only Generate waits.
 
 ## 9. Data Model & Interfaces
 
@@ -687,7 +723,7 @@ Every event carries **no PHI** regardless of sink. Because NFR-6 concerns PHI eg
 
 #### Log event catalog
 
-Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
+Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
 
 | Event | On-device | Telemetry |
 | --- | :---: | :---: |
@@ -704,6 +740,19 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERAT
 | `[LOAD] loading SLM: {model_name}` | ✓ | |
 | `[LOAD] SLM load failed: {e}` | ✓ | ✓ |
 | `[LOAD] SLM model loaded: {duration}s` | ✓ | |
+| `[LOAD] SLM prefix KV restored from disk in {duration}s` | ✓ | |
+| `[LOAD] SLM prefix KV not restored from disk ({reason}) — priming` | ✓ | ✓ |
+| `[LOAD] prefix KV state = {size} MB` | ✓ | |
+| `[LOAD] SLM prefix KV cache primed in {duration}s` | ✓ | |
+| `[LOAD] superseded prefix KV blob removed: {path}` | ✓ | |
+| `[LOAD] prefix KV restore rejected by llama.cpp — full prefill for this note` | ✓ | |
+| `[PRIME] APPDATA unset — skipping` | ✓ | |
+| `[PRIME] no model in {path} — skipping` | ✓ | |
+| `[PRIME] prefix KV blob already present — nothing to do` | ✓ | |
+| `[PRIME] engine init failed: {e}` | ✓ | |
+| `[PRIME] done` | ✓ | |
+| `[PRIME] primed but no blob on disk — the app will prime again at launch` | ✓ | |
+| `[PRIME] failed: {e}` | ✓ | |
 | `[CLOSE] both models resident, status changed to READY` | ✓ | |
 | `[RECORD] using device mic for recording: {mic_name}` | ✓ | |
 | `[RECORD] {record_id}, recording started` | ✓ | |
@@ -732,7 +781,7 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[RECORD]`, `[GENERAT
 | `[CLOSE] application closed` | ✓ | |
 | `[DB] DPAPI key unwrap failed {error message}` | ✓ | ✓ |
 
-Notes: the mic name is PII, so it is on-device only. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
+Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
 
 ### 10.4 Data lifecycle
 
@@ -754,6 +803,7 @@ The clinic/clinician is the **custodian** of the health information; the app is 
   2. **State save/restore into a fresh context** — prefill the prefix once, snapshot its KV state to an in-memory buffer, and restore that snapshot into a fresh throwaway context per note before decoding the transcript tail.
 - **Chosen:** Option 2 (save/restore).
 - **Rationale:** In `llama-cpp-2`, a `LlamaContext` borrows the loaded `LlamaModel`, so storing a persistent context beside the owned model in the engine struct is **self-referential** — safe Rust won't allow it without `unsafe`/lifetime hacks or an extra self-referencing crate. Both options skip the same expensive step (running the prefix through every model layer — seconds of CPU), which is the entire point of the feature. Option 2 reuses the fresh-context-per-note path the engine already had, so it needs no new lifetime machinery; it also makes reset-to-boundary and cancel/error cleanup **automatic** (the snapshot is never mutated and each note's context is discarded), removing the mandatory-trim invariant Option 1 carries. Its only extra cost is a per-note memory copy of the snapshot — **milliseconds against the seconds saved** — so the win is effectively identical while the code stays simpler and safer. The binding exposes both APIs (0.1.150), so this is a design choice, not a capability limit.
+- **Confirmed in v0.1.3:** the snapshot being a plain byte buffer is also what made the on-disk cross-session cache (§8.7) a file write rather than a feature — a persistent context has no serializable form to persist.
 - **Revisit if:** profiling on Windows shows the per-note snapshot restore is a meaningful share of latency (it shouldn't be), or the prefix grows large enough (e.g. few-shot, §8.3) that the snapshot's memory/copy cost matters — then reconsider a persistent context via a self-referential wrapper.
 
 ### Beta trial gate: compiled-in expiry vs a server-enforced license
@@ -826,6 +876,8 @@ Two paths ship: an automatic in-app updater (default), with manual re-install al
 - **Manifest + host.** Each release publishes a `latest.json` (version, notes, per-target signed-bundle URL). Both the manifest and the bundle are **GitHub Release assets**, so the update host is the same as the download host (§14.1) — no extra infrastructure. The updater's `endpoints` point at the release URL.
 - **Check + apply.** On launch the app makes **one** best-effort HTTPS call to the manifest endpoint. If a newer version exists it shows a **non-blocking prompt** ("Update available — install and restart?"); the clinician chooses when, so an update never interrupts a consult. Offline or endpoint-unreachable → the check fails silently and the app runs normally.
 - **PHI posture.** The update check carries **no PHI** — it sends only the current version (in the request URL) and receives the manifest. It is the one outbound call besides telemetry (§10.3), and like telemetry it is best-effort and silent on failure, so the offline default still holds.
+
+- **Post-install prefix-KV prime.** The installer runs `asmart-medical-scribe.exe --prime-kv` after copying files (§8.7) — the hook uses NSIS's `${MAINBINARYNAME}`, which is the Cargo package name, not `productName`. If the update bumped `llama-cpp-sys-2` the blob's filename no longer matches, so this short-lived process re-primes (~22s) and writes the new blob while the installer is still on screen; otherwise it exits in milliseconds. The app is not running at that point, so the prime has the machine to itself, and the subsequent normal launch reaches READY in ~3.5s. A skipped or failed step is not fatal — the app primes on its next background preload instead.
 
 **Manual fallback.** A new version is always also a plain GitHub Release; a user can download and run the new installer (which upgrades in place) if they prefer, or if auto-update is ever disabled. The download site (§14.2) always points at latest.
 

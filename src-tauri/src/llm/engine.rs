@@ -60,6 +60,10 @@ const MAX_REASONING_TOKENS: i32 = 1024; // separate cap for the <think> scratchp
                                         // verbose CoT can't eat the note's budget; tunable (§8.2)
 const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hallucination
 
+/// Sanity floor for a serialized prefix KV state (§8.7). The real one is ~16.5 MB, so this
+/// only ever rejects a zero/garbage serialize — never a legitimately small prefix.
+const MIN_PREFIX_KV_BYTES: usize = 64 * 1024;
+
 /// Generate-path reasoning suppression (design §8.3): the boundary string that ends
 /// the `<think>` block, plus a cap on the reasoning phase. The note is given its own
 /// `max_tokens` *after* the boundary, so a long scratchpad can never truncate it.
@@ -71,7 +75,7 @@ struct Suppress<'a> {
 
 /// Serialized KV state of the fixed prompt prefix (system + one-shot example, §8.3)
 /// for one model. Restoring this into a fresh context skips re-decoding the prefix
-/// on every note — the KV-cache reuse of §8.7. `prefix_tokens` pins which token
+/// on every note — the KV-cache reuse of §8.6. `prefix_tokens` pins which token
 /// sequence the state was built from: a generation only reuses it when the full
 /// prompt begins with exactly these tokens, which keeps cached and uncached notes
 /// byte-identical (a tokenizer merge across the split boundary simply misses the
@@ -85,11 +89,11 @@ struct PrefixCache {
 /// Owns the loaded GGUF model. The `LlamaBackend` is process-wide and created
 /// once; the model is warmed at startup (co-resident, §7) and can be unloaded to
 /// release RAM. Generation builds a fresh context each run,
-/// restoring the cached prefix KV state into it (§8.7) when available.
+/// restoring the cached prefix KV state into it (§8.6) when available.
 pub struct LlmEngine {
     backend: LlamaBackend,
     model: Mutex<Option<LlamaModel>>,
-    /// Cached prefix KV state (§8.7), primed on load ([`warmup`]) and dropped on
+    /// Cached prefix KV state (§8.6), primed on load ([`warmup`]) and dropped on
     /// [`unload`]/model change. Guarded separately from `model`; a fresh context is
     /// still built per note, so cancel/error can never leave stale tokens here.
     prefix_cache: Mutex<Option<PrefixCache>>,
@@ -194,14 +198,36 @@ impl LlmEngine {
         // speed (design §8.4). Failure here is non-fatal — log and continue.
         // Timed separately from the weight load: priming decodes the whole fixed
         // prefix, so it is a real slice of startup and worth seeing on its own.
+        // let t_warm = Instant::now();
+        // if let Err(e) = self.warmup() {
+        //     warn!("LLM warmup pass failed (non-fatal): {e}");
+        // } else {
+        //     info!(
+        //         "[LOAD] SLM prefix KV cache primed in {:.1}s",
+        //         t_warm.elapsed().as_secs_f32()
+        //     );
+        // }
+        // Try the on-disk prefix KV first (§8.7) — reading the blob skips the prefix
+        // decode entirely. Anything wrong with it (absent, stale prompt, short read)
+        // falls through to priming, the in-memory-only path kept commented above.
         let t_warm = Instant::now();
-        if let Err(e) = self.warmup() {
-            warn!("LLM warmup pass failed (non-fatal): {e}");
-        } else {
-            info!(
-                "[LOAD] SLM prefix KV cache primed in {:.1}s",
+        match self.load_prefix_kv() {
+            Ok(()) => info!(
+                "[LOAD] SLM prefix KV restored from disk in {:.2}s",
                 t_warm.elapsed().as_secs_f32()
-            );
+            ),
+            Err(e) => {
+                info!("[LOAD] SLM prefix KV not restored from disk ({e}) — priming");
+                let t_warm = Instant::now();
+                if let Err(e) = self.warmup() {
+                    warn!("LLM warmup pass failed (non-fatal): {e}");
+                } else {
+                    info!(
+                        "[LOAD] SLM prefix KV cache primed in {:.1}s",
+                        t_warm.elapsed().as_secs_f32()
+                    );
+                }
+            }
         }
         Ok(())
     }
@@ -209,7 +235,8 @@ impl LlmEngine {
     pub fn unload(&self) {
         *self.lock_model() = None;
         // Drop the cached prefix state with the model: it belongs to this model
-        // (and would be re-primed cold on the next load, §8.7).
+        // (§8.6). The next load rebuilds it — from the blob when one is present (§8.7),
+        // by priming otherwise.
         *self.prefix_cache.lock().unwrap() = None;
     }
 
@@ -220,7 +247,7 @@ impl LlmEngine {
     /// [`prompt::REASONING_BOUNDARY`] is streamed and returned (§8.3).
     ///
     /// The prompt is built as the fixed prefix + this transcript's tail; when the
-    /// prefix's KV state is cached (§8.7) it is restored into the fresh context and
+    /// prefix's KV state is cached (§8.6) it is restored into the fresh context and
     /// only the tail is decoded, so the prefix is never re-read. The full prompt is
     /// always tokenized and fed identically to the fallback path — the cache only
     /// skips *recomputing* the prefix's KV — so a cached note is byte-identical to
@@ -310,11 +337,13 @@ impl LlmEngine {
         Ok(note.map(|n| prompt::sanitize_note(&n)))
     }
 
-    /// Prime the prefix cache (§8.7): decode the fixed prefix once and serialize the
+    /// Prime the prefix cache (§8.6): decode the fixed prefix once and serialize the
     /// resulting context state so later notes can restore it instead of re-decoding.
     /// Called right after a load — this replaces the old throwaway warmup pass, and
     /// doubles as the warmup (the first real decode after a load is the slow one).
-    /// Failure is non-fatal: generation falls back to a full per-note decode.
+    /// The serialized state is also written to disk (§8.7) so the next launch can skip
+    /// this decode entirely. Failure is non-fatal: generation falls back to a full
+    /// per-note decode.
     fn warmup(&self) -> Result<()> {
         let kind = self.model_kind();
         let guard = self.lock_model();
@@ -338,7 +367,7 @@ impl LlmEngine {
             .map_err(|e| anyhow!("prefix decode failed: {e}"))?;
 
         // Serialize the KV state for **sequence 0 only** (all prompt tokens live on
-        // seq 0 — see the batch below). The sequence-scoped size is the cells actually
+        // seq 0 — see the batch above). The sequence-scoped size is the cells actually
         // used (~the prefix), not the N_CTX maximum the whole-context `get_state_size`
         // reports — so priming doesn't briefly allocate and zero ~1 GB right after the
         // model load, which would spike RAM against the §7 co-resident budget.
@@ -347,6 +376,38 @@ impl LlmEngine {
             ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty())
         };
         state.truncate(written);
+        // `state_seq_get_data_ext` reports 0 on internal failure and has no `Result`. An empty
+        // (or absurdly short) blob writes and reads back fine, so nothing downstream would ever
+        // re-prime it — `restore_prefix` just fails silently and every note pays the full
+        // prefill forever. Bail instead: the caller's warmup branch is non-fatal, so this
+        // degrades to one full decode rather than a permanently poisoned cache. §8.7
+        if written < MIN_PREFIX_KV_BYTES {
+            return Err(anyhow!(
+                "prefix KV serialize returned {written} bytes — too short to be a real state"
+            ));
+        }
+        info!(
+            "[LOAD] prefix KV state = {:.1} MB",
+            state.len() as f32 / (1024.0 * 1024.0)
+        );
+
+        // Keep the blob for the next launch (§8.7). Best-effort — a failed write only
+        // means the next launch primes again.
+        // Via `.tmp` + rename: a re-prime writes the same filename, and a direct write
+        // truncates it first — an interrupted one would leave a short blob that reads
+        // back fine and is never re-primed. Non-atomic original:
+        // match std::fs::write(&path, &state) {
+        if let Some(path) = self.prefix_kv_path() {
+            let tmp = path.with_extension("tmp");
+            match std::fs::write(&tmp, &state).and_then(|()| std::fs::rename(&tmp, &path)) {
+                // Only prune once the replacement is on disk, never before.
+                Ok(()) => Self::remove_superseded_blobs(&path),
+                Err(e) => {
+                    warn!("failed to write prefix KV blob: {e}");
+                    let _ = std::fs::remove_file(&tmp); // leftover half-blob
+                }
+            }
+        }
 
         *self.prefix_cache.lock().unwrap() = Some(PrefixCache {
             kind,
@@ -354,6 +415,101 @@ impl LlmEngine {
             state,
         });
         Ok(())
+    }
+
+    /// Populate the prefix cache from the on-disk blob (§8.7) instead of decoding the
+    /// prefix. Only tokenizes the prefix (no context, no decode). Errors mean "no
+    /// usable blob" and the caller primes instead.
+    fn load_prefix_kv(&self) -> Result<()> {
+        let kind = self.model_kind();
+        let path = self
+            .prefix_kv_path()
+            .ok_or_else(|| anyhow!("no writable models dir"))?;
+        let state = std::fs::read(&path)?;
+        // Same floor as the write side: a blob this short can't restore, and treating it as
+        // "no usable blob" re-primes and overwrites it instead of caching it forever.
+        if state.len() < MIN_PREFIX_KV_BYTES {
+            return Err(anyhow!("prefix KV blob is only {} bytes", state.len()));
+        }
+
+        let guard = self.lock_model();
+        let model = guard
+            .as_ref()
+            .ok_or_else(|| anyhow!("LLM model is not loaded"))?;
+        let prefix_tokens = model
+            .str_to_token(&prompt::prefix(kind), AddBos::Always)
+            .map_err(|e| anyhow!("failed to tokenize prompt prefix: {e}"))?;
+        drop(guard);
+
+        *self.prefix_cache.lock().unwrap() = Some(PrefixCache {
+            kind,
+            prefix_tokens,
+            state,
+        });
+        // A launch that hits the blob never reaches `warmup`, so prune here too — otherwise
+        // an orphan survives forever once the new blob exists.
+        Self::remove_superseded_blobs(&path);
+        Ok(())
+    }
+
+    /// Where the prefix KV blob lives — the writable app-data models dir, named with a hash
+    /// of the prompt prefix and the llama-cpp-sys-2 version (stamped by `build.rs`, since that
+    /// crate vendors llama.cpp and owns the blob layout). A prompt edit
+    /// or a dependency bump changes the name, so a stale blob is never read (the file simply
+    /// isn't there). §8.7
+    ///
+    /// Takes no `kind`: it is `pub(crate)` since B3, and a caller-supplied kind could name a
+    /// model this engine never loaded. `self.kind` makes that unrepresentable.
+    // pub(crate) fn prefix_kv_path(&self, kind: LlmModel) -> Option<PathBuf> {
+    pub(crate) fn prefix_kv_path(&self) -> Option<PathBuf> {
+        use sha2::{Digest, Sha256};
+        use std::fmt::Write;
+
+        let kind = self.kind;
+        let dir = self.model_dirs.first()?;
+        let digest = Sha256::digest(prompt::prefix(kind).as_bytes());
+        let mut hash = String::with_capacity(16);
+        for b in &digest[..8] {
+            let _ = write!(hash, "{b:02x}");
+        }
+        // Pre-version-stamp name, kept for reference:
+        // Some(dir.join(format!("prefix_kv_{}_{hash}.bin", kind.file_name())))
+        // Stamped with llama-cpp-2's version before the sys fix; see build.rs:
+        // let version = env!("LLAMA_CPP_2_VERSION");
+        let version = env!("LLAMA_CPP_SYS_2_VERSION");
+        Some(dir.join(format!(
+            "prefix_kv_{}_{hash}_{version}.bin",
+            kind.file_name()
+        )))
+    }
+
+    /// Delete every `prefix_kv_*` blob beside `current` — the ones a prompt edit or a
+    /// dependency bump left unreadable, at ~16 MB apiece. Best-effort: a blob that won't
+    /// unlink is wasted disk, not a failed load. §8.7
+    fn remove_superseded_blobs(current: &Path) {
+        let Some(dir) = current.parent() else { return };
+        let Ok(entries) = std::fs::read_dir(dir) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path == current {
+                continue;
+            }
+            let is_blob = path
+                .file_name()
+                .and_then(|n| n.to_str())
+                .is_some_and(|n| n.starts_with("prefix_kv_"));
+            if is_blob {
+                match std::fs::remove_file(&path) {
+                    Ok(()) => info!(
+                        "[LOAD] superseded prefix KV blob removed: {}",
+                        path.display()
+                    ),
+                    Err(e) => warn!("failed to remove superseded prefix KV blob: {e}"),
+                }
+            }
+        }
     }
 
     /// Restore the cached prefix state into `ctx` and return the token position to
@@ -373,6 +529,10 @@ impl LlmEngine {
         let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
         if !ok {
             // Restore failed — reset any partial state and decode the whole prompt.
+            // Logged because this is the one silent way the cache stops paying off: the note
+            // is still correct, just at full prefill cost, with the load-time log still
+            // reporting a successful restore. §8.7
+            warn!("[LOAD] prefix KV restore rejected by llama.cpp — full prefill for this note");
             ctx.clear_kv_cache();
             return 0;
         }
@@ -647,7 +807,7 @@ impl LlmEngine {
 
     /// A fresh inference context sized to N_CTX on the engine's thread budget. One
     /// is built per note (and per prefix priming); the cached prefix state is
-    /// restored into it, so nothing needs to hold a context across notes (§8.7).
+    /// restored into it, so nothing needs to hold a context across notes (§8.6).
     fn new_context<'a>(&'a self, model: &'a LlamaModel) -> Result<LlamaContext<'a>> {
         // Both phases run on the tuned thread count (physical // 2, design §8.2): decode
         // (`n_threads`) is memory-bandwidth-bound and regresses past a fraction of the
@@ -687,6 +847,46 @@ fn rate(tokens: i32, elapsed: std::time::Duration) -> f32 {
 
 /// Fail the load if free RAM is below the model file size plus a working margin
 /// (design §8.4): better a graceful error in IDLE than a mid-load OOM crash.
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn remove_superseded_blobs_deletes_only_other_prefix_kv_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let current = dir.path().join("prefix_kv_gemma.gguf_abc123_0.1.150.bin");
+
+        // The current blob, two superseded ones, a crashed write's leftover, and the
+        // model weights sitting in the same dir.
+        let stale = dir.path().join("prefix_kv_gemma.gguf_abc123_0.1.149.bin");
+        let old_prompt = dir.path().join("prefix_kv_gemma.gguf_deadbe_0.1.150.bin");
+        let leftover = dir.path().join("prefix_kv_gemma.gguf_abc123_0.1.150.tmp");
+        let weights = dir.path().join(LlmModel::Gemma.file_name());
+        for p in [&current, &stale, &old_prompt, &leftover, &weights] {
+            std::fs::write(p, b"x").unwrap();
+        }
+
+        LlmEngine::remove_superseded_blobs(&current);
+
+        assert!(current.exists(), "the current blob must survive");
+        assert!(weights.exists(), "non-blob files must be untouched");
+        assert!(!stale.exists());
+        assert!(!old_prompt.exists());
+        assert!(!leftover.exists());
+
+        // Idempotent, and safe when the current blob is the only file left.
+        LlmEngine::remove_superseded_blobs(&current);
+        assert!(current.exists());
+    }
+
+    #[test]
+    fn remove_superseded_blobs_ignores_a_missing_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let gone = dir.path().join("no-such-dir").join("prefix_kv_x.bin");
+        LlmEngine::remove_superseded_blobs(&gone); // must not panic
+    }
+}
+
 fn guard_available_ram(model_path: &Path) -> Result<()> {
     let model_bytes = std::fs::metadata(model_path)
         .map(|m| m.len())

@@ -49,6 +49,9 @@ export default function SoapEditor({ note }: { note: Note }) {
   }, [note.id]);
 
   // Flush on unmount (e.g. switching views) rather than dropping the timer.
+  // `flush` is intentionally not a dep: it is rebuilt every render, so depending on
+  // it would tear down and re-run this effect — flushing constantly, not on unmount.
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   useEffect(() => flush, []);
 
   const onEdit = (value: string) => {

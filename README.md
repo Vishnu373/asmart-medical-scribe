@@ -64,7 +64,7 @@ Organized one folder per domain. The pipeline runs top-to-bottom:
 | `handoff/` | Copies SOAP sections to the clipboard for pasting into an EMR. |
 | `telemetry/` | Opt-in crash reporting. Compiled out by default. |
 | `commands/` | Every function the frontend is allowed to call. |
-| `lib.rs` · `main.rs` · `trial.rs` | App setup and command registration; beta expiry check. |
+| `lib.rs` · `main.rs` · `trial.rs` | App setup and command registration; `trial.rs` (beta expiry) is retained but no longer compiled in. |
 
 Also here: `models/silero_vad_v4.onnx` (the only weights shipped in the installer), `libs/` (Windows runtime DLLs), `tauri.conf.json` (build & bundle config).
 

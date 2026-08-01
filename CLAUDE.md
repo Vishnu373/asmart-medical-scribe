@@ -65,7 +65,7 @@ A recording is a state machine — **IDLE → RECORDING → PROCESSING → IDLE*
 ### Other backend modules
 - **`handoff/`** — EMR clipboard hand-off; per-section Copy in v1. The global paste-hotkey machinery (`paste_section`, `rebind_paste_hotkey`) is present but **dormant** — no shortcut is registered at startup.
 - **`telemetry/`** — opt-in crash reporting, compiled out unless the `crash-reporting` cargo feature + a DSN are present (offline by default). `bun run release` builds with this feature.
-- **`trial/`** — compiled-in beta expiry; `ExpiredView` hard-stops the app past the end date.
+- **`trial/`** — compiled-in beta expiry, **removed**: `trial.rs` and `ExpiredView.tsx` are still on disk but no longer wired in (`mod trial` and the `trial_status` command are commented out). The app never expires.
 
 ## Other directories
 - `landing_page/` — a **separate** Vite/React marketing site with its own `package.json`; unrelated to the app.

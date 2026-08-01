@@ -8,15 +8,13 @@ import { useAppStore } from "@/state";
 // Bridge calls go through `invoke`. The mock is command-aware because mounting a
 // view (e.g. Settings) fires its own loads — `list_input_devices` must return an
 // array (the real backend always does), or `devices.map` throws during render.
-// `respond` is hoisted so individual tests can override one command (e.g. an
-// expired trial) while reusing these defaults.
+// `respond` is hoisted so individual tests can override one command while reusing
+// these defaults.
 const { respond } = vi.hoisted(() => ({
   respond: (cmd: string): Promise<unknown> => {
     switch (cmd) {
       case "ping":
         return Promise.resolve("pong: ready");
-      case "trial_status":
-        return Promise.resolve({ expired: false, end_date: "2026-07-31" });
       case "list_input_devices":
         return Promise.resolve([]);
       case "get_llm_status":
@@ -65,19 +63,5 @@ describe("App shell", () => {
     await userEvent.click(await screen.findByRole("button", { name: "Settings" }));
     expect(screen.getByRole("region", { name: "Settings" })).toBeInTheDocument();
     expect(screen.queryByRole("region", { name: "Recording" })).not.toBeInTheDocument();
-  });
-
-  it("hard-stops on the expired screen once the trial has ended (§1)", async () => {
-    vi.mocked(invoke).mockImplementation((cmd) =>
-      (cmd === "trial_status"
-        ? Promise.resolve({ expired: true, end_date: "2026-07-31" })
-        : respond(cmd)) as Promise<never>,
-    );
-    render(<App />);
-    expect(
-      await screen.findByRole("heading", { name: "This beta has ended" }),
-    ).toBeInTheDocument();
-    // The app is blocked — no nav, no recording view.
-    expect(screen.queryByRole("navigation", { name: "Primary" })).not.toBeInTheDocument();
   });
 });

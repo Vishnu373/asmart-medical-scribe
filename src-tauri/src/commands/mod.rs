@@ -24,7 +24,7 @@ pub fn ping(message: String) -> String {
 /// IDLE → RECORDING. Rejected unless currently IDLE.
 #[tauri::command]
 pub fn start_recording(coordinator: State<'_, Arc<Coordinator>>) -> Result<(), String> {
-    crate::trial::ensure_active()?;
+    // crate::trial::ensure_active()?;
     coordinator.start_recording()?;
     crate::telemetry::track_event("session_started", serde_json::json!({}));
     Ok(())
@@ -113,7 +113,7 @@ pub async fn generate_note(
     store: State<'_, SharedStore>,
     record_id: String,
 ) -> Result<Option<String>, String> {
-    crate::trial::ensure_active()?;
+    // crate::trial::ensure_active()?;
     let transcript = load_transcript(&store, &record_id)?;
     let coordinator = coordinator.inner().clone();
     tauri::async_runtime::spawn_blocking(move || coordinator.generate_note(&record_id, &transcript))
@@ -128,7 +128,7 @@ pub async fn regenerate_note(
     store: State<'_, SharedStore>,
     record_id: String,
 ) -> Result<Option<String>, String> {
-    crate::trial::ensure_active()?;
+    // crate::trial::ensure_active()?;
     let transcript = load_transcript(&store, &record_id)?;
     let coordinator = coordinator.inner().clone();
     tauri::async_runtime::spawn_blocking(move || coordinator.generate_note(&record_id, &transcript))
@@ -197,7 +197,10 @@ pub struct PreloadGate {
     stt: Arc<SttEngine>,
     stt_model_dirs: Vec<PathBuf>,
     engine: Arc<LlmEngine>,
-    started: AtomicBool,
+    /// One-shot guard, but re-armable: the preload thread clears it when the load
+    /// fails so Setup can call [`frontend_ready`] again once the weights exist.
+    // started: AtomicBool,
+    started: Arc<AtomicBool>,
 }
 
 /// Instance of Preload
@@ -207,7 +210,8 @@ impl PreloadGate {
             stt,
             stt_model_dirs,
             engine,
-            started: AtomicBool::new(false),
+            // started: AtomicBool::new(false),
+            started: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -221,6 +225,7 @@ pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
     let engine = gate.engine.clone();
     let stt = gate.stt.clone();
     let stt_model_dirs = gate.stt_model_dirs.clone();
+    let started = gate.started.clone();
     std::thread::spawn(move || {
         let t0 = Instant::now();
         let _ = app.emit("llm-status", serde_json::json!({ "status": "loading" }));
@@ -236,6 +241,11 @@ pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
                 let _ = app.emit("llm-status", serde_json::json!({ "status": "ready" }));
             }
             Err(e) => {
+                // Re-arm so a later `frontend_ready` actually runs. On a first run this
+                // call arrives at App mount, before Setup has downloaded the weights, so
+                // the failure is expected — Setup calls again once both models are on
+                // disk and that second call is the one that primes (§8.2, §8.7).
+                started.store(false, Ordering::SeqCst);
                 log::warn!("LLM preload failed (will retry on first generation): {e}");
                 let _ = app.emit(
                     "llm-status",
@@ -295,11 +305,12 @@ pub fn mark_setup_completed() {
     crate::telemetry::track_event("setup_completed", serde_json::json!({}));
 }
 
-/// Temporary, trial status until July 31 2026
-#[tauri::command]
-pub fn trial_status() -> crate::trial::TrialStatus {
-    crate::trial::status()
-}
+// Beta expiry removed — the app no longer gates on a compiled-in end date.
+// /// Temporary, trial status until July 31 2026
+// #[tauri::command]
+// pub fn trial_status() -> crate::trial::TrialStatus {
+//     crate::trial::status()
+// }
 
 /// Record an app-update lifecycle event on-device, plus telemetry for the two failure stages.
 #[tauri::command]

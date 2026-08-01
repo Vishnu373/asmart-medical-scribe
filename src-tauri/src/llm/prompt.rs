@@ -10,7 +10,7 @@
 //! split and `engine` streams/persists only the note.
 //!
 //! The prompt is laid out `[system + worked examples] → [transcript] → [assistant]`
-//! so the fixed prefix (system + examples) can be prompt-cached (§8.7): the same
+//! so the fixed prefix (system + examples) can be prompt-cached (§8.6): the same
 //! prefix is reused across every note, and only the transcript changes. A single
 //! on-device model (Gemma) with its chat template; the examples teach the format,
 //! so nothing model-specific is stated in the instruction itself.
@@ -125,7 +125,7 @@ pub fn user_message(transcript: &str) -> String {
 /// The fixed prompt **prefix** for a model: system instruction, the worked few-shot
 /// examples, and the instruct-template scaffolding up to (and including) the user
 /// lead-in — everything before the note's own transcript. This is byte-identical
-/// across every note, which is exactly what the KV-cache reuse in §8.7 caches: it is
+/// across every note, which is exactly what the KV-cache reuse in §8.6 caches: it is
 /// prefilled once and its state restored per note so the prefix is never re-decoded.
 /// [`build_prompt`] is `prefix(model) + transcript_tail(model, transcript)`.
 pub fn prefix(model: LlmModel) -> String {
@@ -167,7 +167,7 @@ pub fn transcript_tail(model: LlmModel, transcript: &str) -> String {
 }
 
 /// Wrap the system, the few-shot examples, and the real transcript in the model's
-/// chat template. Split into [`prefix`] (fixed, cacheable §8.7) + [`transcript_tail`]
+/// chat template. Split into [`prefix`] (fixed, cacheable §8.6) + [`transcript_tail`]
 /// (changing); this is the concatenation and stays the single source of the exact
 /// prompt for the fallback (uncached) path.
 pub fn build_prompt(model: LlmModel, transcript: &str) -> String {
@@ -272,7 +272,7 @@ mod tests {
 
     #[test]
     fn prefix_plus_tail_equals_build_prompt() {
-        // The KV-cache reuse (§8.7) prefills `prefix` and appends `transcript_tail`;
+        // The KV-cache reuse (§8.6) prefills `prefix` and appends `transcript_tail`;
         // it must reconstruct exactly the fallback prompt or cached and uncached
         // notes would diverge. Guard the split for a few transcripts.
         let model = LlmModel::Gemma;

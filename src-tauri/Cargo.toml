@@ -1,6 +1,6 @@
 [package]
 name = "asmart-medical-scribe"
-version = "0.1.2"
+version = "0.1.3"
 description = "On-device medical scribe"
 edition = "2021"
 default-run = "asmart-medical-scribe"
@@ -55,7 +55,7 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # In-process GGUF note generation (§8, B10). CPU-only llama.cpp binding — no
 # server, no network. Compiles native code via cmake + a C/C++ toolchain on the
 # Windows build host (no CUDA/Metal features).
-llama-cpp-2 = "0.1.122"
+llama-cpp-2 = "0.1.150"
 # EMR hand-off (§8.6, B11): global paste hotkey + clipboard. The keystroke (Ctrl+V)
 # is delivered via Win32 SendInput through the `windows` crate below — no input-sim
 # dependency. The no-activate overlay *window* is created on the frontend (F7).

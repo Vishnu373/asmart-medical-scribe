@@ -15,7 +15,7 @@ import type {
   Settings,
   SetupStatus,
   SoapSection,
-  TrialStatus,
+  // TrialStatus,
 } from "@/bridge/types";
 
 /** Round-trips a message through the backend to verify the bridge is wired. */
@@ -172,13 +172,11 @@ export function markSetupCompleted(): Promise<void> {
   return invoke("mark_setup_completed");
 }
 
-// — Trial gate (implementation.md §1). Compiled-in beta expiry; the app blocks once
-// past the end date. Checked on startup before anything else renders.
-
-/** The beta trial verdict — whether the compiled-in end date has passed. */
-export function trialStatus(): Promise<TrialStatus> {
-  return invoke<TrialStatus>("trial_status");
-}
+// — Trial gate removed: the beta no longer expires, so nothing queries it.
+// /** The beta trial verdict — whether the compiled-in end date has passed. */
+// export function trialStatus(): Promise<TrialStatus> {
+//   return invoke<TrialStatus>("trial_status");
+// }
 
 // — App update logging (§10.3 `[UPDATE]` rows). The updater is driven from the
 // frontend, so each lifecycle transition is reported to the backend for the on-device

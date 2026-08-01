@@ -7,12 +7,14 @@ mod handoff;
 mod llm;
 mod models;
 mod orchestrator;
+mod prime_kv;
 mod segment;
 mod settings;
 mod store;
 mod stt;
 mod telemetry;
-mod trial;
+// Beta expiry removed — `trial.rs` stays on disk, uncompiled, in case the gate returns.
+// mod trial;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -32,6 +34,13 @@ const STT_IDLE_TIMEOUT: Duration = Duration::ZERO;
 
 /// Builds and runs the Tauri application.
 pub fn run() {
+    // Installer post-install step (§8.7): prime the prefix KV blob and exit without ever
+    // building the app. Checked before anything else so no window or plugin is created.
+    if prime_kv::requested() {
+        prime_kv::run();
+        return;
+    }
+
     telemetry::init();
     telemetry::track_event("application_started", serde_json::json!({}));
 
@@ -187,7 +196,7 @@ pub fn run() {
             commands::list_input_devices,
             commands::submit_feedback,
             commands::mark_setup_completed,
-            commands::trial_status,
+            // commands::trial_status,
             commands::log_update_event,
             models::download_llm,
             models::setup_status,

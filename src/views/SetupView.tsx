@@ -2,7 +2,10 @@ import { useEffect, useRef, useState } from "react";
 import {
   downloadLlm,
   downloadStt,
+  frontendReady,
+  getLlmStatus,
   markSetupCompleted,
+  onLlmStatus,
   onModelDownloadDone,
   onModelDownloadError,
   onModelDownloadProgress,
@@ -33,12 +36,19 @@ function slotsFor(s: SetupStatus): Slot[] {
 /**
  * First-run Setup gate (§8.2, D3). The installer ships no model weights, so on
  * first launch the required set — the RAM-fit LLM and the Parakeet STT model — is
- * downloaded once, verified, and cached. The app is blocked behind this screen
- * until both are present; thereafter Setup is skipped entirely. Missing models
- * start downloading automatically; a failed one shows a Retry.
+ * downloaded once, verified, and cached. Missing models start downloading
+ * automatically; a failed one shows a Retry.
+ *
+ * The downloads are not the last step: the note model's first load primes the
+ * prompt-prefix KV cache (§8.7), ~22s that would otherwise land on an apparently
+ * stalled main screen. So Setup holds for a third step, "Preparing note model…",
+ * until the model reports ready. The app is blocked behind this screen until all
+ * three finish; thereafter Setup is skipped entirely.
  */
 export default function SetupView({ onReady }: { onReady: () => void }) {
   const [status, setStatus] = useState<SetupStatus | null>(null);
+  // Third step: downloads are verified and we are waiting on the note model's load.
+  const [priming, setPriming] = useState(false);
   // Percent per download key (absent ⇒ not started); error message per key.
   const [progress, setProgress] = useState<Record<string, number>>({});
   const [errors, setErrors] = useState<Record<string, string>>({});
@@ -94,7 +104,9 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
               // Reached here only via a completed download → a genuine first-run
               // setup finish (§3 telemetry). Best-effort; never block the UI.
               void markSetupCompleted().catch(() => {});
-              onReady();
+              // onReady();
+              // Not done yet — hand over to the priming step below.
+              setPriming(true);
             }
           })
           .catch(() => {});
@@ -112,8 +124,41 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
     return () => {
       unlisten.then((fns) => fns.forEach((fn) => fn()));
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
+
+  // Third step: load + prime the note model (§8.2 preload, §8.7 prefix cache) and
+  // hold the screen until it reports in. Usually the app's own `frontend_ready` at
+  // mount fired before the weights existed and failed, which re-arms the backend
+  // gate, so this is the call that actually loads them.
+  useEffect(() => {
+    if (!priming) return;
+    let settled = false;
+    const finish = () => {
+      if (settled) return;
+      settled = true;
+      onReady();
+    };
+    const unlisten = onLlmStatus((p) => {
+      // On `error`, release anyway rather than trapping the doctor on Setup — the
+      // main screen already surfaces a failed note model.
+      if (p.status === "ready" || p.status === "error") finish();
+    }).then((fn) => {
+      // Started only once the listener is attached, so a fast load can't land first.
+      void frontendReady().catch(finish);
+      // The gate is one-shot on success: if the mount-time preload already loaded the
+      // model (weights present, only STT was missing), no `llm-status` is coming.
+      void getLlmStatus()
+        .then((s) => {
+          if (s === "ready") finish();
+        })
+        .catch(finish);
+      return fn;
+    });
+    return () => {
+      unlisten.then((fn) => fn());
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [priming]);
 
   const slots = status ? slotsFor(status) : [];
 
@@ -166,6 +211,19 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
               </li>
             );
           })}
+          {priming && (
+            <li className="flex flex-col gap-1">
+              <div className="flex items-center justify-between text-sm">
+                <span className="font-medium text-neutral-200">Preparing note model…</span>
+                <span className="text-neutral-400">One moment</span>
+              </div>
+              {/* No percentage: the backend reports only loading → ready, so an
+                  indeterminate bar is the honest rendering of a ~22s prime. */}
+              <div className="h-1.5 w-full overflow-hidden rounded-full bg-neutral-800">
+                <div className="h-full w-1/3 animate-pulse rounded-full bg-teal-500" />
+              </div>
+            </li>
+          )}
         </ul>
       </div>
     </div>
