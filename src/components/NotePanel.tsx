@@ -1,3 +1,4 @@
+import { useState } from "react";
 import {
   cancelGeneration,
   generateNote,
@@ -26,6 +27,16 @@ export default function NotePanel() {
 
   const llmStatus = useAppStore((s) => s.llmStatus);
 
+  // Backend flips state to IDLE before generate/revert resolves, so `active` is
+  // briefly the stale note; this spans click → refresh landed to hold Copy off.
+  // A count, not a boolean: with overlapping runs the first to finish would
+  // otherwise re-enable Copy while a later one is still swapping the note.
+  // const [syncing, setSyncing] = useState(false);
+  const [syncing, setSyncing] = useState(0);
+  // Set when a refresh failed: the editor is showing a note the backend has
+  // already superseded, so Copy stays off until a refresh lands.
+  const [stale, setStale] = useState(false);
+
   const generating = recordingState === "GENERATING";
   const active = notes.find((n) => n.is_active) ?? notes[0] ?? null;
   // Hold Generate while the co-resident preload is still warming the model (§8.2
@@ -34,21 +45,39 @@ export default function NotePanel() {
   const modelWarming = llmStatus === "loading";
   const ready = recordId !== null && !generating && !modelWarming;
 
-  const refresh = () =>
-    recordId &&
-    listNotes(recordId)
-      .then(setNotes)
-      .catch((e) => pushToast(String(e), "error"));
+  // A swallowed failure used to resolve the caller's await and clear the Copy
+  // gate over a note the editor never reloaded, so failure is now recorded and
+  // rethrown for the caller to toast. A later successful refresh clears it —
+  // holding Copy off forever would just trade one wrong behaviour for another.
+  // const refresh = () =>
+  //   recordId &&
+  //   listNotes(recordId)
+  //     .then(setNotes)
+  //     .catch((e) => pushToast(String(e), "error"));
+  const refresh = async () => {
+    if (!recordId) return;
+    try {
+      setNotes(await listNotes(recordId));
+      setStale(false);
+    } catch (e) {
+      setStale(true);
+      throw e;
+    }
+  };
 
   const onGenerate = async () => {
     if (!recordId) return;
     setStreamingNote("");
+    setSyncing((n) => n + 1);
     try {
       // Regenerate once a note exists; both create a new retained active version.
       const id = await (active ? regenerateNote : generateNote)(recordId);
       if (id) await refresh(); // a cancelled run resolves null — keep the prior note
     } catch (e) {
       pushToast(String(e), "error");
+    } finally {
+      // `finally` so a thrown error cannot wedge Copy off permanently.
+      setSyncing((n) => n - 1);
     }
   };
 
@@ -56,11 +85,14 @@ export default function NotePanel() {
 
   const onRevert = async (noteId: string) => {
     if (!recordId) return;
+    setSyncing((n) => n + 1);
     try {
       await revertVersion(recordId, noteId);
       await refresh();
     } catch (e) {
       pushToast(String(e), "error");
+    } finally {
+      setSyncing((n) => n - 1);
     }
   };
 
@@ -98,7 +130,7 @@ export default function NotePanel() {
         </pre>
       ) : active ? (
         <>
-          <SoapEditor note={active} />
+          <SoapEditor note={active} busy={generating || syncing > 0 || stale} />
           {notes.length > 1 && (
             <div className="flex flex-col gap-1">
               <span className="text-xs font-semibold uppercase tracking-wide text-neutral-500">

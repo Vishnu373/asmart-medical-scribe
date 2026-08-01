@@ -14,7 +14,6 @@ import type {
   RecordSummary,
   Settings,
   SetupStatus,
-  SoapSection,
   // TrialStatus,
 } from "@/bridge/types";
 
@@ -149,10 +148,6 @@ export function downloadStt(): Promise<void> {
 /** Copy a SOAP section's plain text to the clipboard for manual EMR paste (F7 interim). */
 export function copyToClipboard(text: string): Promise<void> {
   return invoke("copy_to_clipboard", { text });
-}
-
-export function pasteSection(recordId: string, section: SoapSection): Promise<void> {
-  return invoke("paste_section", { recordId, section });
 }
 
 // — Feedback (§10.3). Doctor-typed "report a problem" text, routed through the

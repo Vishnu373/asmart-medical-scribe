@@ -56,6 +56,54 @@ describe("NotePanel", () => {
     expect(mockInvoke).toHaveBeenCalledWith("cancel_generation");
   });
 
+  // §F2: state flips to IDLE before regenerate resolves, so Copy must stay off
+  // until the refreshed note list lands — otherwise it copies the stale version.
+  it("disables Copy until the post-generate list_notes refresh lands", async () => {
+    let resolveGen!: (id: string) => void;
+    let resolveList!: (notes: Note[]) => void;
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "regenerate_note":
+          return new Promise((r) => (resolveGen = r as (id: string) => void));
+        case "list_notes":
+          return new Promise((r) => (resolveList = r as (notes: Note[]) => void));
+        default:
+          return Promise.resolve(null);
+      }
+    });
+    useAppStore.setState({ notes: [note("n1", true)] });
+    render(<NotePanel />);
+
+    const copy = screen.getByRole("button", { name: "Copy" });
+    expect(copy).toBeEnabled();
+
+    await userEvent.click(screen.getByRole("button", { name: "Regenerate" }));
+    expect(copy).toBeDisabled();
+
+    resolveGen("n2");
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("list_notes", { recordId: "r1" }));
+    expect(copy).toBeDisabled(); // refresh still in flight — note is still n1
+
+    resolveList([note("n2", true)]);
+    await waitFor(() => expect(screen.getByRole("button", { name: "Copy" })).toBeEnabled());
+  });
+
+  // A failed refresh leaves the editor on the superseded note, so Copy must not
+  // come back just because the generate itself succeeded.
+  it("keeps Copy off when the post-generate refresh fails", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "regenerate_note") return Promise.resolve("n2");
+      if (cmd === "list_notes") return Promise.reject(new Error("db locked"));
+      return Promise.resolve(null);
+    });
+    useAppStore.setState({ notes: [note("n1", true)] });
+    render(<NotePanel />);
+
+    await userEvent.click(screen.getByRole("button", { name: "Regenerate" }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("list_notes", { recordId: "r1" }));
+    expect(screen.getByRole("button", { name: "Copy" })).toBeDisabled();
+  });
+
   it("reverts to an earlier version via revert_version", async () => {
     useAppStore.setState({ notes: [note("n2", true), note("n1", false)] });
     render(<NotePanel />);

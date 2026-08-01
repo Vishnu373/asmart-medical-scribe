@@ -7,8 +7,6 @@
     "core:default",
     "updater:default",
     "process:default",
-    "global-shortcut:default",
-    "clipboard-manager:allow-read-text",
     "clipboard-manager:allow-write-text"
   ]
 }

@@ -45,12 +45,6 @@ describe("command wrappers call invoke with the right name and args", () => {
 
     await cmd.revertVersion("r1", "n2");
     expect(mockInvoke).toHaveBeenCalledWith("revert_version", { recordId: "r1", noteId: "n2" });
-
-    await cmd.pasteSection("r1", "subjective");
-    expect(mockInvoke).toHaveBeenCalledWith("paste_section", {
-      recordId: "r1",
-      section: "subjective",
-    });
   });
 
   it("record + settings commands", async () => {

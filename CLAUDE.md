@@ -63,7 +63,7 @@ A recording is a state machine — **IDLE → RECORDING → PROCESSING → IDLE*
 - **`settings/`** — `settings.json` in the app data dir; `model_choice`, residency mode, cached total-RAM.
 
 ### Other backend modules
-- **`handoff/`** — EMR clipboard hand-off; per-section Copy in v1. The global paste-hotkey machinery (`paste_section`, `rebind_paste_hotkey`) is present but **dormant** — no shortcut is registered at startup.
+- **`handoff/`** — EMR clipboard hand-off; a single `copy_to_clipboard` command behind the note's Copy button. The global paste-hotkey machinery (`paste_section`, `rebind_paste_hotkey`, the overlay, the simulated Ctrl+V) has been **withdrawn and removed**, along with the global-shortcut plugin and the clipboard read permission.
 - **`telemetry/`** — opt-in crash reporting, compiled out unless the `crash-reporting` cargo feature + a DSN are present (offline by default). `bun run release` builds with this feature.
 - **`trial/`** — compiled-in beta expiry, **removed**: `trial.rs` and `ExpiredView.tsx` are still on disk but no longer wired in (`mod trial` and the `trial_status` command are commented out). The app never expires.
 

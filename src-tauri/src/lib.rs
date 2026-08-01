@@ -58,7 +58,6 @@ pub fn run() {
                 .level_for(env!("CARGO_CRATE_NAME"), log::LevelFilter::Info)
                 .build(),
         )
-        .plugin(tauri_plugin_global_shortcut::Builder::new().build())
         .plugin(tauri_plugin_clipboard_manager::init())
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
@@ -201,8 +200,6 @@ pub fn run() {
             models::download_llm,
             models::setup_status,
             models::download_stt,
-            handoff::paste_section,
-            handoff::rebind_paste_hotkey,
             handoff::copy_to_clipboard,
         ])
         .build(tauri::generate_context!())

@@ -1,7 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import { copyToClipboard, updateNote, type Note } from "@/bridge";
 import { useAppStore } from "@/state";
-import { stripMarkdown } from "@/lib/soap";
+import { toPlainText } from "@/lib/soap";
 import { useAutoGrow } from "@/hooks/useAutoGrow";
 import Markdown from "@/components/Markdown";
 
@@ -15,9 +15,10 @@ type Mode = "preview" | "edit";
  * formatted, read-only HTML (the default — clinicians read far more than they
  * edit); Edit drops back to the raw textarea, debounce-saved verbatim via
  * `update_note`. A pending save is flushed on unmount or when the note switches
- * (regenerate / revert) so the last edit is never lost.
+ * (regenerate / revert) so the last edit is never lost. `busy` holds Copy off
+ * while a regenerate/revert is in flight, when `note` is still the old version.
  */
-export default function SoapEditor({ note }: { note: Note }) {
+export default function SoapEditor({ note, busy }: { note: Note; busy?: boolean }) {
   const pushToast = useAppStore((s) => s.pushToast);
   const [text, setText] = useState(note.soap_data);
   const [mode, setMode] = useState<Mode>("preview");
@@ -31,12 +32,19 @@ export default function SoapEditor({ note }: { note: Note }) {
   const timer = useRef<ReturnType<typeof setTimeout> | null>(null);
   const pending = useRef<{ id: string; data: string } | null>(null);
 
-  const flush = () => {
+  // Resolves false when the save failed, so `onCopy` can await it and hold the
+  // clipboard back; fire-and-forget only guaranteed the write was *started*.
+  const flush = async () => {
     if (timer.current) clearTimeout(timer.current);
-    if (pending.current) {
-      const { id, data } = pending.current;
-      pending.current = null;
-      updateNote(id, data).catch((e) => pushToast(String(e), "error"));
+    if (!pending.current) return true;
+    const { id, data } = pending.current;
+    pending.current = null;
+    try {
+      await updateNote(id, data);
+      return true;
+    } catch (e) {
+      pushToast(String(e), "error");
+      return false;
     }
   };
 
@@ -51,8 +59,9 @@ export default function SoapEditor({ note }: { note: Note }) {
   // Flush on unmount (e.g. switching views) rather than dropping the timer.
   // `flush` is intentionally not a dep: it is rebuilt every render, so depending on
   // it would tear down and re-run this effect — flushing constantly, not on unmount.
+  // `void`: the component is going away, so there is no one left to await the save.
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  useEffect(() => flush, []);
+  useEffect(() => () => void flush(), []);
 
   const onEdit = (value: string) => {
     setText(value);
@@ -62,11 +71,14 @@ export default function SoapEditor({ note }: { note: Note }) {
   };
 
   // Manual EMR hand-off (F7): copy the whole note so the clinician can paste it
-  // into the EMR with Ctrl+V. Copies the live editor value (unsaved edits
-  // included), with markdown stripped to plain text so it matches the dormant
-  // native paste path byte-for-byte (§8.6).
-  const onCopy = () => {
-    const out = stripMarkdown(text);
+  // into the EMR with Ctrl+V. Copies the live editor value rendered to plain
+  // text — what Preview shows, minus the markdown. Flush first so a copy made
+  // inside the debounce window can't hand over text the DB doesn't have yet.
+  const onCopy = async () => {
+    // A failed save already toasted; copying anyway would put text on the
+    // clipboard that the record does not have.
+    if (!(await flush())) return;
+    const out = toPlainText(text);
     if (!out) return;
     copyToClipboard(out)
       .then(() => pushToast("Note copied", "info"))
@@ -99,7 +111,7 @@ export default function SoapEditor({ note }: { note: Note }) {
         <button
           type="button"
           onClick={onCopy}
-          disabled={!text.trim()}
+          disabled={busy || !text.trim()}
           className="rounded border border-neutral-700 px-2 py-0.5 text-xs hover:bg-neutral-800 disabled:opacity-40"
         >
           Copy

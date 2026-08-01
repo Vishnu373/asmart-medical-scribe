@@ -665,7 +665,7 @@ The backend owns all state; commands are requests, and state guards reject illeg
 | Notes | `generate_note`, `regenerate_note`, `cancel_generation`, `update_note`, `revert_version` | Produce/edit/cancel notes; flip the active version (§8.4–8.5) |
 | Records | `list_records`, `open_record`, `delete_record` | Saved-encounter browsing (FR-13); `delete_record` is permanent (NFR-9) |
 | Settings | `get_settings`, `update_settings` | Read/patch the JSON store, including mic device |
-| Hand-off | `copy_to_clipboard` | Copy a SOAP section's plain text to the clipboard for manual paste into the EMR. `paste_section` (one-key hotkey paste) is built but dormant, reserved for the deferred overlay (§13) |
+| Hand-off | `copy_to_clipboard` | Copy the note's plain text to the clipboard for manual paste into the EMR. The one-key hotkey paste (`paste_section`, no-activate overlay) has been **withdrawn** — the command, the global-shortcut plugin and the clipboard *read* permission are all removed |
 
 ### 9.5 Tauri events (backend → UI `emit`)
 
@@ -787,7 +787,7 @@ Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), w
 
 - **Audio:** discarded immediately after each segment is transcribed; never persisted (NFR-9, §8.5).
 - **Transcripts & notes:** retained encrypted until the doctor deletes them; **deletion is permanent** — no recycle bin, no cloud copy (NFR-9).
-- **Clipboard:** EMR hand-off places a section on the system clipboard, which is **auto-cleared a few seconds after paste**, limiting how long PHI lingers in a shared buffer.
+- **Clipboard:** the note's Copy button places text on the system clipboard, where it stays until the clinician copies something else — **there is no auto-clear**. The timed wipe belonged to the withdrawn hotkey hand-off, where the app knew when the paste had landed; on a manual copy it could clear the text before the doctor pastes it.
 
 ### 10.5 Compliance posture (PHIPA/PIPEDA)
 

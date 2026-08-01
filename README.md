@@ -22,7 +22,7 @@ Built with **Tauri 2** (Rust backend + React / TypeScript frontend), fully offli
 - 🎙️ **Records & transcribes** a consult locally — no cloud, no PHI egress.
 - 📝 **Generates a SOAP note** from the transcript with an on-device LLM.
 - 🔒 **Encrypts everything at rest** (SQLCipher; key sealed by Windows DPAPI).
-- 📋 **Hands off to your EMR** — paste any SOAP section into the focused field via a global hotkey.
+- 📋 **Hands off to your EMR** — copy the note to the clipboard and paste it straight into your EMR.
 
 ---
 

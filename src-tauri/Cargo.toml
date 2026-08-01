@@ -56,10 +56,8 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # server, no network. Compiles native code via cmake + a C/C++ toolchain on the
 # Windows build host (no CUDA/Metal features).
 llama-cpp-2 = "0.1.150"
-# EMR hand-off (§8.6, B11): global paste hotkey + clipboard. The keystroke (Ctrl+V)
-# is delivered via Win32 SendInput through the `windows` crate below — no input-sim
-# dependency. The no-activate overlay *window* is created on the frontend (F7).
-tauri-plugin-global-shortcut = "2"
+# EMR hand-off: the note's Copy button writes the whole note to the system
+# clipboard. The §8.6 global-hotkey hand-off was withdrawn — no keystroke injection.
 tauri-plugin-clipboard-manager = "2"
 # Optional-model download (§8.2, D1): the lightest LLM tier (Phi-3.5 Q4) is not
 # bundled — it's fetched on explicit doctor request. `ureq` is a small, pure-Rust
@@ -84,13 +82,11 @@ tauri-plugin-process = "2"
 default = []
 crash-reporting = ["dep:sentry"]
 
-# Windows DPAPI for wrapping the DB key (design §10.1); the keyboard feature backs
-# the §8.6 Ctrl+V paste via SendInput.
+# Windows DPAPI for wrapping the DB key (design §10.1).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
-    "Win32_UI_Input_KeyboardAndMouse",
 ] }
 
 [dev-dependencies]

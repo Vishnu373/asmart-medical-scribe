@@ -1,5 +1,5 @@
 import { describe, it, expect, beforeEach, vi } from "vitest";
-import { render, screen, fireEvent, cleanup } from "@testing-library/react";
+import { render, screen, fireEvent, cleanup, waitFor } from "@testing-library/react";
 import { invoke } from "@tauri-apps/api/core";
 import SoapEditor from "@/components/SoapEditor";
 import type { Note } from "@/bridge";
@@ -50,7 +50,7 @@ describe("SoapEditor", () => {
     vi.useRealTimers();
   });
 
-  it("copies the whole note as plain text for manual paste", () => {
+  it("copies the whole note as plain text for manual paste", async () => {
     const md: Note = {
       ...note,
       soap_data:
@@ -60,12 +60,64 @@ describe("SoapEditor", () => {
     };
     render(<SoapEditor note={md} />);
     fireEvent.click(screen.getByRole("button", { name: "Copy" }));
-    expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
-      text:
-        "## Subjective\nPatient reports a sore throat for 3 days.\n\n" +
-        "## Objective\nTemp 38.1 C\nThroat erythematous\n\n" +
-        "## Assessment\n\n## Plan",
+    // Headers lose their `##`, bold is stripped, but `- ` bullets survive —
+    // a plain EMR textarea can't draw them the way Preview does.
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
+        text:
+          "Subjective\nPatient reports a sore throat for 3 days.\n\n" +
+          "Objective\n- Temp 38.1 C\n- Throat erythematous\n\n" +
+          "Assessment\n\nPlan",
+      }),
+    );
+    // Nothing was edited, so the flush must not have written to the DB.
+    expect(mockInvoke.mock.calls.map((c) => c[0])).toEqual(["copy_to_clipboard"]);
+  });
+
+  it("copies the edited text, not the note it was rendered with", async () => {
+    render(<SoapEditor note={note} />);
+    enterEdit();
+    fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
+      target: { value: "## Objective\n- **Temp 38.1 C**" },
     });
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await waitFor(() =>
+      expect(mockInvoke).toHaveBeenCalledWith("copy_to_clipboard", {
+        text: "Objective\n- Temp 38.1 C",
+      }),
+    );
+  });
+
+  it("saves a pending edit before copying it", async () => {
+    render(<SoapEditor note={note} />);
+    enterEdit();
+    const edited = note.soap_data + "\nfollow up";
+    fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
+      target: { value: edited },
+    });
+    // Copy lands inside the 600ms debounce window: the flush must beat it to the
+    // DB, or the clipboard hands over text no record has.
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await waitFor(() =>
+      expect(mockInvoke.mock.calls.map((c) => c[0])).toEqual(["update_note", "copy_to_clipboard"]),
+    );
+    expect(mockInvoke).toHaveBeenCalledWith("update_note", { id: "n1", soapData: edited });
+  });
+
+  // The save is awaited, not just issued first: if it fails, the clipboard must
+  // not end up holding text the record does not have.
+  it("does not copy when the pending save fails", async () => {
+    mockInvoke.mockImplementation((cmd: string) =>
+      cmd === "update_note" ? Promise.reject(new Error("db locked")) : Promise.resolve(null),
+    );
+    render(<SoapEditor note={note} />);
+    enterEdit();
+    fireEvent.change(screen.getByRole("textbox", { name: "SOAP note" }), {
+      target: { value: note.soap_data + "\nfollow up" },
+    });
+    fireEvent.click(screen.getByRole("button", { name: "Copy" }));
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("update_note", expect.anything()));
+    expect(mockInvoke).not.toHaveBeenCalledWith("copy_to_clipboard", expect.anything());
   });
 
   it("flushes a pending edit on unmount", () => {
