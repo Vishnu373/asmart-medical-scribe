@@ -4,6 +4,7 @@
 // Run after `tauri build`.
 
 import { existsSync, readdirSync, readFileSync, unlinkSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { join, dirname } from "node:path";
 import { fileURLToPath } from "node:url";
 import {
@@ -19,11 +20,25 @@ for (const [k, v] of Object.entries({ ACCOUNT_ID, ACCESS_KEY_ID, SECRET_ACCESS_K
 }
 
 const root = join(dirname(fileURLToPath(import.meta.url)), "..");
-const nsisDir = join(root, "src-tauri/target/release/bundle/nsis");
+
+// Builds land outside the project tree (C:\ms — see docs/setup.md), so ask cargo for
+// the real target dir instead of hardcoding it; stale pre-move installers still sit in
+// src-tauri/target/ and must never be picked up as a release.
+const targetDir = JSON.parse(
+  execFileSync("cargo", ["metadata", "--format-version", "1", "--no-deps"], {
+    cwd: join(root, "src-tauri"),
+    encoding: "utf8",
+    maxBuffer: 64 * 1024 * 1024,
+  }),
+).target_directory;
+
+// const nsisDir = join(root, "src-tauri/target/release/bundle/nsis");
+const nsisDir = join(targetDir, "release/bundle/nsis");
 // `bundle.targets: "all"` builds an MSI alongside the NSIS setup, in its own folder.
 // Only the NSIS pair is published (that's what latest.json points at), but both pile
 // up on disk across versions, so both are swept.
-const msiDir = join(root, "src-tauri/target/release/bundle/msi");
+// const msiDir = join(root, "src-tauri/target/release/bundle/msi");
+const msiDir = join(targetDir, "release/bundle/msi");
 // The updater manifest. Its bucket key is the endpoint `tauri.conf.json` polls, so
 // this is the object that actually publishes a release — the repo copy is only source.
 const manifestPath = join(root, "website/latest.json");

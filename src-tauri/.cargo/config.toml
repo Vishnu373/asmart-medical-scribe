@@ -1,2 +1,15 @@
 [env]
 MEDSCRIBE_CRASH_DSN = "https://7af2def58e6a44c4ab34c18abe20e21c@app.glitchtip.com/25588"
+
+# Build llama.cpp with Ninja, not the default Visual Studio generator: the latter
+# runs the nested vulkan-shaders-gen sub-project's configure/build/install steps
+# in parallel instead of in order, and they race (§8.8). Ninja needs cl.exe on
+# PATH — build from the Developer PowerShell / x64 Native Tools prompt.
+CMAKE_GENERATOR = "Ninja"
+
+# Build outside the project tree: Windows caps paths at 260 chars and the Vulkan
+# backend's vulkan-shaders-gen sub-build nests to ~294 under the default
+# `src-tauri/target/` (§8.8). A short root buys back the ~66 chars it needs.
+# Required, not a convenience — without it the build fails on path length.
+[build]
+target-dir = "C:/ms"

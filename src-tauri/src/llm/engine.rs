@@ -36,7 +36,7 @@ use super::prompt;
 /// LLM; it is downloaded once at first-run Setup (D3, `models`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmModel {
-    /// Gemma 3n E2B instruct, Unsloth dynamic Q4_K_XL (GGUF).
+    /// Gemma 4 E2B instruct, Unsloth dynamic Q4_K_XL (GGUF).
     Gemma,
 }
 
@@ -177,7 +177,10 @@ impl LlmEngine {
 
         info!("[LOAD] loading SLM: {file}"); // §10.3
         let t_load = Instant::now();
-        let params = LlamaModelParams::default(); // mmap default; CPU-only build
+        // let params = LlamaModelParams::default(); // mmap default; CPU-only build
+        // The default is n_gpu_layers = -1 (offload all), so with the Vulkan backend
+        // now compiled in it must be pinned to 0 until B3 makes the choice (§8.8).
+        let params = LlamaModelParams::default().with_n_gpu_layers(0);
         let model = LlamaModel::load_from_file(&self.backend, &path, &params).map_err(|e| {
             // §10.3 `[LOAD] SLM load failed: {e}` (both sinks). Sanitized: the llama.cpp
             // load error embeds the GGUF path (username = PII).

@@ -42,3 +42,6 @@ src-tauri/resources/models/*
 # Claude files
 .claude/
 CLAUDE.md
+
+# Codex files
+AGENTS.md

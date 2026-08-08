@@ -52,10 +52,14 @@ zeroize = "1"
 # One-time total-RAM probe driving the model-residency decision (§7, B9); also
 # the load-time available-RAM guard before the LLM loads (§8.4, B10).
 sysinfo = { version = "0.32", default-features = false, features = ["system"] }
-# In-process GGUF note generation (§8, B10). CPU-only llama.cpp binding — no
-# server, no network. Compiles native code via cmake + a C/C++ toolchain on the
-# Windows build host (no CUDA/Metal features).
-llama-cpp-2 = "0.1.150"
+# In-process GGUF note generation (§8, B10). No server, no network. Compiles
+# native code via cmake + a C/C++ toolchain on the Windows build host.
+# `vulkan` builds the driver-agnostic GPU backend into llama.cpp (§8.8) — it needs
+# the Vulkan SDK on the build host, and the loader is bundled in libs/. No CUDA or
+# ROCm: one backend covers every vendor. Version stays pinned — it is part of the
+# §8.7 KV blob filename, so bumping it invalidates every cached blob.
+# llama-cpp-2 = "0.1.150"   # pre-§8.8, CPU-only
+llama-cpp-2 = { version = "0.1.150", features = ["vulkan"] }
 # EMR hand-off: the note's Copy button writes the whole note to the system
 # clipboard. The §8.6 global-hotkey hand-off was withdrawn — no keystroke injection.
 tauri-plugin-clipboard-manager = "2"
@@ -82,11 +86,14 @@ tauri-plugin-process = "2"
 default = []
 crash-reporting = ["dep:sentry"]
 
-# Windows DPAPI for wrapping the DB key (design §10.1).
+# Windows DPAPI for wrapping the DB key (design §10.1); DXGI for enumerating
+# display adapters during GPU detection (§8.8, B3).
 [target.'cfg(windows)'.dependencies]
 windows = { version = "0.58", features = [
     "Win32_Foundation",
     "Win32_Security_Cryptography",
+    "Win32_Graphics_Dxgi",
+    "Win32_Graphics_Dxgi_Common",
 ] }
 
 [dev-dependencies]

@@ -35,7 +35,7 @@ This product lets the doctor focus on **one thing — treating the patient** —
 - Transcribe the conversation locally (speech-to-text).
 - Generate a structured **SOAP-R clinical note** from the transcript, fully on-device.
 - Keep the transcript locally so the doctor can revisit it; the doctor can delete transcripts at any time.
-- Run entirely on commodity clinician hardware: **Windows 11, 16 GB RAM or higher, no GPU (CPU-only inference)**.
+- Run entirely on commodity clinician hardware: **Windows 11, 16 GB RAM or higher**. CPU-only inference is the guaranteed baseline; where the machine has an integrated or discrete GPU, note generation uses it (§8.8).
 
 ### Non-goals (explicitly out of scope for v1)
 
@@ -45,7 +45,7 @@ This product lets the doctor focus on **one thing — treating the patient** —
 
 ### Key assumptions & constraints
 
-- Target hardware: **Windows 11, 16 GB RAM or higher, CPU-only**. This is the binding constraint on model selection and on whether transcription is real-time vs. post-encounter.
+- Target hardware: **Windows 11, 16 GB RAM or higher, CPU-only**. This is the binding constraint on model selection and on whether transcription is real-time vs. post-encounter. A GPU is **never assumed** — when one is present it accelerates note generation (§8.8), but nothing in the design depends on it.
 - In-person capture uses a **single microphone** picking up both doctor and patient in the same room.
 - **Human-in-the-loop:** the doctor reviews and edits every note; the tool never auto-files anything.
 - **Audio is processed, not permanently retained**; the **transcript is retained locally** until the doctor deletes it.
@@ -83,7 +83,7 @@ The system works like a dictation tool tuned for a clinical visit. While the doc
 
 ## 3. Non-Functional Requirements
 
-All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or higher, **CPU-only, no GPU**. Numbers are design targets to validate during benchmarking, not guarantees, given on-device model variability.
+All targets are for the **binding hardware profile**: Windows 11, 16 GB RAM or higher, **CPU-only, no GPU**. Numbers are design targets to validate during benchmarking, not guarantees, given on-device model variability. GPU acceleration (§8.8) is **upside, not a new floor** — every target below must hold on a machine with no usable GPU.
 
 | # | Requirement | Target | Rationale |
 |---|------------|--------|-----------|
@@ -396,11 +396,21 @@ The model is **not** unloaded here in v1 — it is left warm, and the idle-watch
 
 ## 7. Model Residency Strategy
 
-The application runs two models on the same machine: the speech-to-text model used during recording, and the note-generation (LLM) model used after recording stops. Both are sizable, CPU-only, and resident in RAM while in use.
+The application runs two models on the same machine: the speech-to-text model used during recording, and the note-generation (LLM) model used after recording stops. Both are sizable and resident while in use. STT is always on the CPU (ONNX); the LLM runs on a GPU when one is available (§8.8).
 
 **Co-residency, always.** With a single small note model (§8.2), both models stay warm in RAM **at the same time** for the life of the session — no swapping, no per-device mode decision. The single ~3.2 GB Gemma model alongside the STT model fits comfortably on the target hardware, so the hand-off from transcription to note generation is instantaneous.
 
 This assumes a **16 GB (or higher) machine** — the binding hardware profile (§2). Co-residency keeps a real buffer for the app, webview, OS, and the clinician's other applications on such a device; smaller machines are out of scope for now.
+
+**Where the LLM's ~3.2 GB actually sits** depends on the backend chosen at load (§8.8), and only the discrete case changes the budget:
+
+| Backend | LLM weights + KV live in | Effect on the §7 system-RAM budget |
+|---------|--------------------------|-------------------------------------|
+| Discrete GPU | VRAM | **Frees ~3.2 GB of system RAM** — the budget gets easier |
+| Integrated GPU | System RAM (shared with the CPU) | **Unchanged** — the iGPU allocates from the same pool |
+| CPU | System RAM | Unchanged — the baseline this section was written against |
+
+The budget above is therefore stated for the worst case (CPU or iGPU). A discrete GPU only ever adds headroom, so no separate accounting is needed.
 
 ---
 
@@ -441,14 +451,14 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 |-------|-------|--------------|
 | `gemma-4-E2B-it-UD-Q4_K_XL` | Q4_K_XL (Unsloth dynamic) | 3.18 GB |
 
-**Execution model.** The GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6).
+**Execution model.** The GGUF model runs **in-process** inside the Rust backend via the `llama-cpp-2` binding to llama.cpp — no separate inference server, no external process, and no network calls. This keeps all note generation fully on-device, satisfying the zero-egress requirement (NFR-6). The compute backend — discrete GPU, integrated GPU, or CPU — is chosen automatically at load time; see **§8.8**.
 
 **Model distribution & first-run setup.** The installer ships **no** model weights — it carries only the application (and the small VAD model), keeping the download lean. The models the app needs are fetched **once, on first launch**, through a one-time **Setup** step, then cached on disk and reused every launch — fully offline thereafter (matching the STT lifecycle in §6.4). Setup now downloads exactly two files: the **single Gemma note model** and the **Parakeet STT model**. There is no longer any "download another tier later" affordance.
 
 - **Gated until ready.** On launch the app checks whether the required models are present; if not, it shows the Setup screen and does not proceed into recording/generation until both are downloaded and verified. Once present, Setup is skipped entirely.
 - **Integrity-checked.** Each download is verified against a known SHA-256 checksum before it is accepted, so a corrupted or truncated transfer is rejected rather than loaded.
 - **Not PHI egress.** These are model-weight downloads on first run, the only outbound network calls in the app; no patient data ever crosses the device boundary (NFR-6). After Setup the app runs with no network dependency for core function.
-- **Primes the prefix KV before handing over.** Once both downloads verify, Setup performs one further step in-app: load the models, prefill the fixed prompt prefix, and write the KV blob to disk (§8.7). It is shown as its own "Preparing note model…" step because it takes ~22s, and the models are **left loaded** afterwards so the clinician's first session starts immediately. Every later launch reads the blob instead (~0.01s). Mechanically this is the ordinary co-resident preload (§8.2 startup fix), re-run: the preload gate fires once at window mount, which on a first run is *before* the weights exist, so that attempt fails and **re-arms** the gate; Setup triggers it again once both downloads verify, and waits on the same `llm-status` event the main screen uses.
+- **Detects the compute backend, then primes the prefix KV, before handing over.** Once both downloads verify, Setup performs two further steps in-app. First it settles the §8.8 backend question — discrete GPU, integrated GPU, or CPU — in a short-lived child process, and caches the answer; this must come *before* the load, since it decides where the model is loaded. Then it loads the models, prefills the fixed prompt prefix, and writes the KV blob(s) to disk (§8.7) — two of them on a GPU machine, CPU first. It is shown as its own "Preparing note model…" step because it takes ~22s, and the models are **left loaded** afterwards so the clinician's first session starts immediately. Every later launch reads the blob instead (~0.01s). Mechanically this is the ordinary co-resident preload (§8.2 startup fix), re-run: the preload gate fires once at window mount, which on a first run is *before* the weights exist, so that attempt fails and **re-arms** the gate; Setup triggers it again once both downloads verify, and waits on the same `llm-status` event the main screen uses.
 
 **Upgrade migration — delete the retired tier weights.** A device upgrading from a prior version still has the old GGUFs (`mistral.gguf`, `phi-q8.gguf`, `phi-q4.gguf`) in its app-data models dir — several GB that will never be loaded again. On first launch of v0.1.2 the app **deletes any of these that exist** from the writable models dir (the bundled resource dir is read-only and carries none), reclaiming the disk. The deletion is best-effort and idempotent: a missing file is a no-op, a failed unlink is logged and does not block startup.
 
@@ -576,13 +586,15 @@ The few-shot prompt (§8.3) puts a large, **byte-identical prefix** in front of 
 **Staleness is handled by the filename, not by a version check.** The blob is a raw llama.cpp memory dump with no internal version tag, so there is nothing to compare. Instead the file *name* encodes everything the bytes depend on:
 
 ```
-prefix_kv_<gguf file name>_<sha256 of prompt::prefix()[..8]>_<llama-cpp-sys-2 version>.bin
+prefix_kv_<gguf file name>_<sha256 of prompt::prefix()[..8]>_<llama-cpp-sys-2 version>_<cpu|igpu|dgpu>.bin
 ```
 
 A changed prompt or a changed inference build therefore looks for a name that does not exist. "Stale" collapses into "absent", which is already the fallback path — no comparison logic, no migration step, nothing to remember at release time.
 
+The trailing **backend suffix** (§8.8) names the compute backend the blob was computed on. It is not a correctness key — the bytes are portable across backends so long as the context parameters are identical, which they are — but it makes a machine's history readable from a directory listing or a support log, and it forecloses a future per-backend context tweak silently reusing a mismatched blob.
+
 - **The version string comes from `Cargo.lock`, read by `build.rs` at compile time** and baked into the binary. It must not be hand-maintained and must not come from `Cargo.toml`: the manifest carries a **range** (`"0.1.122"` means `>=0.1.122, <0.2.0`) and had in fact already drifted — the lockfile resolves to 0.1.150. Only the lockfile states what is actually compiled in. It cannot be read at runtime because it is a source file and is not shipped in the installer.
-- **Superseded blobs are deleted** whenever the current blob is established — after a new one is written, and again after an existing one is read back on load, since a launch that restores from disk never re-primes and would otherwise leave the orphan forever. A prompt edit or a dependency bump therefore does not leave 16.5 MB orphans accumulating in app-data across updates.
+- **Exactly two blobs are kept; everything else is deleted** whenever the current blob is established — after a new one is written, and again after an existing one is read back on load, since a launch that restores from disk never re-primes and would otherwise leave the orphan forever. The two survivors are the **active backend's** blob and the **CPU** blob, which a GPU machine keeps as the standing safety net for the §8.8 stale-cache path. Everything else goes: an older prompt hash, an older `llama-cpp-sys-2` version, or the other GPU flavour. A prompt edit or a dependency bump therefore does not leave 16.5 MB orphans accumulating in app-data across updates. On a CPU-only machine the two collapse into one — the active blob *is* the CPU blob — so nothing changes from prior behaviour there.
 - **The blob is written atomically** — to a sibling `.tmp`, then renamed into place. A re-prime writes the *same* filename as the existing blob, and a direct write truncates it first, so an interrupted write would leave a short blob under the correct name. That file reads back cleanly, which would make the restore path succeed, skip the prefill, and then silently fail to apply — a permanent slow path reported in the log as a successful restore. The rename makes the real name hold either the whole previous blob or the whole new one.
 - **A too-short state is rejected on both sides.** `state_seq_get_data_ext` reports a byte count with no error channel and returns 0 on internal failure, so the serialize step is checked against a floor (64 KiB, against a real ~16.5 MB state) before anything is written, and the read side applies the same floor to the file. This is the one case the atomic write cannot cover: the bytes are short *before* they are handed to the writer, so writing them atomically only makes a bad blob permanent. Rejecting instead re-primes, which also overwrites the bad file.
 
@@ -592,13 +604,103 @@ A changed prompt or a changed inference build therefore looks for a name that do
 
 | Path | Primes when | Model afterwards |
 | --- | --- | --- |
-| **Fresh install** | In-app Setup (§8.2), immediately after the model downloads finish, as a visible "Preparing …" step | **Stays loaded.** Setup is already inside the running app, so unloading would only pay the model load twice. Both engines are warm and the clinician can start the first session right away. |
-| **Update that bumps `llama-cpp-sys-2`** | The installer runs `asmart-medical-scribe.exe --prime-kv` as a post-install step — a short-lived headless process that loads the model, primes, writes the blob, and exits | **Released with the process.** Priming happens while the installer is still on screen and the app is not running, so the ~3 GB has the machine to itself with no co-residency pressure (§7). The app then launches normally and hits the 3.5s path. |
+| **Fresh install** | In-app Setup (§8.2), immediately after the model downloads finish and the §8.8 detection has settled, as a visible "Preparing …" step | **Stays loaded.** Setup is already inside the running app, so unloading would only pay the model load twice. Both engines are warm and the clinician can start the first session right away. |
+| **Update that bumps `llama-cpp-sys-2`** | The installer runs `asmart-medical-scribe.exe --prime-kv` as a post-install step — a short-lived headless process that detects (§8.8), loads the model, primes, writes the blob, and exits | **Released with the process.** Priming happens while the installer is still on screen and the app is not running, so the ~3 GB has the machine to itself with no co-residency pressure (§7). The app then launches normally and hits the 3.5s path. |
 | **Every normal launch** | Never — the blob is read (~0.01s) | Loaded as today (§8.4) |
 
-`--prime-kv` exits in milliseconds when the correctly-named blob already exists, so an update that does *not* touch `llama-cpp-sys-2` costs nothing. It also no-ops on a fresh install, where the models have not been downloaded yet — that case is Setup's job.
+**A GPU machine primes twice, CPU first.** The CPU blob is not optional: §8.8's stale-cache recovery depends on it already being on disk, or the first session after a driver update pays the ~22s it was written to avoid. So on a machine that detected a GPU, the priming step computes the **CPU blob first (~22s), then the GPU blob (fast)** — and in that order specifically, because it leaves the model loaded on the GPU, which is where the session needs it. The reverse order would load the model three times instead of two. The whole cost lands inside Setup or the installer step, where the user is already waiting and no clinician is blocked; the deliberate trade is ~22 extra seconds of one-time setup on exactly the machines that were supposed to be fast, bought against a stall that would otherwise land mid-consult. A CPU-only machine primes once, as before.
+
+`--prime-kv` runs the §8.8 detection first, unless that machine's cached state is already `done` — the probe is what lets a machine whose driver has since been fixed recover its GPU, and a machine already on its GPU has nothing to gain from it. It then exits in milliseconds when the correctly-named blob already exists, so an update that changes neither `llama-cpp-sys-2` nor the detected backend costs nothing beyond the probe. Because the backend is part of the filename, a *changed* answer is self-detecting: the blob for the newly-chosen backend is simply absent, and the prime runs. It still no-ops on a fresh install, where the models have not been downloaded yet — that case is Setup's job.
 
 **The launch-time fallback stays.** If the installer step is skipped or fails, or the blob is absent for any other reason, the background preload thread (§8.4) primes exactly as it does today and writes the blob for next time. This is what keeps a failed install step from producing a permanently slow app; the cost is one launch showing "Preparing note model…" for ~22s, during which recording and transcription are unaffected and only Generate waits.
+
+### 8.8 GPU acceleration (Vulkan, with CPU fallback)
+
+Note generation is the slowest thing the app does. Most clinician laptops carry at least an integrated GPU, and the model is small enough (3.18 GB) to fit one entirely — so where a GPU with room to hold it exists, the LLM runs on it. **CPU remains the guaranteed baseline** (§3): nothing in the design depends on a GPU being present, and every machine without one behaves exactly as before.
+
+Scope is the **LLM only**. STT is ONNX, not llama.cpp, and stays on the CPU.
+
+**Backend — Vulkan only, compiled in.** llama.cpp is compiled with its Vulkan backend (`llama-cpp-sys-2`'s `vulkan` feature) into the single existing binary. Vulkan is the one backend that covers Intel, AMD, and NVIDIA — integrated and discrete — from one build, so the product keeps **one installer for every machine**. Vendor backends (CUDA, HIP, SYCL) are faster on their own hardware but would mean shipping several installers or a fat binary with a vendor runtime, which is the wrong trade for a clinic-laptop product. **This is a permanent scope decision, not a first step:** no vendor backend will be added later, which is what makes the packaging below simple enough to keep.
+
+**Ship it in the installer, do not download it.** LM Studio — the proven reference for this problem — builds each backend as a separately downloaded, separately versioned runtime pack, selected against the machine's hardware on first launch. That structure exists because it carries CUDA, ROCm, Vulkan and CPU variants across several vendors, at hundreds of MB each; per-machine download is the only way to avoid shipping all of it to everyone. With Vulkan as the only backend there is exactly **one package, identical on every machine**, so the download step has nothing to decide. It would add an R2 object to host and version, an app-vs-backend version match to get right, and a first-run failure mode — to save a fraction of a first run that already pulls 3.18 GB of weights. The backend therefore ships **inside the installer**, and the "which hardware" question moves to where it belongs: on the clinician's machine, once, at Setup.
+
+**What ships, and what the machine already has.** The Vulkan *runtime* is never ours to distribute — it is two pieces that arrive with the graphics driver: the loader (`vulkan-1.dll`) and the driver's own Vulkan implementation. We ship only llama.cpp built to *use* them.
+
+The one exception is the loader itself. It accompanies every Intel/AMD/NVIDIA driver, but a stripped Windows image, or a bare VM on the Basic Display Adapter, may lack it — and with Vulkan compiled in, an unresolvable import stops the process **before `main`**, so our own CPU fallback would never get to run. Delay-loading does not fix this: the MSVC delay-load helper raises an SEH exception that llama.cpp's C++ `catch` blocks do not intercept, so a missing loader would still be a hard crash rather than a `Result` the fallback can take. The loader is therefore **bundled app-locally** in `libs/` alongside the OpenSSL and MSVC runtime DLLs the installer already places next to the exe, where the exe-directory search finds it first. It is Apache-2.0 and redistributable. ICD discovery is registry-based and unaffected by where the loader sits, so on a machine with no GPU driver the bundled loader simply reports zero devices — a clean, catchable "no GPU" rather than a crash.
+
+**Detection — DXGI, and only ever once.** Adapters are enumerated through DXGI (the `windows` crate, already a dependency), which reports each adapter's real description string and its dedicated vs. shared video memory. That is what distinguishes a discrete GPU from an integrated one and what supplies the device **name for the log — never hardcoded**. Vulkan's own device enumeration cannot make that distinction reliably by name alone.
+
+Detection is **not** re-run per model load, per launch, or per session. It runs once, its answer is cached (below), and every subsequent launch reads that answer. Probing display adapters in front of a waiting clinician is exactly the latency this section exists to remove.
+
+**Selection order — dGPU → iGPU → CPU.** Discrete first: it has its own VRAM, so it is both faster and frees ~3.2 GB of system RAM against the §7 budget. Integrated second. CPU last.
+
+**Memory floor — 5 GB, applied to both GPU classes.** Priority alone is not enough: a 2 GB discrete card wins the ordering but cannot hold a 3.18 GB model, and the dangerous outcome is not a load failure (the fallback would catch that) but a **silent driver spill into system memory** — it loads, it runs, and generation is far slower than CPU while the log still reports a healthy dGPU. An adapter is therefore only eligible if it reports **≥ 5 GB**: 3.18 GB of weights plus context and working buffers, with enough margin that the driver never spills.
+
+The field read differs by class, and reading the wrong one silently disables the feature:
+
+| Class | Field checked | Why |
+|-------|---------------|-----|
+| Discrete | Dedicated video memory | Its own VRAM, the resource that actually constrains it |
+| Integrated | Shared system memory | It has no dedicated pool — dedicated reads as ~128 MB or less, so testing that field would fail **every** iGPU and disable the feature on exactly the laptops it targets |
+
+A discrete card below the floor does **not** jump to CPU — it is skipped and the chain continues, so a laptop with a 2 GB dGPU and an Intel iGPU lands on the iGPU. On the 16 GB target profile an iGPU reports ~8 GB shared and passes; an 8 GB machine reports ~4 GB and correctly falls to CPU, which is below the stated hardware profile anyway.
+
+**Offload — all layers.** Eligibility is already decided by the floor above, so there is no partial-offload heuristic and no per-device layer budget: it is `n_gpu_layers = all` or CPU.
+
+**No user control.** The decision is entirely automatic — no setting, no picker, no override, and no runtime-management screen of the kind LM Studio exposes. Clinicians are not the audience for a backend choice, and the fallback chain already handles every machine. The cached result (below) is a diagnostic record for the developer, not a doctor-facing setting (§9.3).
+
+**One decision point.** The backend is applied **inside `LlmEngine`**, not by its callers: the engine reads the cached `gpu.backend` and loads accordingly. Three separate paths construct an engine — normal launch, first-run Setup (§8.2), and the headless `--prime-kv` process (§8.7) — and if they could disagree, the installer would prime on one backend while the app ran on another, discarding the §8.7 head start on every update. Reading one cached value in one place makes agreement structural rather than something three call sites must remember. (`n_threads` is deliberately duplicated across these paths instead, because drift there only changes how fast a prime runs, never which backend produced it.)
+
+**When detection runs.** Never in a doctor's session, on the same principle as the §8.7 prime — and in the same two places, so the two steps stay adjacent and consistent:
+
+| Path | Detection runs | Order |
+| --- | --- | --- |
+| **Fresh install** | In-app Setup, **after** the model downloads verify and **before** the note model is loaded | Download → detect → load onto the chosen device → §8.7 blobs → done |
+| **Any update** | The headless post-install process (§8.7), immediately before it primes — **unless** the cached state is already `done`, which is skipped | Detect → load → prime → exit |
+| **Every normal launch** | Never — the cached answer is read from `settings.json` | Read choice → load there → read blob |
+
+Detection must precede the load, not follow it: its result decides *where* the model is loaded — VRAM, shared memory, or system RAM — so it cannot run afterwards.
+
+**The probe runs in an isolated process, never in the app.** Enumerating adapters and initialising Vulkan on an unknown driver is the one genuinely crash-prone step in this design, and a driver fault there is not a catchable error. On the update path that isolation is free — `--prime-kv` is already a short-lived headless process, and a fault there takes down a helper the user never sees while the installer carries on. For parity the Setup path runs detection the same way, as a short-lived child process rather than inside the running app. This is the one property worth borrowing from LM Studio's out-of-process engine, and it is affordable here precisely because it runs **once at setup** rather than on every generation.
+
+**The cached result** lives in the settings store (§9.3), not the clinical DB — it is machine configuration, carries no PHI, and must be writable by the headless installer process without unwrapping a DPAPI key:
+
+```json
+"gpu": { "state": "done", "backend": "igpu", "adapter": "Intel Arc Graphics", "memory_mb": 8192, "attempts": 1 }
+```
+
+| `state` | Meaning | `backend` |
+| --- | --- | --- |
+| `pending` | Never run, or invalidated and awaiting re-detection | — |
+| `done` | Ran; a GPU passed the floor | `dgpu` / `igpu` |
+| `unusable` | Ran correctly; the honest answer is no GPU — none present, no driver, or below the floor | `cpu` |
+| `failed` | The probe itself broke (driver fault, child process died) | `cpu` |
+
+`unusable` and `failed` are deliberately distinct: the first is a **supported configuration and a success**, and re-probing it every launch would be waste; the second is a machine that *has* a GPU we could not talk to, which is worth retrying and worth seeing in a support log. `attempts` bounds that retry — after three the machine settles on `cpu` and stops probing, so a device that faults on every probe cannot loop forever.
+
+**A `failed` machine is not written off forever.** A crashed probe usually means a broken driver, and drivers get fixed — so a machine capable of GPU inference would otherwise sit on CPU indefinitely with no route back. The recovery is free rather than a new mechanism: the update path re-probes and resets `attempts`, so every release gives such a machine a fresh chance, and one that Windows has since repaired quietly picks its GPU back up.
+
+**It re-probes only where there is something to gain.** `failed` (a GPU we could not reach), `unusable` (no GPU or no driver *at the time* — a driver installed since would change the answer) and `pending` are all re-probed. **`done` is skipped**: that machine is already on its GPU, a fresh probe cannot improve on it, and skipping keeps the common case paying nothing on update. The case this gives up — a `done` machine whose GPU has since broken — is already covered by the session-time load failure below, which falls back to CPU and resets the state to `pending`.
+
+That sets the retry rhythm deliberately: **never per launch** — probing is the crash-prone step and repeating it in front of the clinician is what this section exists to avoid — but **per update, for the machines it can help**, in a process that is both isolated (above) and already running. Re-probing on driver change instead would recover sooner, but the driver version is not exposed through DXGI and would need a separate registry read; that precision is not worth a new Windows dependency for a failure this rare.
+
+`adapter` and `memory_mb` drive no decision. They exist so a single settings file answers "what is this doctor actually running on" when slow generation is reported.
+
+**Nothing else is recorded.** Whether the models downloaded and whether a KV blob exists are both answerable from the filesystem — the files are present and checksum-clean, or they are not. Storing a status flag beside them creates a second source of truth that can disagree with the first (flag says done, file was deleted, app trusts the flag), so only the detection result — the one thing that cannot be re-derived without probing again — is persisted.
+
+**The cached answer can go stale, and the safety net is required.** The realistic case is not a user changing hardware — that means a reinstall, which re-runs Setup. It is **Windows updating the graphics driver underneath a working install**: a machine detected as `igpu` months ago can wake up genuinely unable to use it, and would then fail to load the model on every launch, forever, with no user-discoverable fix. So: if a load fails on the cached backend, that session falls back to CPU — using the CPU blob that §8.7 guarantees is already on disk, so no prime is paid in front of the clinician — and `state` is reset to `pending` so the next launch re-detects. The machine quietly settles into its new reality.
+
+The fallback therefore has **three** triggers, not one: no GPU found, a GPU found but ineligible or unusable, and a previously-good GPU that has since stopped working. The third is the one a setup-time-only check would miss.
+
+**Logging.** The `[GPU]` events are in the §10.3 catalog, **on-device only** — `{adapter}` is a device-identifying hardware string, and a machine without a usable GPU is a supported configuration rather than a failure worth reporting off-device.
+
+Every interpolated value is read at runtime: `{adapter}` and `{vram}` come from the DXGI adapter descriptor, and the dGPU/iGPU split comes from dedicated vs. shared video memory. **No device name, vendor string, or model is hardcoded anywhere**, and the classification must never be derived by matching vendor substrings.
+
+**Interaction with the prefix KV blob (§8.7).** Two changes there follow from this section, specified in full at §8.7 rather than repeated here: the blob's filename gains a **backend suffix**, and a GPU machine computes **two** blobs at setup — its own, plus a CPU one held as the safety net the stale-cache path above depends on.
+
+Note what does *not* motivate the suffix. The snapshot's layout is fixed by the model and the context parameters (`n_ctx`, KV cache types), not by the device that computed it; a CPU-computed prefix and a GPU-computed one differ only in floating-point rounding, far below anything that changes a note. One blob would in fact be valid across all three backends — **so long as the context parameters stay identical on every path**, which is a rule this design commits to. The suffix is carried for **operational legibility**: a support log or an app-data listing states outright what a machine ran on. That is worth the one extra prime, and it removes the standing hazard that a future per-backend context tweak silently invalidates a shared blob.
+
+**Build-host requirement.** The Vulkan SDK (for `glslc`, which compiles the backend's shaders) joins LLVM and CMake as a Windows build prerequisite — see `docs/setup.md`. It is a **build-time** dependency only; nothing extra ships to the clinician.
 
 ## 9. Data Model & Interfaces
 
@@ -653,6 +755,7 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 |-----|-----------|---------|
 | `vad_threshold` | internal | Fixed sensible default (§6.2) |
 | `idle_timeout` | internal | Auto-stop-on-silence default |
+| `gpu` | internal | Cached compute-backend decision (§8.8): `{ state, backend, adapter, memory_mb, attempts }`. Written once by the setup/installer detection step and read on every launch; never surfaced, never editable. It lives here rather than in the clinical DB because it is machine configuration with no PHI, and because the headless installer process must write it without unwrapping the DPAPI-protected DB key (§10.1) |
 
 ### 9.4 Tauri commands (UI → backend `invoke`)
 
@@ -723,7 +826,7 @@ Every event carries **no PHI** regardless of sink. Because NFR-6 concerns PHI eg
 
 #### Log event catalog
 
-Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
+Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
 
 | Event | On-device | Telemetry |
 | --- | :---: | :---: |
@@ -734,6 +837,14 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[PRIME]`, `[RECORD]`
 | `[LAUNCH] downloading SLM model {model_name}` | ✓ | ✓ |
 | `[LAUNCH] download SLM model failed {e}` | ✓ | ✓ |
 | `[LAUNCH] SLM model checksum mismatch` | ✓ | ✓ |
+| `[GPU] dGPU selected: {adapter} ({vram} MB dedicated) — offloading all layers` | ✓ | |
+| `[GPU] iGPU selected: {adapter} ({vram} MB shared) — offloading all layers` | ✓ | |
+| `[GPU] {adapter} skipped: {vram} MB below the {floor} MB floor` | ✓ | |
+| `[GPU] no compatible GPU detected — falling back to CPU inference` | ✓ | |
+| `[GPU] {adapter} found but Vulkan init failed ({e}) — falling back to CPU inference` | ✓ | |
+| `[GPU] detection probe failed (attempt {n}) — falling back to CPU inference` | ✓ | |
+| `[GPU] using cached backend: {backend}` | ✓ | |
+| `[GPU] load failed on cached backend {backend} — CPU for this session, re-detecting next launch` | ✓ | |
 | `[LOAD] loading STT model: {model_name}` | ✓ | |
 | `[LOAD] STT model load failed: {e}` | ✓ | ✓ |
 | `[LOAD] STT model loaded: {duration}s` | ✓ | |
@@ -781,7 +892,7 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[LOAD]`, `[PRIME]`, `[RECORD]`
 | `[CLOSE] application closed` | ✓ | |
 | `[DB] DPAPI key unwrap failed {error message}` | ✓ | ✓ |
 
-Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
+Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The `[GPU]` rows (§8.8) are **on-device only** for the same reason: `{adapter}` is a device-identifying hardware string. That includes the fallback and skip lines — a machine without a usable GPU is a supported configuration, not a failure, so there is nothing to report off-device. `{e}` on the Vulkan-init row is a sanitized driver error, held to the same bar as every other logged error. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
 
 ### 10.4 Data lifecycle
 
@@ -845,6 +956,7 @@ Items deliberately deferred from v1, to revisit once the core product is validat
 | **Fine-tuned models** | Note model fine-tuned on SOAP datasets for more consistent output | Few-shot prompting (§8.3) is a cheaper, reversible lever; no evidence yet that fine-tuning is needed |
 | **AI engineering for larger context** | Context-handling techniques (e.g. chunking, summarization, retrieval) for transcripts that exceed the model window | The model window far exceeds a realistic consult (§8.3), so the whole transcript fits in one prompt today; needed only for much longer inputs |
 | **Selectable alternate STT engine** | A user-selectable higher-accuracy / weaker-hardware STT option (e.g. a Whisper-family model) alongside the default Parakeet engine | A native-build constraint, not a product objection — see the note below. Parakeet (§6.4) covers EN+FR well, so a second engine is a refinement, not a v1 need |
+| **Runtime-loadable GPU backends (`GGML_BACKEND_DL`)** | Builds ggml's backends as separate DLLs (`ggml-vulkan.dll`, `ggml-cpu-*.dll`) loaded at runtime, so the executable carries no Vulkan import at all, an unloadable backend simply never registers, and the CPU path gains per-microarchitecture dispatch. This is the structure LM Studio ships | Available — `llama-cpp-2`'s `dynamic-backends` feature turns it on (`GGML_BACKEND_DL` + `GGML_CPU_ALL_VARIANTS`), so this is a real option, not a blocked one. Declined for v1 because it is an all-or-nothing mode switch for the **whole** engine: llama.cpp and the CPU backend also become loose DLLs, which trades one shipped artifact for ten, adds an exe-vs-backend version match to keep right, and turns a missing engine into a new class of field failure. §8.8 gets the degradation it needs from an app-local `vulkan-1.dll` instead. Revisit if the single-variant CPU build measures materially slower than per-microarchitecture dispatch, which is the one benefit `/DELAYLOAD`-style fixes cannot supply |
 
 The r2.dev base URL should later swap to a custom domain (production polish, tied to #10).
 

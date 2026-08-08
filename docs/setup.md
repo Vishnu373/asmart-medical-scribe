@@ -15,9 +15,10 @@ Install these first — the native build won't compile without them.
 | **OpenSSL** | Linked by the encrypted DB (SQLCipher) | [github.com/openssl/openssl](https://github.com/openssl/openssl) |
 | **LLVM (libclang)** | `bindgen` generates the LLM bindings | [llvm releases](https://github.com/llvm/llvm-project/releases/tag/llvmorg-22.1.0) |
 | **CMake ≥ 4.1** | Drives the LLM's C++ build | [cmake.org/download](https://cmake.org/download/#latest) |
+| **Vulkan SDK** | `glslc` compiles the LLM's GPU shaders | [vulkan.lunarg.com/sdk/home](https://vulkan.lunarg.com/sdk/home#windows) |
 | **Perl + NASM** | Build OpenSSL from source | [Strawberry Perl](https://strawberryperl.com/) · [NASM](https://www.nasm.us/) |
 
-> Set up the [Windows native dependencies](#-windows-native-dependencies) (OpenSSL, LLVM, CMake) **before** running or testing the app.
+> Set up the [Windows native dependencies](#-windows-native-dependencies) (OpenSSL, LLVM, CMake, Vulkan SDK) **before** running or testing the app.
 
 ---
 
@@ -65,6 +66,44 @@ setx LIBCLANG_PATH "C:\Program Files\LLVM\bin"
 This project requires **CMake ≥ 4.1** (older versions can't target the installed Visual Studio toolchain).
 
 > **Note:** Strawberry Perl ships its own older `cmake`. Make sure `C:\Program Files\CMake\bin` comes **above** `C:\Strawberry\c\bin` on your `PATH`, or the wrong `cmake` is picked up. Verify with `cmake --version`.
+
+### Vulkan SDK & the Ninja generator — for GPU note generation
+
+Note generation runs on the GPU via llama.cpp's Vulkan backend (design §8.8). The build needs the **Vulkan SDK** installed — `glslc` compiles the GPU shaders into the binary. Install it from [vulkan.lunarg.com](https://vulkan.lunarg.com/sdk/home#windows) and confirm `%VULKAN_SDK%` is set.
+
+> The runtime loader `vulkan-1.dll` is **not** in the SDK — the SDK ships only the link stub `Lib\vulkan-1.lib`. The loader lives in `C:\Windows\System32`, installed by your graphics driver, and a copy is committed to `src-tauri/libs/` so it ships with the app.
+
+**Build from the Developer PowerShell for VS** (or the x64 Native Tools Command Prompt) — **not** a plain PowerShell:
+
+```powershell
+Get-Command cl.exe, ninja.exe | Select-Object Name, Source   # both must resolve
+```
+
+`src-tauri/.cargo/config.toml` sets `CMAKE_GENERATOR = "Ninja"`, and Ninja finds the compiler via `PATH`, which only the developer shell sets up. Nothing to install — Ninja ships with the Visual Studio Build Tools.
+
+> **Why Ninja and not the default Visual Studio generator?** llama.cpp builds its shader compiler (`vulkan-shaders-gen`) as a nested CMake sub-project whose steps must run in order. Under the Visual Studio generator, parallel MSBuild starts those steps on different worker threads simultaneously — install before configure — and they race over the same directories. The build fails with a scatter of unrelated-looking errors (`MSB6003: link.exe could not be run`, `MSB1009: Project file does not exist`, `cannot find the batch label VCEnd`). Ninja sequences them correctly.
+
+### Build output directory — `C:\ms`
+
+Rust builds this project into **`C:\ms`**, not the usual `src-tauri/target/`. This is set in `src-tauri/.cargo/config.toml`, so it applies automatically — there is nothing to install or configure.
+
+It is **required, not a preference.** Windows caps a file path at 260 characters. The Vulkan backend builds its shader compiler (`vulkan-shaders-gen`) as a nested sub-project, and those paths reach **~294 characters** under the default `src-tauri/target/`. The build fails on path length before it can finish. A short root recovers the ~66 characters needed:
+
+| Target directory | Deepest build path | Result |
+| --- | --- | --- |
+| `src-tauri/target/` (default) | ~294 chars | ✗ exceeds the 260 limit |
+| `C:\ms` | ~228 chars | ✓ builds |
+
+> **Gotcha:** a `CARGO_TARGET_DIR` environment variable **overrides** this config file. If a build lands somewhere unexpected, check for a stale one:
+>
+> ```powershell
+> $env:CARGO_TARGET_DIR      # should print nothing
+> Remove-Item Env:CARGO_TARGET_DIR
+> ```
+>
+> Environment changes only reach newly-started terminals, so open a fresh one after removing it.
+
+`C:\ms` is disposable build cache — deleting it costs a full rebuild and nothing else. Clone the repo wherever you like; only the build output needs the short path.
 
 ---
 
@@ -208,7 +247,7 @@ $env:TAURI_SIGNING_PRIVATE_KEY_PASSWORD="<your-key-password>"
 bun run release
 ```
 
-Output lands in `src-tauri/target/release/bundle/nsis/`:
+Output lands in `C:\ms\release\bundle\nsis\` (see [Build output directory](#build-output-directory--cms) — **not** `src-tauri/target/`):
 
 ```
 asmart_medical_scribe_<version>_x64-setup.exe
