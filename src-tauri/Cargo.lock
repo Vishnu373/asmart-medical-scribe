@@ -166,6 +166,7 @@ dependencies = [
  "log",
  "natural",
  "once_cell",
+ "ort",
  "rand",
  "regex",
  "rubato",

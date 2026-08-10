@@ -32,6 +32,83 @@ use stt::SttEngine;
 /// `Duration::ZERO` disables the idle unload entirely for STT.
 const STT_IDLE_TIMEOUT: Duration = Duration::ZERO;
 
+/// Resolve the STT intra-op thread count: env override, else half the cached
+/// physical cores, probing and caching on first run. `None` = leave ORT alone,
+/// i.e. every session sizes its own pool (stock behaviour) — a machine we cannot
+/// measure gets the default, not a guess. See
+/// docs/implementation-stt-thread-management.md.
+fn stt_thread_count(settings: &mut Settings) -> Option<usize> {
+    if let Some(n) = std::env::var("STT_THREAD_COUNT")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|n| *n > 0)
+    {
+        log::info!("[STT] thread allocation override: {n} threads from STT_THREAD_COUNT");
+        return Some(n);
+    }
+
+    let cached = settings.physical_cores;
+    let physical = match cached {
+        Some(n) => n,
+        None => {
+            let n = sysinfo::System::new().physical_core_count()?;
+            settings.physical_cores = Some(n);
+            log::info!("[STT] thread allocated: {n} physical cores");
+            n
+        }
+    };
+
+    // Integer division floors, by decision: 7 cores → 3 threads, never 4.
+    // Derived once, here — the cache holds cores, not threads (§3.1).
+    let threads = (physical / 2).max(1);
+    if cached.is_some() {
+        log::info!("[STT] thread allocation cache hit: {threads} threads");
+    } else {
+        log::info!("[STT] thread allocation cached: {threads} threads");
+    }
+    Some(threads)
+}
+
+/// Size the ORT global thread pool. With a global pool set, `DisablePerSessionThreads`
+/// makes every ORT session — Parakeet's three and Silero's — draw from it instead of
+/// sizing its own to the physical core count.
+// Phase 1 (experiment): the count came from `ASMART_STT_THREADS` /
+// `ASMART_STT_INTER_THREADS`, and an unset var meant no pool at all. Both are now
+// resolved by `stt_thread_count` above.
+// fn init_ort_thread_pool() {
+//     let intra = std::env::var("ASMART_STT_THREADS")
+//         .ok()
+//         .and_then(|v| v.parse::<usize>().ok())
+//         .filter(|n| *n > 0);
+//     let Some(intra) = intra else { return };
+//
+//     let inter = std::env::var("ASMART_STT_INTER_THREADS")
+//         .ok()
+//         .and_then(|v| v.parse::<usize>().ok())
+//         .filter(|n| *n > 0)
+//         .unwrap_or(intra);
+fn init_ort_thread_pool(intra: usize) {
+    // Pinned to the intra count; `transcribe-rs` enables parallel execution, so leaving
+    // the inter-op pool uncapped would leak past the limit we just set.
+    let inter = intra;
+
+    let opts = match ort::environment::GlobalThreadPoolOptions::default()
+        .with_intra_threads(intra)
+        .and_then(|o| o.with_inter_threads(inter))
+    {
+        Ok(o) => o,
+        Err(e) => {
+            log::warn!("[STT] ORT thread pool config failed: {e}");
+            return;
+        }
+    };
+
+    // `false` means an ORT environment already existed and ours was ignored — logged
+    // rather than swallowed, or the allocation above is inert while looking applied.
+    let committed = ort::init().with_global_thread_pool(opts).commit();
+    log::info!("[STT] ORT global pool intra={intra} inter={inter} committed={committed}");
+}
+
 /// Builds and runs the Tauri application.
 pub fn run() {
     // Installer post-install step (§8.7): prime the prefix KV blob and exit without ever
@@ -62,6 +139,10 @@ pub fn run() {
         .plugin(tauri_plugin_updater::Builder::new().build())
         .plugin(tauri_plugin_process::init())
         .setup(|app| {
+            // Phase 1: the pool was sized here, first thing in setup. It now depends on
+            // settings, so the call moved below `Settings::load`.
+            // init_ort_thread_pool();
+
             log::info!(
                 "[LAUNCH] application started — v{}, {}",
                 env!("CARGO_PKG_VERSION"),
@@ -96,7 +177,29 @@ pub fn run() {
 
             // settings.json - user settings
             let settings_path = data_dir.join("settings.json");
-            let app_settings = Settings::load(&settings_path).map_err(|e| e.to_string())?;
+            let mut app_settings = Settings::load(&settings_path).map_err(|e| e.to_string())?;
+
+            // Must precede any ORT session (STT preload, SileroVad) — the environment is
+            // first-write-wins. May write `physical_cores` on first run, hence after the
+            // load and before the save.
+            let probed_before = app_settings.physical_cores;
+            if let Some(n) = stt_thread_count(&mut app_settings) {
+                init_ort_thread_pool(n);
+            }
+            // `SharedSettings::new` only wraps the value — it never writes. Without this the
+            // probed count stays in memory and every launch re-probes.
+            //
+            // Only the first run mutates the count, and only that one key is written back:
+            // a whole-struct save on every launch would overwrite a settings.json that
+            // `load` could not parse, taking mic_device and the gpu cache with it.
+            // if let Err(e) = app_settings.save(&settings_path) {
+            //     log::warn!("[STT] settings save failed (non-fatal): {e}");
+            // }
+            if app_settings.physical_cores != probed_before {
+                if let Err(e) = app_settings.patch_physical_cores(&settings_path) {
+                    log::warn!("[STT] settings save failed (non-fatal): {e}");
+                }
+            }
 
 
             // deleting old models - applications running v.0.1.1

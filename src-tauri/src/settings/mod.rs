@@ -23,6 +23,10 @@ pub struct Settings {
     pub idle_timeout: u32,
     /// Internal: cached GPU detection result (§8.8). Never doctor-facing.
     pub gpu: GpuSettings,
+    /// Internal: physical core count, probed once on first run and reused
+    /// thereafter. Raw hardware fact — the STT thread policy derives from it
+    /// at startup rather than being frozen here.
+    pub physical_cores: Option<usize>,
 }
 
 impl Default for Settings {
@@ -32,6 +36,7 @@ impl Default for Settings {
             vad_threshold: 0.5,
             idle_timeout: 30,
             gpu: GpuSettings::default(),
+            physical_cores: None,
         }
     }
 }
@@ -103,6 +108,31 @@ impl Settings {
         let json = serde_json::to_string_pretty(self).context("serialize settings")?;
         fs::write(path, json).context("write settings file")?;
         Ok(())
+    }
+
+    /// Writes only `physical_cores` back to `path`, leaving every other key on disk
+    /// byte-for-byte — including keys this build does not know about. A whole-struct
+    /// `save` cannot be used here: `load` falls back to defaults when the file will
+    /// not parse, so saving would flush `mic_device` and the `gpu` cache with it.
+    pub fn patch_physical_cores(&self, path: &Path) -> Result<()> {
+        // Nothing on disk to preserve — first run, write the struct out whole.
+        if !path.exists() {
+            return self.save(path);
+        }
+
+        let json = fs::read_to_string(path).context("read settings file")?;
+        let mut value: serde_json::Value =
+            serde_json::from_str(&json).context("parse settings JSON")?;
+        let obj = value
+            .as_object_mut()
+            .context("settings JSON is not an object")?;
+        obj.insert(
+            "physical_cores".to_string(),
+            serde_json::json!(self.physical_cores),
+        );
+
+        let out = serde_json::to_string_pretty(&value).context("serialize settings")?;
+        fs::write(path, out).context("write settings file")
     }
 }
 
@@ -253,6 +283,43 @@ mod tests {
         let json = serde_json::to_string(&s).unwrap();
         assert!(json.contains(r#""state":"unusable""#), "{json}");
         assert!(json.contains(r#""backend":"igpu""#), "{json}");
+    }
+
+    #[test]
+    fn patch_physical_cores_leaves_every_other_key_alone() {
+        // Including a key this build does not know about: the patch is a key write,
+        // not a round-trip through `Settings`.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(
+            &path,
+            r#"{"mic_device":"USB Mic","gpu":{"state":"done","attempts":1},"future_key":42}"#,
+        )
+        .unwrap();
+
+        let mut s = Settings::default();
+        s.physical_cores = Some(8);
+        s.patch_physical_cores(&path).unwrap();
+
+        let v: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(v["physical_cores"], 8);
+        assert_eq!(v["mic_device"], "USB Mic");
+        assert_eq!(v["gpu"]["state"], "done");
+        assert_eq!(v["gpu"]["attempts"], 1);
+        assert_eq!(v["future_key"], 42);
+    }
+
+    #[test]
+    fn patch_physical_cores_does_not_touch_an_unparseable_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("settings.json");
+        fs::write(&path, r#"{"mic_device":"USB Mic","#).unwrap();
+
+        let mut s = Settings::default();
+        s.physical_cores = Some(8);
+        assert!(s.patch_physical_cores(&path).is_err());
+        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"mic_device":"USB Mic","#);
     }
 
     #[test]

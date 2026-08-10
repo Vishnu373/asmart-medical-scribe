@@ -36,6 +36,10 @@ vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 # whisper.cpp and llama-cpp-2 (B10) each statically vendor ggml, which collides at
 # link time. Parakeet (ONNX) carries no ggml, so the LLM links cleanly.
 transcribe-rs = { version = "0.3.8", default-features = false, features = ["onnx"] }
+# Direct ORT handle so we can size the global thread pool before any session is built
+# (see docs/implementation-stt-thread-management.md). Version must match transcribe-rs's
+# pinned `=2.0.0-rc.12` exactly, or there are two ORT environments and ours is inert.
+ort = "=2.0.0-rc.12"
 # Transcript text cleanup (custom words + filler/stutter filtering, ported text.rs).
 natural = "0.5"
 once_cell = "1"

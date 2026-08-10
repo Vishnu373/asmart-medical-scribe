@@ -1,7 +1,9 @@
 use std::sync::mpsc::Receiver;
 use std::sync::Arc;
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
+use crate::audio_toolkit::TARGET_SAMPLE_RATE;
 use crate::stt::Transcriber;
 
 use super::Segment;
@@ -65,8 +67,40 @@ where
     F: FnMut(Result<TranscriptSegment, SegmentError>) + Send + 'static,
 {
     let handle = thread::spawn(move || {
+        // Per-consult accumulators: the loop spans exactly one consult, since the channel
+        // closes when B7 drops the segmenter on stop.
+        let (mut segments, mut speech_s, mut transcribe_s) = (0u64, 0.0f32, 0.0f32);
+        let mut slowest: Option<(u64, f32)> = None;
+
         for segment in rx.iter() {
-            match transcriber.transcribe(&segment.audio) {
+            // STT cost visibility (docs/implementation-stt-thread-management.md §3.6).
+            let audio_s = segment.audio.len() as f32 / TARGET_SAMPLE_RATE as f32;
+            let t0 = Instant::now();
+            let result = transcriber.transcribe(&segment.audio);
+            let secs = t0.elapsed().as_secs_f32();
+            log::info!(
+                "[STT] seq{}: speech - {audio_s:.1}s, transcribe - {secs:.2}s",
+                segment.seq
+            );
+
+            segments += 1;
+            speech_s += audio_s;
+            transcribe_s += secs;
+            if slowest.is_none_or(|(_, s)| secs > s) {
+                slowest = Some((segment.seq, secs));
+            }
+
+            // Phase 1: RTF per segment — a ratio you had to invert to read, and totals you
+            // had to sum by hand. Replaced by the durations above plus the summary below.
+            // let ms = t0.elapsed().as_secs_f32() * 1000.0;
+            // log::info!(
+            //     "[STT] seq={} audio={audio_s:.2}s transcribe={ms:.0}ms rtf={:.3}",
+            //     segment.seq,
+            //     ms / 1000.0 / audio_s
+            // );
+
+            // match transcriber.transcribe(&segment.audio) {   // pre-experiment: untimed
+            match result {
                 Ok(text) if !text.trim().is_empty() => {
                     sink(Ok(TranscriptSegment {
                         seq: segment.seq,
@@ -79,6 +113,20 @@ where
                     message: e.to_string(),
                 })),
             }
+        }
+
+        // Channel closed: the consult is over. Skipped at zero so an all-silence
+        // recording does not log a row of zeroes.
+        // `slowest` is set on the same iteration that increments `segments`, so
+        // `Some` and `segments > 0` are the same condition — matching on it drops a
+        // fallback that could only ever print a fake row.
+        // if segments > 0 {
+        //     let (seq, secs) = slowest.unwrap_or((0, 0.0));
+        if let Some((seq, secs)) = slowest {
+            log::info!(
+                "[STT] transcription done: segments - {segments}, speech duration - {speech_s:.1}s, \
+                 transcribe duration - {transcribe_s:.1}s, slowest seq - (seq{seq}, {secs:.2}s)"
+            );
         }
     });
 

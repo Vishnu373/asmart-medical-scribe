@@ -267,7 +267,11 @@ pub fn update_settings(
 ) -> Result<(), String> {
     // The `gpu` block (§8.8) is backend-owned: a payload missing the key would
     // deserialize to `pending` and wipe a completed probe. Keep ours.
-    settings.gpu = state.get().gpu;
+    let current = state.get();
+    settings.gpu = current.gpu;
+    // Same for `physical_cores`: backend-owned, absent from the UI payload, and a
+    // `None` here would send the next launch back to probing.
+    settings.physical_cores = current.physical_cores;
     state.update(settings).map_err(|e| e.to_string())
 }
 

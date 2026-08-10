@@ -755,6 +755,7 @@ Two tables. One record has many notes (one row per Generate/Regenerate, §8.5). 
 |-----|-----------|---------|
 | `vad_threshold` | internal | Fixed sensible default (§6.2) |
 | `idle_timeout` | internal | Auto-stop-on-silence default |
+| `physical_cores` | internal | Cached physical core count, probed once on first run. The STT thread policy (half the cores) derives from it at startup, so the raw count is stored and the policy stays in code. `null`/absent re-probes on next launch |
 | `gpu` | internal | Cached compute-backend decision (§8.8): `{ state, backend, adapter, memory_mb, attempts }`. Written once by the setup/installer detection step and read on every launch; never surfaced, never editable. It lives here rather than in the clinical DB because it is machine configuration with no PHI, and because the headless installer process must write it without unwrapping the DPAPI-protected DB key (§10.1) |
 
 ### 9.4 Tauri commands (UI → backend `invoke`)
@@ -826,7 +827,7 @@ Every event carries **no PHI** regardless of sink. Because NFR-6 concerns PHI eg
 
 #### Log event catalog
 
-Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
+Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[STT]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
 
 | Event | On-device | Telemetry |
 | --- | :---: | :---: |
@@ -870,6 +871,13 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `
 | `[RECORD] {record_id}, recording failed {e}` | ✓ | ✓ |
 | `[RECORD] {record_id} audio device failed mid-recording` | ✓ | ✓ |
 | `[RECORD] {record_id}, recording complete — {M}m {SS}s` | ✓ | |
+| `[STT] thread allocated: {n} physical cores` | ✓ | |
+| `[STT] thread allocation cached: {n} threads` | ✓ | |
+| `[STT] thread allocation cache hit: {n} threads` | ✓ | |
+| `[STT] thread allocation override: {n} threads from STT_THREAD_COUNT` | ✓ | |
+| `[STT] ORT global pool intra={n} inter={n} committed={bool}` | ✓ | |
+| `[STT] seq{seq}: speech - {N}s, transcribe - {N}s` | ✓ | |
+| `[STT] transcription done: segments - {n}, speech duration - {N}s, transcribe duration - {N}s, slowest seq - (seq{seq}, {N}s)` | ✓ | |
 | `[GENERATE] {record_id} → {note_id}, note generation started — {input_tokens}` | ✓ | |
 | `[GENERATE] {note_id}, note generation failed {e}` | ✓ | ✓ |
 | `[GENERATE] {note_id} prefill started` | ✓ | |
@@ -892,7 +900,7 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `
 | `[CLOSE] application closed` | ✓ | |
 | `[DB] DPAPI key unwrap failed {error message}` | ✓ | ✓ |
 
-Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The `[GPU]` rows (§8.8) are **on-device only** for the same reason: `{adapter}` is a device-identifying hardware string. That includes the fallback and skip lines — a machine without a usable GPU is a supported configuration, not a failure, so there is nothing to report off-device. `{e}` on the Vulkan-init row is a sanitized driver error, held to the same bar as every other logged error. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
+Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The `[GPU]` rows (§8.8) are **on-device only** for the same reason: `{adapter}` is a device-identifying hardware string. That includes the fallback and skip lines — a machine without a usable GPU is a supported configuration, not a failure, so there is nothing to report off-device. `{e}` on the Vulkan-init row is a sanitized driver error, held to the same bar as every other logged error. The `[STT]` rows are on-device only: the four thread rows state a core count, which is a hardware fact about the machine, and the per-segment and summary rows are pure durations and counts — never transcript text, so the §10.3 PHI bar holds by construction. The first three thread rows are mutually exclusive per launch (probe-and-cache on first run, cache hit thereafter, override when `STT_THREAD_COUNT` is set), and `transcription done` is emitted once per consult, skipped entirely when the recording produced no segments. See `docs/implementation-stt-thread-management.md`. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
 
 ### 10.4 Data lifecycle
 
