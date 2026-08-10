@@ -102,11 +102,6 @@ impl SttEngine {
         }
     }
 
-    /// Set the transcription language ("en", "fr", or "auto").
-    pub fn set_language(&self, lang: impl Into<String>) {
-        *self.language.lock().unwrap() = lang.into();
-    }
-
     /// Reset the idle timer (call while recording so the model isn't unloaded
     /// mid-consult).
     pub fn touch_activity(&self) {

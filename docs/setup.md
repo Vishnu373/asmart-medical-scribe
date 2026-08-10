@@ -72,6 +72,12 @@ This project requires **CMake ≥ 4.1** (older versions can't target the install
 Note generation runs on the GPU via llama.cpp's Vulkan backend (design §8.8). The build needs the **Vulkan SDK** installed — `glslc` compiles the GPU shaders into the binary. Install it from [vulkan.lunarg.com](https://vulkan.lunarg.com/sdk/home#windows) and confirm `%VULKAN_SDK%` is set.
 
 > The runtime loader `vulkan-1.dll` is **not** in the SDK — the SDK ships only the link stub `Lib\vulkan-1.lib`. The loader lives in `C:\Windows\System32`, installed by your graphics driver, and a copy is committed to `src-tauri/libs/` so it ships with the app.
+>
+> If you ever re-copy it from `System32`, clear the read-only attribute it carries over — otherwise the build fails with `Access is denied. (os error 5)` when it copies the resource into the target directory:
+>
+> ```
+> attrib -r src-tauri\libs\vulkan-1.dll
+> ```
 
 **Build from the Developer PowerShell for VS** (or the x64 Native Tools Command Prompt) — **not** a plain PowerShell:
 

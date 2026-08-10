@@ -258,7 +258,16 @@ pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
 
 /// Persist patched settings.
 #[tauri::command]
-pub fn update_settings(state: State<'_, SharedSettings>, settings: Settings) -> Result<(), String> {
+// pub fn update_settings(state: State<'_, SharedSettings>, settings: Settings) -> Result<(), String> {
+//     state.update(settings).map_err(|e| e.to_string())
+// }
+pub fn update_settings(
+    state: State<'_, SharedSettings>,
+    mut settings: Settings,
+) -> Result<(), String> {
+    // The `gpu` block (§8.8) is backend-owned: a payload missing the key would
+    // deserialize to `pending` and wipe a completed probe. Keep ours.
+    settings.gpu = state.get().gpu;
     state.update(settings).map_err(|e| e.to_string())
 }
 
