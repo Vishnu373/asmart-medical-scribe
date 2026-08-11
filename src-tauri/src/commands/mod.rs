@@ -60,7 +60,6 @@ pub fn update_transcript(
     id: String,
     transcript: String,
 ) -> Result<(), String> {
-
     match store.lock().update_transcript(&id, &transcript) {
         Ok(()) => {
             log::info!("[EDIT] {id} transcript updated");
@@ -81,11 +80,18 @@ pub fn list_records(store: State<'_, SharedStore>) -> Result<Vec<RecordSummary>,
 
 /// Load a full record (transcript included) by id; `None` if it's gone.
 #[tauri::command]
-pub fn open_record(store: State<'_, SharedStore>, id: String) -> Result<Option<Record>, String> {
+pub fn open_record(
+    store: State<'_, SharedStore>,
+    llm: State<'_, Arc<LlmEngine>>,
+    id: String,
+) -> Result<Option<Record>, String> {
+    // An old record shares none of the live recording's prefill, so drop the session
+    // rather than hold a warm context and the model lock for it (design §8.9).
+    llm.end_prefill();
     store.lock().open_record(&id).map_err(|e| e.to_string())
 }
 
-/// List a record's note versions, newest first; the `is_active` row is the current note and the rest are the revertable history. 
+/// List a record's note versions, newest first; the `is_active` row is the current note and the rest are the revertable history.
 /// The frontend loads these after a record opens and after GENERATING→IDLE.
 #[tauri::command]
 pub fn list_notes(store: State<'_, SharedStore>, record_id: String) -> Result<Vec<Note>, String> {
@@ -275,7 +281,7 @@ pub fn update_settings(
     state.update(settings).map_err(|e| e.to_string())
 }
 
-/// A microphone choice for the settings picker. 
+/// A microphone choice for the settings picker.
 /// Display-only metadata — the live cpal handle stays in the backend; `mic_device` persists the chosen `name` (`None` = system default).
 #[derive(serde::Serialize)]
 pub struct InputDevice {
@@ -299,7 +305,7 @@ pub fn list_input_devices() -> Result<Vec<InputDevice>, String> {
 }
 
 /// Submit doctor-typed feedback ("report a problem") through the telemetry seam — the "broke but didn't crash" channel that lands alongside crashes.
-/// Routes to the same backend when built with `crash-reporting` + a DSN; a local log otherwise. 
+/// Routes to the same backend when built with `crash-reporting` + a DSN; a local log otherwise.
 /// The body is free text and NOT scrubbable, so the UI warns the clinician against including patient information.
 #[tauri::command]
 pub fn submit_feedback(message: String) -> Result<(), String> {
@@ -310,7 +316,6 @@ pub fn submit_feedback(message: String) -> Result<(), String> {
     crate::telemetry::report_feedback(message);
     Ok(())
 }
-
 
 /// Initial stage, after installing the application and downloaded the model weights
 #[tauri::command]

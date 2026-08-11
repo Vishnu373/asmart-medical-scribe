@@ -169,8 +169,11 @@ flowchart LR
     subgraph NoteGen["Note-generation path — built by this project"]
         TStore --> Prompt[Prompt/Template Layer<br/>SOAP schema · language · anti-fabrication]
         Prompt --> LLM[LLM Note Generator]
+        KV[Note model KV cache<br/>prefilled during recording §8.9] --> LLM
         LLM --> Note[SOAP Note]
     end
+
+    ASR -. each finished segment, during recording .-> KV
 
     TStore --> UI
     Note --> UI[UI Shell<br/>record · transcript · note · export]
@@ -198,6 +201,8 @@ sequenceDiagram
         Cap->>ASR: Send segment audio
         ASR-->>UI: Segment text (< 2s)
         UI-->>Dr: Append text to transcript
+        ASR->>LLM: Queue segment for prefill (§8.9, never blocking)
+        LLM->>LLM: Decode segment into the live KV cache
         opt Doctor corrects
             Dr->>UI: Inline edit (preserved)
         end
@@ -207,7 +212,7 @@ sequenceDiagram
     Dr->>UI: Final transcript review/edit
     Dr->>UI: Click Generate Note
     UI->>LLM: generate_note(transcript, language) [background]
-    Note over LLM: STT + LLM co-resident (§7)
+    Note over LLM: STT + LLM co-resident (§7)<br/>Transcript already in the KV cache (§8.9) —<br/>only the closing turn tail is left to prefill
     LLM-->>UI: SOAP note
     UI-->>Dr: Show note for review/edit
     UI->>DB: Save note (encrypted)
@@ -353,9 +358,11 @@ Worker thread (Rust) ── emit("transcript-segment", {seq, text}) ──► Re
 
 **Backend copy is backup only.** The backend may retain a raw transcript copy purely for crash-recovery / autosave, but that is a backup — not the artifact the UI mirrors. The editable truth lives in the frontend.
 
+**Two destinations, in order.** The sink that receives a finished segment has a second consumer: after emitting to the UI, it queues the same text for the note model's KV cache (**§8.9**). The order is fixed — UI first, prefill second — and the prefill hop is a queue push that never blocks, so a slow or stopped prefill can never delay the transcript reaching the screen. The prefill copy is not a second source of truth: it is discarded at the next Start, and Generate still works from the frontend's document.
+
 ### 6.6 Threading & coordination (orchestration)
 
-This stage answers: **what ties Pieces 6.1–6.5 together into a single, well-behaved lifecycle?** It adds no new audio or STT component — it is the **coordinator** that owns application state and spins the three threads up and down cleanly so nothing leaks and nothing is lost.
+This stage answers: **what ties Pieces 6.1–6.5 together into a single, well-behaved lifecycle?** It adds no new audio or STT component — it is the **coordinator** that owns application state and spins the recording's threads up and down cleanly so nothing leaks and nothing is lost.
 
 **The state machine.** A recording encounter moves through three states, owned by the backend:
 
@@ -370,10 +377,11 @@ This stage answers: **what ties Pieces 6.1–6.5 together into a single, well-be
 - **RECORDING** — the capture thread and transcription worker are both live and running asynchronously in parallel; segments flow through the queue and finished text is emitted to the UI (§6.3, §6.5).
 - **PROCESSING** — Stop has been pressed: capture has ended, but in-flight audio is still being finalized. Brief in v1; this is also the lifecycle slot where phase-two note generation will run.
 
-**The three threads.**
+**The threads.**
 
 - **Capture thread** (the "ears") — owns the cpal stream and VAD; emits audio *segments* into the queue.
 - **Transcription worker** (the "hands") — pulls segments off the queue, runs the STT engine, and emits finished text to the UI.
+- **Prefill thread** (**§8.9**) — holds the note model and one live context for the recording, and decodes each finished segment into its KV cache. Started at Start, before the first segment can land; dropped at the next Start, when an old record is opened, or on unload. Because it holds the model lock for the whole recording, everything that needs the model during a recording goes through it.
 - **UI thread** — renders the editable transcript and owns the Start/Stop controls.
 
 The two hops differ by design: **capture → transcription is an mpsc queue** (a real buffer that can hold a backlog), while **transcription → UI is a push event** (§6.5), not a buffer the UI drains.
@@ -411,6 +419,8 @@ This assumes a **16 GB (or higher) machine** — the binding hardware profile (�
 | CPU | System RAM | Unchanged — the baseline this section was written against |
 
 The budget above is therefore stated for the worst case (CPU or iGPU). A discrete GPU only ever adds headroom, so no separate accounting is needed.
+
+**One extra context during a session.** Transcript prefill (§8.9) keeps a single `n_ctx` context alive from Start until the session ends, on top of the weights. It is one context, not one per segment — the same context is reused for every segment and then for the note — and it sits wherever the weights sit (VRAM on a discrete GPU, system RAM otherwise). Generate no longer builds a second context on the prefilled path, so this replaces the per-note context rather than adding to it; the fallback path (§8.6) still builds its own.
 
 ---
 
@@ -466,7 +476,7 @@ Making generation an explicit, post-review action is a deliberate clinical-safet
 
 **Tuning notes:**
 
-- **Thread count (decode-phase only).** At startup the app reads the machine's **physical** core count and sets the decode thread count to `physical_cores // 2` (floor, minimum 1). This is applied **only to the decode/generation phase** (`n_threads`); the **prefill/prompt phase is left at the llama.cpp default** (`n_threads_batch` untouched). Rationale: token-by-token decode is memory-bandwidth-bound and stops scaling — often regresses — past a fraction of the cores, while prefill is compute-bound and still benefits from the full set, so the two phases are tuned independently.
+- **Thread count — the two phases are split.** At startup the app reads the machine's **physical** core count **once** and derives every thread count from it: decode (`n_threads`) gets `physical / 2` (floor, minimum 1) and prefill (`n_threads_batch`) gets the remainder, `physical − physical / 2` (minimum 1). Rationale: token-by-token decode is memory-bandwidth-bound and stops scaling — often regresses — past a fraction of the cores, while prefill is compute-bound and still benefits from the full set, so the two phases are tuned independently. The remainder is the larger side on an odd core count, deliberately: prefill is batched and scales, decode does not. STT takes the same `physical / 2` share (§6.4), so prefill runs on the cores STT left over — which is what makes prefilling *during* a recording (§8.9) affordable. If the core count is unavailable, llama.cpp picks both counts itself and everything still works.
 - **Context window.** `n_ctx = 8192` — covers the fixed prompt prefix (system + few-shot examples, §8.3) plus the longest realistic transcript plus the generated note, while staying well under the model maximum and not reserving RAM the §7 budget needs.
 - **Max output tokens.** `max_output_tokens = 1536` — the ceiling for one generation. Note (§8.3): with chain-of-thought this budget must cover the model's reasoning **and** the note; the few-shot examples model brief reasoning to keep the note within budget (validate in benchmarking).
 - **Sampling** — low temperature for near-deterministic, low-hallucination clinical output (finalized alongside the prompt in §8.3).
@@ -702,6 +712,24 @@ Note what does *not* motivate the suffix. The snapshot's layout is fixed by the 
 
 **Build-host requirement.** The Vulkan SDK (for `glslc`, which compiles the backend's shaders) joins LLVM and CMake as a Windows build prerequisite — see `docs/setup.md`. It is a **build-time** dependency only; nothing extra ships to the clinician.
 
+### 8.9 Transcript prefill during recording
+
+**What it does.** At Start, the engine opens one context, restores the §8.7 prefix KV into it, and keeps it alive for the recording. Each finished segment is tokenized (no BOS) and decoded onto the end of that context as it arrives. By the time the clinician presses Generate, the KV cache already holds prefix + transcript, and only the closing turn tail plus the note itself remain — moving the transcript prefill out of the clinician's wait and into time that was idle anyway.
+
+**Why a dedicated thread.** A `LlamaContext<'a>` borrows `&'a LlamaModel`, and the model lives inside the engine's mutex — so keeping one context alive across a whole recording means keeping the `MutexGuard` alive too. One thread owns both. Everything that needs the model during a recording therefore goes through that thread (§6.6), and nothing contends for the lock. Segments reach it over an **unbounded** channel with a separate depth counter, never a bounded one: blocking the STT sink is the one thing prefill must never do (§6.5).
+
+**Generate re-checks with an LCP.** The clinician can edit the transcript while recording (FR-3), so what was prefilled may no longer be a prefix of what Generate is asked to write about. Generate therefore tokenizes the **whole** prompt exactly as §8.6 does, takes the **longest common prefix** against the prefilled token sequence, trims the KV cache to that point, and decodes only the rest. An untouched transcript reuses everything; an edit costs only the tokens after the edit point. This is the same "correct first, cached second" rule as §8.6 — the note is byte-identical either way.
+
+**The queue-depth safety valve.** Prefill only pays off if it keeps pace with speech. If the queue passes a fixed depth, it never will — at Generate it would still be grinding through a backlog while the clinician waits, which is worse than not prefilling at all. So prefill **stops for the rest of that recording**, logs one warning, and lets Generate take the §8.6 path. Catching up is not attempted; a queue that backs up is a statement about the machine, not a transient.
+
+**Always falls back.** Every failure mode here — no usable prefix blob, context creation failure, a tokenize or decode error, a refused KV trim, the transcript passing the prompt budget, a dead thread mid-note — sets the same *disabled* flag, breaks the loop, and releases the model guard, so Generate's normal path takes the lock and produces the note exactly as it would have. Prefill can make a note faster; it can never make one wrong, and it can never turn a working consult into an error. In particular, the "transcript is too long" error stays byte-for-byte the one the normal path raises.
+
+**Rollback after each note.** The note (and the turn tail before it) is decoded onto the same live context, so the KV is trimmed back to the transcript's end afterwards — otherwise a Regenerate would build on the previous note's tokens. A *refused* trim means stale entries survive, so the session is abandoned rather than reused.
+
+**Scope.** Prefill belongs to a live recording only. Opening an old record drops the session, and Generate there takes the §8.6 path with its own context — the transcript already exists in full, so there is nothing to overlap.
+
+**Logging.** The `[PREFILL]` rows are in the §10.3 catalog, on-device only: token counts and durations, never transcript text (NFR-6).
+
 ## 9. Data Model & Interfaces
 
 This section consolidates what the app persists and the Tauri command/event contracts that cross the React ↔ Rust boundary. It gathers contracts introduced piecewise in §6 and §8 into one reference.
@@ -827,7 +855,7 @@ Every event carries **no PHI** regardless of sink. Because NFR-6 concerns PHI eg
 
 #### Log event catalog
 
-Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[STT]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
+Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[THREADS]`, `[LOAD]`, `[PRIME]`, `[RECORD]`, `[STT]`, `[LLM]`, `[PREFILL]`, `[GENERATE]`, `[EDIT]`, `[UPDATE]`, `[CLOSE]`, `[DB]`). "On-device" = written to the local log file; "Telemetry" = also sent to GlitchTip.
 
 | Event | On-device | Telemetry |
 | --- | :---: | :---: |
@@ -871,14 +899,16 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `
 | `[RECORD] {record_id}, recording failed {e}` | ✓ | ✓ |
 | `[RECORD] {record_id} audio device failed mid-recording` | ✓ | ✓ |
 | `[RECORD] {record_id}, recording complete — {M}m {SS}s` | ✓ | |
-| `[STT] thread allocated: {n} physical cores` | ✓ | |
-| `[STT] thread allocation cached: {n} threads` | ✓ | |
-| `[STT] thread allocation cache hit: {n} threads` | ✓ | |
+| `[THREADS] {n} physical cores detected` / `{n} physical cores (cached)` | ✓ | |
+| `[STT] thread allocated: {n} threads` | ✓ | |
 | `[STT] thread allocation override: {n} threads from STT_THREAD_COUNT` | ✓ | |
-| `[STT] ORT global pool intra={n} inter={n} committed={bool}` | ✓ | |
+| `[LLM] thread allocated: {n} decode, {n} prefill` | ✓ | |
 | `[STT] seq{seq}: speech - {N}s, transcribe - {N}s` | ✓ | |
 | `[STT] transcription done: segments - {n}, speech duration - {N}s, transcribe duration - {N}s, slowest seq - (seq{seq}, {N}s)` | ✓ | |
+| `[PREFILL] seq{seq}: {n} tokens, prefill - {N}s, total - {n} tokens` | ✓ | |
+| `[PREFILL] stopped for this recording: {reason}` | ✓ | |
 | `[GENERATE] {record_id} → {note_id}, note generation started — {input_tokens}` | ✓ | |
+| `[GENERATE] {note_id} prefill session — {n} of {n} tokens reused, {n} to prefill` | ✓ | |
 | `[GENERATE] {note_id}, note generation failed {e}` | ✓ | ✓ |
 | `[GENERATE] {note_id} prefill started` | ✓ | |
 | `[GENERATE] {note_id} prefill done — prefill duration {N}s` | ✓ | |
@@ -900,7 +930,7 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[LOAD]`, `[PRIME]`, `
 | `[CLOSE] application closed` | ✓ | |
 | `[DB] DPAPI key unwrap failed {error message}` | ✓ | ✓ |
 
-Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The `[GPU]` rows (§8.8) are **on-device only** for the same reason: `{adapter}` is a device-identifying hardware string. That includes the fallback and skip lines — a machine without a usable GPU is a supported configuration, not a failure, so there is nothing to report off-device. `{e}` on the Vulkan-init row is a sanitized driver error, held to the same bar as every other logged error. The `[STT]` rows are on-device only: the four thread rows state a core count, which is a hardware fact about the machine, and the per-segment and summary rows are pure durations and counts — never transcript text, so the §10.3 PHI bar holds by construction. The first three thread rows are mutually exclusive per launch (probe-and-cache on first run, cache hit thereafter, override when `STT_THREAD_COUNT` is set), and `transcription done` is emitted once per consult, skipped entirely when the recording produced no segments. See `docs/implementation-stt-thread-management.md`. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
+Notes: the `[PRIME]` rows come from the headless `--prime-kv` process (§8.7), which never initialises telemetry — so they are on-device only by construction, written through that process's own file sink rather than `tauri-plugin-log`, and tagged `[<LEVEL>][prime-kv]` in the same `medscribe.log`. `[PRIME] done` is emitted only after the blob is confirmed on disk; `ensure_loaded` succeeding is not sufficient, since a failed prime or blob write is non-fatal there. The mic name is PII, so it is on-device only. The `[GPU]` rows (§8.8) are **on-device only** for the same reason: `{adapter}` is a device-identifying hardware string. That includes the fallback and skip lines — a machine without a usable GPU is a supported configuration, not a failure, so there is nothing to report off-device. `{e}` on the Vulkan-init row is a sanitized driver error, held to the same bar as every other logged error. The thread rows (`[THREADS]`, `[STT] thread allocated`, `[LLM] thread allocated`) are on-device only: they state a core count, which is a hardware fact about the machine. So are the remaining `[STT]` rows — pure durations and counts, never transcript text, so the §10.3 PHI bar holds by construction. All three are emitted on every launch, since only the core count is cached and the split is re-derived each time: the `[THREADS]` row reads `detected` on the run that probes and `(cached)` thereafter. The `[STT]` row is replaced by the override row when `STT_THREAD_COUNT` is set — that override applies to STT alone, so the `[LLM]` row is unaffected by it. `transcription done` is emitted once per consult, skipped entirely when the recording produced no segments. See `docs/implementation-stt-thread-management.md`. The `[PREFILL]` rows (§8.9) are on-device only and carry token counts and durations only — never the segment text. The per-segment row is Info-level and fires once per non-empty segment; `stopped for this recording` is a Warn emitted at most once per recording, and its absence is the normal case. The `prefill session` row is emitted only when Generate ran on a live prefilled context, so it is also the marker that distinguishes that path from the §8.6 fallback. The four prefill/reasoning rows are Info-level and on-device only (their failure is captured by `note generation failed`). `update available` / `downloaded` / `installed` and `audio device failed mid-recording` also drive a UI notification.
 
 ### 10.4 Data lifecycle
 

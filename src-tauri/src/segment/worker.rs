@@ -149,10 +149,7 @@ mod tests {
 
     /// Send `count` segments (seq 0..count) and run them through `transcriber`,
     /// returning the Ok results as `(seq, text)` and the Err results as `seq`.
-    fn run(
-        count: u64,
-        transcriber: Arc<dyn Transcriber>,
-    ) -> (Vec<(u64, String)>, Vec<u64>) {
+    fn run(count: u64, transcriber: Arc<dyn Transcriber>) -> (Vec<(u64, String)>, Vec<u64>) {
         let (tx, rx) = channel();
         for seq in 0..count {
             tx.send(Segment {
@@ -180,8 +177,9 @@ mod tests {
 
     #[test]
     fn emits_results_in_sequence_order() {
-        let t: Arc<dyn Transcriber> =
-            Arc::new(MockTranscriber::with_responses(["alpha", "bravo", "charlie"]));
+        let t: Arc<dyn Transcriber> = Arc::new(MockTranscriber::with_responses([
+            "alpha", "bravo", "charlie",
+        ]));
         let (oks, errs) = run(3, t);
         assert!(errs.is_empty());
         assert_eq!(

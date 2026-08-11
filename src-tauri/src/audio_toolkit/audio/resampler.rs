@@ -162,13 +162,17 @@ mod tests {
 
         // Second recording on the same resampler.
         let mut reused = Vec::new();
-        rs.push(&vec![0.25f32; 48_000], |frame| reused.extend_from_slice(frame));
+        rs.push(&vec![0.25f32; 48_000], |frame| {
+            reused.extend_from_slice(frame)
+        });
         rs.finish(|frame| reused.extend_from_slice(frame));
 
         // Same input on a brand-new resampler.
         let mut fresh = Vec::new();
         let mut rs2 = FrameResampler::new(48_000, 16_000, Duration::from_millis(30));
-        rs2.push(&vec![0.25f32; 48_000], |frame| fresh.extend_from_slice(frame));
+        rs2.push(&vec![0.25f32; 48_000], |frame| {
+            fresh.extend_from_slice(frame)
+        });
         rs2.finish(|frame| fresh.extend_from_slice(frame));
 
         assert_eq!(

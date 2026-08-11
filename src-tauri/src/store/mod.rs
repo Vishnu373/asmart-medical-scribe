@@ -373,7 +373,10 @@ mod tests {
         assert_eq!(loaded.transcript, "hello");
 
         store.update_transcript(&rec.id, "edited").unwrap();
-        assert_eq!(store.open_record(&rec.id).unwrap().unwrap().transcript, "edited");
+        assert_eq!(
+            store.open_record(&rec.id).unwrap().unwrap().transcript,
+            "edited"
+        );
 
         assert_eq!(store.list_records().unwrap().len(), 1);
         store.delete_record(&rec.id).unwrap();

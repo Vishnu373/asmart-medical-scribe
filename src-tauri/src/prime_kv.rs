@@ -49,7 +49,8 @@ pub fn run() {
     let n_threads = sysinfo::System::new()
         .physical_core_count()
         .map(|physical| (physical / 2).max(1) as i32);
-    let engine = match LlmEngine::new(kind, vec![models_dir], n_threads) {
+    // No prefill here: this is a headless one-shot prime, there is no recording.
+    let engine = match LlmEngine::new(kind, vec![models_dir], n_threads, None) {
         Ok(e) => e,
         Err(e) => {
             warn!("[PRIME] engine init failed: {e}");

@@ -240,7 +240,10 @@ mod tests {
         // The supplied prompt carries at least two worked pairs; they ride in the
         // fixed prefix that teaches format/style.
         let p = parsed();
-        assert!(p.examples.len() >= 2, "expected the supplied few-shot pairs");
+        assert!(
+            p.examples.len() >= 2,
+            "expected the supplied few-shot pairs"
+        );
         let prefix = prefix(LlmModel::Gemma);
         // Two-phase format: each example carries a private reasoning block bounded by
         // the reasoning marker.
@@ -298,7 +301,9 @@ mod tests {
         );
         // A duplicate <think>…</think> block echoed after the note is removed whole.
         assert_eq!(
-            sanitize_note("## Plan\n- rest\n<think>oops more reasoning</think>\n## Response\n- none"),
+            sanitize_note(
+                "## Plan\n- rest\n<think>oops more reasoning</think>\n## Response\n- none"
+            ),
             "## Plan\n- rest\n\n## Response\n- none"
         );
         // An unclosed <think> to end-of-note drops the trailing scratchpad.

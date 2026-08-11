@@ -116,7 +116,9 @@ pub fn init() {
                 match serde_json::from_value(scrubbed) {
                     Ok(event) => Some(event),
                     Err(e) => {
-                        log::warn!("crash report dropped: scrubbed event failed to round-trip: {e}");
+                        log::warn!(
+                            "crash report dropped: scrubbed event failed to round-trip: {e}"
+                        );
                         None
                     }
                 }

@@ -13,8 +13,9 @@ fn main() {
     // let version = locked_version(&lock, "llama-cpp-2")
     //     .expect("llama-cpp-2 not found in Cargo.lock — the prefix KV cache cannot be versioned");
     // println!("cargo:rustc-env=LLAMA_CPP_2_VERSION={version}");
-    let version = locked_version(&lock, "llama-cpp-sys-2")
-        .expect("llama-cpp-sys-2 not found in Cargo.lock — the prefix KV cache cannot be versioned");
+    let version = locked_version(&lock, "llama-cpp-sys-2").expect(
+        "llama-cpp-sys-2 not found in Cargo.lock — the prefix KV cache cannot be versioned",
+    );
     println!("cargo:rustc-env=LLAMA_CPP_SYS_2_VERSION={version}");
 
     tauri_build::build()

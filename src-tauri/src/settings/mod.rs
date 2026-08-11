@@ -24,9 +24,13 @@ pub struct Settings {
     /// Internal: cached GPU detection result (§8.8). Never doctor-facing.
     pub gpu: GpuSettings,
     /// Internal: physical core count, probed once on first run and reused
-    /// thereafter. Raw hardware fact — the STT thread policy derives from it
-    /// at startup rather than being frozen here.
+    /// thereafter. Raw hardware fact — the STT/decode/prefill split derives from
+    /// it at startup rather than being frozen here.
     pub physical_cores: Option<usize>,
+    // Cached the derived split instead of the probe; a later change to the split
+    // then never reached a machine that had already probed.
+    // pub stt_thread_count: Option<usize>,
+    // pub llm_prefill_thread_count: Option<usize>,
 }
 
 impl Default for Settings {
@@ -319,7 +323,10 @@ mod tests {
         let mut s = Settings::default();
         s.physical_cores = Some(8);
         assert!(s.patch_physical_cores(&path).is_err());
-        assert_eq!(fs::read_to_string(&path).unwrap(), r#"{"mic_device":"USB Mic","#);
+        assert_eq!(
+            fs::read_to_string(&path).unwrap(),
+            r#"{"mic_device":"USB Mic","#
+        );
     }
 
     #[test]
@@ -327,7 +334,10 @@ mod tests {
         // Guard against PHI ever leaking into the unencrypted settings file.
         let json = serde_json::to_string(&Settings::default()).unwrap();
         for phi in ["transcript", "soap", "note", "label", "record"] {
-            assert!(!json.contains(phi), "settings must not carry PHI field: {phi}");
+            assert!(
+                !json.contains(phi),
+                "settings must not carry PHI field: {phi}"
+            );
         }
     }
 }

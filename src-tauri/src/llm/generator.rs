@@ -63,10 +63,7 @@ impl NoteGenerator for RealNoteGenerator {
                 // Sanitized: a model/decode error can embed the GGUF path.
                 let msg = crate::telemetry::sanitize_error(&e.to_string());
                 log::error!("[GENERATE] {notes_id}, note generation failed {msg}");
-                crate::telemetry::track_event(
-                    "generation_failed",
-                    json!({ "error": msg }),
-                );
+                crate::telemetry::track_event("generation_failed", json!({ "error": msg }));
                 return Err(e);
             }
         };

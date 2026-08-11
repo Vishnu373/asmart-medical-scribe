@@ -10,7 +10,8 @@
 
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
 
@@ -27,6 +28,7 @@ use llama_cpp_2::sampling::LlamaSampler;
 use llama_cpp_2::token::LlamaToken;
 use llama_cpp_2::LlamaStateSeqFlags;
 
+use super::prefill::{self, GenEvent, PrefillCmd, PrefillSession};
 use super::prompt;
 
 /// The note-generation model (design §8.2). A single on-device model —
@@ -103,12 +105,19 @@ pub struct LlmEngine {
     /// Model-file search dirs, in priority order (D1): the app-data download dir
     /// first (optional models the doctor pulled), then the bundled resource dir.
     model_dirs: Vec<PathBuf>,
-    /// Decode-phase threads (physical // 2); prefill left at the llama.cpp default
-    /// (design §8.2 — decode is bandwidth-bound and stops scaling; prefill is not).
-    /// `None` when the physical core count was unavailable — both phases then fall
-    /// back to llama.cpp's own defaults rather than a guessed count.
+    /// Decode-phase threads, STT's half of the cores (design §8.2). `None` when the
+    /// physical core count was unavailable: llama.cpp then picks both counts itself.
     n_threads: Option<i32>,
     // n_threads: i32,
+    /// Prefill-phase threads (`n_threads_batch`), the cores STT's half leaves over
+    /// (design §8.2). `None` applies `n_threads` to both phases.
+    n_threads_batch: Option<i32>,
+    /// Mirrors "is `model` `Some`?" without taking the model lock, which the prefill
+    /// session holds for a whole recording while `is_loaded` sits on the UI's path.
+    loaded: AtomicBool,
+    /// The live prefill session while a recording is in flight (design §8.9). Its
+    /// thread owns the model guard and one warm context.
+    prefill: Mutex<Option<PrefillSession>>,
     /// Serializes [`ensure_loaded`] so the co-resident background preload (design
     /// §8.2 startup fix) and an early Generate can't both load the model at once.
     /// Held only across the load itself, never nested inside the `model` lock.
@@ -118,9 +127,15 @@ pub struct LlmEngine {
 impl LlmEngine {
     /// Create the engine for `kind`, resolving the model file across `model_dirs`
     /// (first existing wins). The model itself is not loaded until [`ensure_loaded`];
-    /// `n_threads` (physical // 2, design §8.2) is applied to both decode and prefill
-    /// (see [`new_context`]); `None` leaves both at the llama.cpp defaults.
-    pub fn new(kind: LlmModel, model_dirs: Vec<PathBuf>, n_threads: Option<i32>) -> Result<Self> {
+    /// `n_threads` (physical // 2, design §8.2) drives decode; `None` leaves both phases
+    /// at the llama.cpp defaults. `n_threads_batch` is the prefill-phase count (design
+    /// §8.2) — `None` applies `n_threads` to both.
+    pub fn new(
+        kind: LlmModel,
+        model_dirs: Vec<PathBuf>,
+        n_threads: Option<i32>,
+        n_threads_batch: Option<i32>,
+    ) -> Result<Self> {
         let mut backend =
             LlamaBackend::init().map_err(|e| anyhow!("llama backend init failed: {e}"))?;
         // llama.cpp/ggml dump per-tensor load and context noise straight to C++ stderr,
@@ -136,6 +151,9 @@ impl LlmEngine {
             model_dirs,
             n_threads: n_threads.map(|n| n.max(1)),
             // n_threads: n_threads.max(1),
+            n_threads_batch: n_threads_batch.map(|n| n.max(1)),
+            loaded: AtomicBool::new(false),
+            prefill: Mutex::new(None),
             load_lock: Mutex::new(()),
         })
     }
@@ -145,7 +163,7 @@ impl LlmEngine {
     }
 
     pub fn is_loaded(&self) -> bool {
-        self.lock_model().is_some()
+        self.loaded.load(Ordering::Acquire)
     }
 
     /// Load the model if it isn't already, after checking that enough RAM is free
@@ -190,6 +208,7 @@ impl LlmEngine {
             anyhow!("failed to load LLM model {}: {e}", path.display())
         })?;
         *self.lock_model() = Some(model);
+        self.loaded.store(true, Ordering::Release);
         info!(
             "[LOAD] SLM model loaded: {:.1}s", // §10.3
             t_load.elapsed().as_secs_f32()
@@ -236,6 +255,10 @@ impl LlmEngine {
     }
 
     pub fn unload(&self) {
+        // Before anything else: the prefill thread holds the model guard, so taking it
+        // below would block forever until that thread exits.
+        self.end_prefill();
+        self.loaded.store(false, Ordering::Release);
         *self.lock_model() = None;
         // Drop the cached prefix state with the model: it belongs to this model
         // (§8.6). The next load rebuilds it — from the blob when one is present (§8.7),
@@ -267,6 +290,16 @@ impl LlmEngine {
         // transcript text is ever logged (NFR-6/PHI). The per-phase and completion
         // timings are emitted inside `decode_and_generate` (§10.3 `[GENERATE]` rows).
         self.ensure_loaded()?;
+
+        // A live prefill session already holds the transcript in a warm context, so run
+        // the note there (design §8.9). `None` means no usable session and the normal
+        // path below takes over.
+        if let Some(result) =
+            self.try_prefill_generate(record_id, note_id, transcript, on_token, cancel)
+        {
+            return result;
+        }
+
         let kind = self.model_kind();
         let prompt = prompt::build_prompt(kind, transcript);
 
@@ -542,6 +575,32 @@ impl LlmEngine {
         n as i32
     }
 
+    /// Restore the cached prefix into `ctx` on its own and return its tokens — the
+    /// prefill session's version of [`restore_prefix`], which needs a full prompt to
+    /// check against and there is no prompt yet mid-recording. `None` means no usable
+    /// cache, and the session gives up (a note without the prefix cached is the normal
+    /// path's problem, not prefill's).
+    fn restore_prefix_state(
+        &self,
+        ctx: &mut LlamaContext,
+        kind: LlmModel,
+    ) -> Option<Vec<LlamaToken>> {
+        let cache = self.prefix_cache.lock().unwrap();
+        let pc = cache.as_ref()?;
+        if pc.kind != kind {
+            return None;
+        }
+        // Safety: same contract as `restore_prefix` — the blob came from
+        // `state_seq_get_data_ext` on a context built from this model and params.
+        let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
+        if !ok {
+            warn!("[PREFILL] prefix KV restore rejected by llama.cpp");
+            ctx.clear_kv_cache();
+            return None;
+        }
+        Some(pc.prefix_tokens.clone())
+    }
+
     /// Decode `tokens[start..]` into `ctx` (positions `start..`, so a restored
     /// prefix lines up), then stream generated tokens until end-of-generation, the
     /// token cap, or cancellation. Shared by the cached and full-decode paths.
@@ -812,16 +871,14 @@ impl LlmEngine {
     /// is built per note (and per prefix priming); the cached prefix state is
     /// restored into it, so nothing needs to hold a context across notes (§8.6).
     fn new_context<'a>(&'a self, model: &'a LlamaModel) -> Result<LlamaContext<'a>> {
-        // Both phases run on the tuned thread count (physical // 2, design §8.2): decode
-        // (`n_threads`) is memory-bandwidth-bound and regresses past a fraction of the
-        // cores, and we cap prefill (`n_threads_batch`) at the same count rather than let
-        // it fall to the llama.cpp default of 4 — 4 would throttle the transcript-tail
-        // prefill (the uncached part of every note) on any many-core machine.
-        // When the physical core count was unavailable, neither is set and llama.cpp
-        // uses its own defaults.
+        // llama.cpp uses `n_threads_batch` for batched (prefill) decode and `n_threads`
+        // for single-token decode, so the two phases sit on disjoint cores with no
+        // runtime switching (design §8.2). Unset → llama.cpp's own defaults.
         let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(N_CTX));
         if let Some(n) = self.n_threads {
-            ctx_params = ctx_params.with_n_threads(n).with_n_threads_batch(n);
+            ctx_params = ctx_params
+                .with_n_threads(n)
+                .with_n_threads_batch(self.n_threads_batch.unwrap_or(n));
         }
         // let ctx_params = LlamaContextParams::default()
         //     .with_n_ctx(NonZeroU32::new(N_CTX))
@@ -834,6 +891,276 @@ impl LlmEngine {
 
     fn lock_model(&self) -> MutexGuard<'_, Option<LlamaModel>> {
         self.model.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    // ---- transcript prefill during recording (design §8.9) ----
+
+    /// Start prefilling this recording's segments, replacing any previous session.
+    /// Unconditional: an unknown core count just leaves llama.cpp its own thread counts.
+    pub fn begin_prefill(self: &Arc<Self>) {
+        let mut slot = self.prefill.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = None; // drop the previous session (and its KV) before spawning a new one
+        *slot = Some(PrefillSession::spawn(self.clone()));
+    }
+
+    /// Drop the session: its thread drains, releases the model guard, and exits.
+    pub fn end_prefill(&self) {
+        let mut slot = self.prefill.lock().unwrap_or_else(|p| p.into_inner());
+        *slot = None;
+    }
+
+    /// Queue a finished segment for prefill. Never blocks the STT sink.
+    pub fn push_prefill_segment(&self, seq: u64, text: &str) {
+        let slot = self.prefill.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(session) = slot.as_ref() {
+            session.push_segment(seq, text);
+        }
+    }
+
+    /// Route a note through the live session, or `None` to use the normal path.
+    fn try_prefill_generate(
+        &self,
+        record_id: &str,
+        note_id: &str,
+        transcript: &str,
+        on_token: &dyn Fn(&str),
+        cancel: &Arc<AtomicBool>,
+    ) -> Option<Result<Option<String>>> {
+        let slot = self.prefill.lock().unwrap_or_else(|p| p.into_inner());
+        slot.as_ref()?
+            .generate(record_id, note_id, transcript, on_token, cancel)
+    }
+
+    /// The prefill thread's body. Holds the model guard and one warm context for the
+    /// life of the recording; see `llm::prefill` for why that has to be a thread.
+    ///
+    /// Every failure here is non-fatal by construction: it sets `disabled` and breaks,
+    /// which releases the guard so [`generate`]'s normal path can take the lock.
+    pub(crate) fn run_prefill_loop(
+        &self,
+        rx: Receiver<PrefillCmd>,
+        depth: Arc<AtomicUsize>,
+        disabled: Arc<AtomicBool>,
+    ) {
+        let give_up = |why: String| {
+            if !disabled.swap(true, Ordering::Relaxed) {
+                warn!("[PREFILL] stopped for this recording: {why}");
+            }
+        };
+
+        if let Err(e) = self.ensure_loaded() {
+            give_up(format!("model not loaded ({e})"));
+            return;
+        }
+        let guard = self.lock_model();
+        let Some(model) = guard.as_ref() else {
+            give_up("model not loaded".into());
+            return;
+        };
+        let kind = self.kind;
+
+        let mut ctx = match self.new_context(model) {
+            Ok(ctx) => ctx,
+            Err(e) => return give_up(format!("context creation failed ({e})")),
+        };
+        // The prefix restore runs at record start, where nobody is waiting on it.
+        let Some(prefix_tokens) = self.restore_prefix_state(&mut ctx, kind) else {
+            return give_up("no usable prefix KV cache".into());
+        };
+        let prefix_len = prefix_tokens.len();
+        let mut prefilled = prefix_tokens;
+
+        // Same ceiling Generate enforces: the KV holds prompt + reasoning + note, so the
+        // prompt must leave both output budgets free under N_CTX.
+        let prompt_budget = (N_CTX as i32 - (MAX_REASONING_TOKENS + MAX_OUTPUT_TOKENS)) as usize;
+        let mut batch = LlamaBatch::new(N_CTX as usize, 1);
+
+        for cmd in rx.iter() {
+            match cmd {
+                PrefillCmd::Segment { seq, text } => {
+                    depth.fetch_sub(1, Ordering::Relaxed);
+                    // `prefilled.len() == prefix_len` means nothing has been appended yet,
+                    // so this is the transcript's first segment and takes no leading space.
+                    let Some(chunk) = prefill::segment_chunk(prefilled.len() == prefix_len, &text)
+                    else {
+                        continue;
+                    };
+
+                    let t0 = Instant::now();
+                    let tokens = match model.str_to_token(&chunk, AddBos::Never) {
+                        Ok(t) => t,
+                        Err(e) => {
+                            give_up(format!("segment tokenization failed ({e})"));
+                            break;
+                        }
+                    };
+                    if prefilled.len() + tokens.len() >= prompt_budget {
+                        // The consult outgrew the context. Generate's existing "transcript
+                        // is too long" error stays the only user-facing behaviour — prefill
+                        // must never turn a working consult into an error, or vice versa.
+                        give_up(format!(
+                            "transcript passed the {prompt_budget}-token prompt budget"
+                        ));
+                        break;
+                    }
+
+                    batch.clear();
+                    let last = tokens.len() - 1;
+                    let mut failed = None;
+                    for (i, token) in tokens.iter().enumerate() {
+                        let pos = (prefilled.len() + i) as i32;
+                        if let Err(e) = batch.add(*token, pos, &[0], i == last) {
+                            failed = Some(format!("batch fill failed ({e})"));
+                            break;
+                        }
+                    }
+                    if let Some(why) = failed {
+                        give_up(why);
+                        break;
+                    }
+                    if let Err(e) = ctx.decode(&mut batch) {
+                        give_up(format!("segment decode failed ({e})"));
+                        break;
+                    }
+                    prefilled.extend_from_slice(&tokens);
+
+                    // Counts and durations only — no transcript text (NFR-6/PHI).
+                    info!(
+                        "[PREFILL] seq{seq}: {} tokens, prefill - {:.2}s, total - {} tokens",
+                        tokens.len(),
+                        t0.elapsed().as_secs_f32(),
+                        prefilled.len() - prefix_len
+                    );
+                }
+                PrefillCmd::Generate {
+                    record_id,
+                    note_id,
+                    transcript,
+                    cancel,
+                    events,
+                } => {
+                    let Some(result) = self.prefill_generate(
+                        &mut ctx,
+                        model,
+                        kind,
+                        &mut prefilled,
+                        &record_id,
+                        &note_id,
+                        &transcript,
+                        &cancel,
+                        &events,
+                    ) else {
+                        // The context is unusable. Drop `events` with no `Done` on it:
+                        // the caller reads the closed channel as "no session" and runs
+                        // the normal path, so the clinician still gets a note.
+                        give_up("the live context could not be reused".into());
+                        break;
+                    };
+                    // Roll the KV back to what `prefilled` describes: the note and the
+                    // turn tail before it sit past that point and must not be reused by a
+                    // regenerate. `Ok(false)` is a *refused* removal — the stale region
+                    // survives, so the session can't be trusted either.
+                    if !matches!(
+                        ctx.clear_kv_cache_seq(Some(0), Some(prefilled.len() as u32), None),
+                        Ok(true)
+                    ) {
+                        give_up("KV rollback after the note failed".into());
+                        let _ = events.send(GenEvent::Done(result));
+                        break;
+                    }
+                    let _ = events.send(GenEvent::Done(result));
+                }
+            }
+        }
+    }
+
+    /// Generate the note on the recording's live context. Same prompt, same decode loop,
+    /// same output as [`generate`] — the only difference is where the prefill came from.
+    ///
+    /// `None` means the context turned out to be unusable and the caller falls back to
+    /// the normal path; `Some(Err)` is the generation's own error, surfaced as usual.
+    #[allow(clippy::too_many_arguments)]
+    fn prefill_generate(
+        &self,
+        ctx: &mut LlamaContext,
+        model: &LlamaModel,
+        kind: LlmModel,
+        prefilled: &mut Vec<LlamaToken>,
+        record_id: &str,
+        note_id: &str,
+        transcript: &str,
+        cancel: &Arc<AtomicBool>,
+        events: &Sender<GenEvent>,
+    ) -> Option<Result<Option<String>>> {
+        let prompt = prompt::build_prompt(kind, transcript);
+        let tokens = match model.str_to_token(&prompt, AddBos::Always) {
+            Ok(t) => t,
+            Err(e) => return Some(Err(anyhow!("failed to tokenize prompt: {e}"))),
+        };
+
+        let output_budget = MAX_REASONING_TOKENS + MAX_OUTPUT_TOKENS;
+        let prompt_budget = N_CTX as i32 - output_budget;
+        if tokens.len() as i32 >= prompt_budget {
+            // Byte-for-byte the error the normal path raises — prefill must never change
+            // what the clinician sees, only how fast they see it.
+            return Some(Err(anyhow!(
+                "transcript is too long for the model context ({} tokens; the prompt \
+                 must stay under {prompt_budget} to leave room for the {output_budget}-token \
+                 reasoning+note within the {N_CTX} context)",
+                tokens.len()
+            )));
+        }
+
+        info!(
+            "[GENERATE] {record_id} → {note_id}, note generation started — {} input tokens",
+            tokens.len()
+        );
+
+        // Longest common prefix against what the recording prefilled. An edit anywhere in
+        // the transcript costs only the tokens after it; an untouched transcript reuses
+        // everything. `prefilled` is a prefix of the prompt in the no-edit case, so the
+        // LCP is its whole length.
+        let reuse = tokens
+            .iter()
+            .zip(prefilled.iter())
+            .take_while(|(a, b)| a == b)
+            .count();
+        // Drop everything past the reuse point. A refused removal (`Ok(false)`) leaves
+        // stale KV entries that would decode into a garbage note — abandon the session
+        // and let the caller regenerate on a fresh context instead.
+        if !matches!(
+            ctx.clear_kv_cache_seq(Some(0), Some(reuse as u32), None),
+            Ok(true)
+        ) {
+            return None;
+        }
+        prefilled.truncate(reuse);
+
+        info!(
+            "[GENERATE] {note_id} prefill session — {reuse} of {} tokens reused, {} to prefill",
+            tokens.len(),
+            tokens.len() - reuse
+        );
+
+        let on_token = |piece: &str| {
+            let _ = events.send(GenEvent::Token(piece.to_string()));
+        };
+        let note = self.decode_and_generate(
+            note_id,
+            ctx,
+            model,
+            &tokens,
+            reuse as i32,
+            MAX_OUTPUT_TOKENS,
+            Some(Suppress {
+                open: prompt::REASONING_OPEN,
+                boundary: prompt::REASONING_BOUNDARY,
+                max_reasoning_tokens: MAX_REASONING_TOKENS,
+            }),
+            &on_token,
+            cancel,
+        );
+        Some(note.map(|n| n.map(|n| prompt::sanitize_note(&n))))
     }
 }
 

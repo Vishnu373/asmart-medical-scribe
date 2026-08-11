@@ -28,24 +28,35 @@ use settings::Settings;
 use store::{SharedStore, Store};
 use stt::SttEngine;
 
-
 /// `Duration::ZERO` disables the idle unload entirely for STT.
 const STT_IDLE_TIMEOUT: Duration = Duration::ZERO;
 
-/// Resolve the STT intra-op thread count: env override, else half the cached
-/// physical cores, probing and caching on first run. `None` = leave ORT alone,
-/// i.e. every session sizes its own pool (stock behaviour) — a machine we cannot
-/// measure gets the default, not a guess. See
-/// docs/implementation-stt-thread-management.md.
-fn stt_thread_count(settings: &mut Settings) -> Option<usize> {
-    if let Some(n) = std::env::var("STT_THREAD_COUNT")
+/// Every thread count in the app, split from one physical-core probe (§8.2).
+struct ThreadSplit {
+    /// ORT intra/inter-op pool for STT.
+    stt: usize,
+    /// llama.cpp single-token decode. The same share as STT, which is idle at
+    /// Generate time — but a separate field, so the STT debug override cannot
+    /// silently retune the LLM.
+    decode: usize,
+    /// llama.cpp batch threads, prefilling transcript segments during the
+    /// recording (§8.9) — the cores STT does not take.
+    prefill: usize,
+}
+
+/// The thread split: half the physical cores to STT and decode, the rest to LLM
+/// prefill. The *core count* is probed once and cached; the split itself is derived
+/// every launch, so changing it here reaches machines that have already probed.
+/// `None` = core count unavailable, so every consumer keeps its own default — a
+/// machine we cannot measure gets the stock behaviour, not a guess.
+/// See docs/implementation-stt-thread-management.md.
+fn thread_split(settings: &mut Settings) -> Option<ThreadSplit> {
+    // Debug knob, read before the probe so it still works on a machine we cannot
+    // measure. Overrides the STT share only — never cached, never seen by the LLM.
+    let stt_override = std::env::var("STT_THREAD_COUNT")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
-        .filter(|n| *n > 0)
-    {
-        log::info!("[STT] thread allocation override: {n} threads from STT_THREAD_COUNT");
-        return Some(n);
-    }
+        .filter(|n| *n > 0);
 
     let cached = settings.physical_cores;
     let physical = match cached {
@@ -53,20 +64,32 @@ fn stt_thread_count(settings: &mut Settings) -> Option<usize> {
         None => {
             let n = sysinfo::System::new().physical_core_count()?;
             settings.physical_cores = Some(n);
-            log::info!("[STT] thread allocated: {n} physical cores");
             n
         }
     };
 
-    // Integer division floors, by decision: 7 cores → 3 threads, never 4.
-    // Derived once, here — the cache holds cores, not threads (§3.1).
-    let threads = (physical / 2).max(1);
-    if cached.is_some() {
-        log::info!("[STT] thread allocation cache hit: {threads} threads");
+    // Integer division floors, by decision: 7 cores → 3 for STT/decode, 4 for prefill.
+    // Derived here rather than cached — the cache holds cores, not threads (§3.1).
+    let decode = (physical / 2).max(1);
+    let prefill = (physical - decode).max(1);
+    let stt = stt_override.unwrap_or(decode);
+
+    log::info!(
+        "[THREADS] {physical} physical cores {}",
+        if cached.is_some() { "(cached)" } else { "detected" }
+    );
+    if stt_override.is_some() {
+        log::info!("[STT] thread allocation override: {stt} threads from STT_THREAD_COUNT");
     } else {
-        log::info!("[STT] thread allocation cached: {threads} threads");
+        log::info!("[STT] thread allocated: {stt} threads");
     }
-    Some(threads)
+    log::info!("[LLM] thread allocated: {decode} decode, {prefill} prefill");
+
+    Some(ThreadSplit {
+        stt,
+        decode,
+        prefill,
+    })
 }
 
 /// Size the ORT global thread pool. With a global pool set, `DisablePerSessionThreads`
@@ -74,7 +97,7 @@ fn stt_thread_count(settings: &mut Settings) -> Option<usize> {
 /// sizing its own to the physical core count.
 // Phase 1 (experiment): the count came from `ASMART_STT_THREADS` /
 // `ASMART_STT_INTER_THREADS`, and an unset var meant no pool at all. Both are now
-// resolved by `stt_thread_count` above.
+// resolved by `thread_split` above.
 // fn init_ort_thread_pool() {
 //     let intra = std::env::var("ASMART_STT_THREADS")
 //         .ok()
@@ -103,10 +126,10 @@ fn init_ort_thread_pool(intra: usize) {
         }
     };
 
-    // `false` means an ORT environment already existed and ours was ignored — logged
-    // rather than swallowed, or the allocation above is inert while looking applied.
-    let committed = ort::init().with_global_thread_pool(opts).commit();
-    log::info!("[STT] ORT global pool intra={intra} inter={inter} committed={committed}");
+    // A `false` return means an ORT environment already existed and ours was ignored.
+    // let committed = ort::init().with_global_thread_pool(opts).commit();
+    // log::info!("[STT] ORT global pool intra={intra} inter={inter} committed={committed}");
+    let _ = ort::init().with_global_thread_pool(opts).commit();
 }
 
 /// Builds and runs the Tauri application.
@@ -158,7 +181,6 @@ pub fn run() {
                 .join("models")
                 .join("silero_vad_v4.onnx");
 
-
             let data_dir = app.path().app_data_dir()?;
             std::fs::create_dir_all(&data_dir)?;
 
@@ -180,11 +202,12 @@ pub fn run() {
             let mut app_settings = Settings::load(&settings_path).map_err(|e| e.to_string())?;
 
             // Must precede any ORT session (STT preload, SileroVad) — the environment is
-            // first-write-wins. May write `physical_cores` on first run, hence after the
+            // first-write-wins. May write the thread counts on first run, hence after the
             // load and before the save.
             let probed_before = app_settings.physical_cores;
-            if let Some(n) = stt_thread_count(&mut app_settings) {
-                init_ort_thread_pool(n);
+            let threads = thread_split(&mut app_settings);
+            if let Some(t) = &threads {
+                init_ort_thread_pool(t.stt);
             }
             // `SharedSettings::new` only wraps the value — it never writes. Without this the
             // probed count stays in memory and every launch re-probes.
@@ -197,10 +220,9 @@ pub fn run() {
             // }
             if app_settings.physical_cores != probed_before {
                 if let Err(e) = app_settings.patch_physical_cores(&settings_path) {
-                    log::warn!("[STT] settings save failed (non-fatal): {e}");
+                    log::warn!("[THREADS] settings save failed (non-fatal): {e}");
                 }
             }
-
 
             // deleting old models - applications running v.0.1.1
             if let Err(e) = models::cleanup_retired_weights(app.handle()) {
@@ -211,18 +233,16 @@ pub fn run() {
             let llm_model = LlmModel::Gemma;
             let model_dirs = models::model_dirs(app.handle()).map_err(|e| e.to_string())?;
 
-            // 1. LLM thread count - Option 1 -> using half of physical cores for both prefill and decode 
-            // 2. Option 2 -> when physical cores unavailable, llama.cpp pick its own default. 
-            let n_threads = sysinfo::System::new()
-                .physical_core_count()
-                .map(|physical| (physical / 2).max(1) as i32);
+            // `None` on both when the core count is unavailable, leaving llama.cpp its
+            // own defaults.
+            let n_threads = threads.as_ref().map(|t| t.decode as i32);
+            let n_threads_batch = threads.as_ref().map(|t| t.prefill as i32);
 
             // managed state for the LLM sharing -> model, location, thread count
             let llm_engine = Arc::new(
-                LlmEngine::new(llm_model, model_dirs.clone(), n_threads)
+                LlmEngine::new(llm_model, model_dirs.clone(), n_threads, n_threads_batch)
                     .map_err(|e| e.to_string())?,
             );
-
 
             // managed state for the LLM sharing -> STT engine, location, llm engine
             app.manage(commands::PreloadGate::new(
@@ -242,6 +262,7 @@ pub fn run() {
             // 5. save the recording
             // 6. location of dumping transcript in case DB fails
             let handle = app.handle().clone();
+            // 7. LLM engine — segments are pushed to its prefill session as they land
             let pipeline = RealPipeline::new(
                 handle.clone(),
                 engine,
@@ -249,6 +270,7 @@ pub fn run() {
                 model_dirs,
                 store.clone(),
                 data_dir,
+                llm_engine.clone(),
             );
 
             // managed state for closing - unloads LLM
@@ -256,7 +278,6 @@ pub fn run() {
 
             // note generation struct
             let generator = RealNoteGenerator::new(handle.clone(), llm_engine, store.clone());
-
 
             // Coordinator
             // 1. recording pipeline
@@ -316,7 +337,7 @@ pub fn run() {
 
                 handle.state::<Arc<LlmEngine>>().unload();
                 log::info!("[CLOSE] SLM model unloaded");
-                
+
                 log::info!("[CLOSE] application closed");
             }
         });

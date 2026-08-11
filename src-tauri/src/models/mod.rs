@@ -383,12 +383,15 @@ fn stream_verified(
     let mut next_emit: u64 = 0;
 
     loop {
-        let n = reader.read(&mut buf).map_err(|e| anyhow!("read body: {e}"))?;
+        let n = reader
+            .read(&mut buf)
+            .map_err(|e| anyhow!("read body: {e}"))?;
         if n == 0 {
             break;
         }
         hasher.update(&buf[..n]);
-        out.write_all(&buf[..n]).map_err(|e| anyhow!("write body: {e}"))?;
+        out.write_all(&buf[..n])
+            .map_err(|e| anyhow!("write body: {e}"))?;
         downloaded += n as u64;
         if downloaded >= next_emit {
             let _ = app.emit(
@@ -402,7 +405,8 @@ fn stream_verified(
             next_emit = downloaded + EMIT_EVERY;
         }
     }
-    out.sync_all().map_err(|e| anyhow!("flush temp file: {e}"))?;
+    out.sync_all()
+        .map_err(|e| anyhow!("flush temp file: {e}"))?;
     drop(out);
 
     // A dropped connection EOFs the reader as `Ok(0)` rather than erroring, so a
@@ -463,11 +467,17 @@ mod tests {
 
         // Present only in the second dir → found there.
         fs::write(b.path().join("model.gguf"), b"x").unwrap();
-        assert_eq!(resolve("model.gguf", &dirs).unwrap(), b.path().join("model.gguf"));
+        assert_eq!(
+            resolve("model.gguf", &dirs).unwrap(),
+            b.path().join("model.gguf")
+        );
 
         // Present in both → the first (download dir) shadows the bundled one.
         fs::write(a.path().join("model.gguf"), b"x").unwrap();
-        assert_eq!(resolve("model.gguf", &dirs).unwrap(), a.path().join("model.gguf"));
+        assert_eq!(
+            resolve("model.gguf", &dirs).unwrap(),
+            a.path().join("model.gguf")
+        );
     }
 
     #[test]

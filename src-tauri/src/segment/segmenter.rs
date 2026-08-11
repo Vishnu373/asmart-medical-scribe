@@ -26,7 +26,7 @@ impl Default for SegmenterConfig {
     fn default() -> Self {
         let rate = TARGET_SAMPLE_RATE as usize;
         Self {
-            min_samples: rate / 5, // 0.2 s
+            min_samples: rate / 5,  // 0.2 s
             max_samples: rate * 25, // 25 s
         }
     }

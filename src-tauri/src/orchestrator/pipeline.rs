@@ -8,6 +8,7 @@ use serde_json::json;
 use tauri::{AppHandle, Emitter};
 
 use crate::audio_toolkit::{AudioRecorder, SileroVad, SmoothedVad};
+use crate::llm::LlmEngine;
 use crate::segment::{spawn_stt_worker, Segmenter, SegmenterConfig, SttWorkerHandle};
 use crate::store::SharedStore;
 use crate::stt::{ModelKind, SttEngine, Transcriber};
@@ -42,6 +43,9 @@ pub struct RealPipeline {
     /// recoverable `.txt` so a finished consult is never lost (it lived only in
     /// memory until this point).
     data_dir: PathBuf,
+    /// Note-generation engine. The pipeline only touches its prefill session: start one
+    /// per recording and push each finished segment at it (design §8.9).
+    llm: Arc<LlmEngine>,
     running: Option<Running>,
 }
 
@@ -65,6 +69,7 @@ impl RealPipeline {
         model_dirs: Vec<PathBuf>,
         store: SharedStore,
         data_dir: PathBuf,
+        llm: Arc<LlmEngine>,
     ) -> Self {
         Self {
             app,
@@ -73,6 +78,7 @@ impl RealPipeline {
             model_dirs,
             store,
             data_dir,
+            llm,
             running: None,
         }
     }
@@ -108,9 +114,14 @@ impl Pipeline for RealPipeline {
 
         let transcript = Arc::new(Mutex::new(Vec::<String>::new()));
 
+        // Start this recording's prefill session before the first segment can land, so no
+        // segment is silently dropped on the floor. Replaces any previous session.
+        self.llm.begin_prefill();
+
         let worker = {
             let app = self.app.clone();
             let transcript = transcript.clone();
+            let llm = self.llm.clone();
             let transcriber: Arc<dyn Transcriber> = self.engine.clone();
             spawn_stt_worker(seg_rx, transcriber, move |res| match res {
                 Ok(ts) => {
@@ -119,7 +130,14 @@ impl Pipeline for RealPipeline {
                     if let Ok(mut t) = transcript.lock() {
                         t.push(ts.text.clone());
                     }
-                    let _ = app.emit("transcript-segment", json!({ "seq": ts.seq, "text": ts.text }));
+                    let _ = app.emit(
+                        "transcript-segment",
+                        json!({ "seq": ts.seq, "text": ts.text }),
+                    );
+                    // Second destination after the UI (design §6.5). Queued, never inline:
+                    // prefilling here would hold segment N+1's transcription behind
+                    // segment N's prefill, serializing the two phases §8.9 overlaps.
+                    llm.push_prefill_segment(ts.seq, &ts.text);
                 }
                 Err(e) => {
                     let _ = app.emit(
