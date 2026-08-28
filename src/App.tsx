@@ -63,10 +63,11 @@ function App() {
   //     .catch(() => setTrial({ expired: false, endDate: "" }));
   // }, []);
 
-  // Are the required models present? If not, Setup downloads them first (D3).
+  // Are the models present? If not, Setup downloads them first (D3). The optional
+  // draft model opens Setup too, but Setup releases anyway if it can't be fetched.
   useEffect(() => {
     setupStatus()
-      .then((s) => setSetupReady(s.ready))
+      .then((s) => setSetupReady(s.ready && s.draft_present))
       .catch(() => setSetupReady(true)); // don't hard-block if the check fails
   }, []);
 

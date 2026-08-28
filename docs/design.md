@@ -730,6 +730,20 @@ Note what does *not* motivate the suffix. The snapshot's layout is fixed by the 
 
 **Logging.** The `[PREFILL]` rows are in the §10.3 catalog, on-device only: token counts and durations, never transcript text (NFR-6).
 
+### 8.10 Speculative decoding
+
+**What it does.** Writing a note one token at a time means reading all 3.18 GB of weights out of memory for each token. The arithmetic is cheap; the memory read is not, which is why decoding is slow in a way prefill is not. Speculative decoding has a **second, much smaller model** guess the next few tokens, and the real model check all of those guesses in a single pass — one weight read instead of several. Guesses that survive the check are kept for free.
+
+**The guarantee.** A guess is kept only when it is exactly the token the real model would have written anyway. Anything else is thrown away and the real model's own choice is used instead. Notes therefore come out **byte-identical** to what the app produces without the feature — the same promise §8.6, §8.7 and §8.9 each make about their caches. Nothing the small model invents can reach clinical text.
+
+**The draft model.** `gemma4-e2b-draft.gguf` — Google's own Gemma 4 E2B assistant head, 93 MiB, Q8_0. It is not a standalone model: it shares the note model's vocabulary exactly (token ids mean the same thing in both, which the technique requires) and rides the note model's own KV cache rather than keeping a separate one. It loads on whatever backend §8.8 chose for the note model, and stays resident alongside it (§7); at 93 MiB it is a rounding error against the 3.18 GB target.
+
+**Distribution.** The draft is fetched at Setup like the other weights, with its own progress row and its own SHA-256 (§14). Unlike the note and STT models it is **optional**: it does not gate the app. A device that cannot download it — offline, or behind a firewall — retries a few times and is then released into the app, which runs exactly as it did before, just without the speedup. A missed download is visible rather than a silent permanent slowdown, but it is never a reason a clinician cannot record a consult.
+
+**Always falls back.** Every failure — no draft file, a vocabulary that does not match, a context that will not build, a decode error, a refused KV trim — switches the feature off for the session and lets the existing decode loop write the note as it does today. `MEDSCRIBE_NO_SPECULATIVE=1` does the same on demand, for benchmarking and support. Speculative decoding can make a note faster; it can never make one wrong, and it can never turn a working consult into an error.
+
+**Status.** The draft model has been chosen and is distributed (Setup fetches it today). The decode-loop change is not built yet, and whether it ships at all depends on measuring how often the guesses are accepted — below roughly 30% the draft work costs more than it saves. See [`implementation-spec-decoding.md`](implementation-spec-decoding.md) for the phased plan and the open blocker in the llama.cpp bindings.
+
 ## 9. Data Model & Interfaces
 
 This section consolidates what the app persists and the Tauri command/event contracts that cross the React ↔ Rust boundary. It gathers contracts introduced piecewise in §6 and §8 into one reference.
@@ -866,6 +880,9 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[THREADS]`, `[LOAD]`,
 | `[LAUNCH] downloading SLM model {model_name}` | ✓ | ✓ |
 | `[LAUNCH] download SLM model failed {e}` | ✓ | ✓ |
 | `[LAUNCH] SLM model checksum mismatch` | ✓ | ✓ |
+| `[LAUNCH] downloading DRAFT model {model_name}` | ✓ | ✓ |
+| `[LAUNCH] download DRAFT model failed {e}` | ✓ | ✓ |
+| `[LAUNCH] DRAFT model checksum mismatch` | ✓ | ✓ |
 | `[GPU] dGPU selected: {adapter} ({vram} MB dedicated) — offloading all layers` | ✓ | |
 | `[GPU] iGPU selected: {adapter} ({vram} MB shared) — offloading all layers` | ✓ | |
 | `[GPU] {adapter} skipped: {vram} MB below the {floor} MB floor` | ✓ | |

@@ -215,13 +215,13 @@ Only needed when the model weights change.
 nothing else (any terminal; example uses Command Prompt):
 
 ```bash
-curl -L -o scripts\models\model_file_name "model_file_url"
+curl -L -o scripts\models\<model_file_name> <model_file_url>
 ```
 
 **Hash** it with SHA-256:
 
 ```bash
-certutil -hashfile scripts\models\model_file_name SHA256
+certutil -hashfile scripts\models\<model_file_name> SHA256
 ```
 
 Copy the resulting hash into the matching model entry in:

@@ -1,5 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import {
+  downloadDraft,
   downloadLlm,
   downloadStt,
   frontendReady,
@@ -17,10 +18,14 @@ import type { SetupStatus } from "@/bridge";
 const LLM = "llm";
 /** The Parakeet STT download's event key (matches `models::STT.tier`). */
 const STT = "stt";
+/** The draft model's download event key (matches `models::DRAFT.tier`). */
+const DRAFT = "draft";
+/** Automatic retries after a failed download, before the row falls back to Retry. */
+const MAX_RETRIES = 3;
 
-/** A required model the first run must fetch, derived from `SetupStatus`. */
+/** A model the first run fetches, derived from `SetupStatus`. */
 interface Slot {
-  /** Event key: `"llm"` or `"stt"`. */
+  /** Event key: `"llm"`, `"stt"` or `"draft"`. */
   key: string;
   label: string;
   present: boolean;
@@ -30,20 +35,23 @@ function slotsFor(s: SetupStatus): Slot[] {
   return [
     { key: LLM, label: "Note model", present: s.llm_present },
     { key: STT, label: "Speech recognition", present: s.stt_present },
+    { key: DRAFT, label: "Draft model for note generation", present: s.draft_present },
   ];
 }
 
 /**
  * First-run Setup gate (§8.2, D3). The installer ships no model weights, so on
- * first launch the required set — the RAM-fit LLM and the Parakeet STT model — is
- * downloaded once, verified, and cached. Missing models start downloading
- * automatically; a failed one shows a Retry.
+ * first launch the required set — the RAM-fit LLM and the Parakeet STT model — plus
+ * the optional speculative-decoding draft model is downloaded once, verified, and
+ * cached. Missing models start downloading automatically and retry MAX_RETRIES
+ * times; a still-failing one shows a Retry. An updating install lands here too,
+ * with only the draft model missing.
  *
  * The downloads are not the last step: the note model's first load primes the
  * prompt-prefix KV cache (§8.7), ~22s that would otherwise land on an apparently
- * stalled main screen. So Setup holds for a third step, "Preparing note model…",
- * until the model reports ready. The app is blocked behind this screen until all
- * three finish; thereafter Setup is skipped entirely.
+ * stalled main screen. So Setup holds for a final step, "Preparing note model…",
+ * until the model reports ready. The app is blocked behind this screen until the
+ * required models finish; thereafter Setup is skipped entirely.
  */
 export default function SetupView({ onReady }: { onReady: () => void }) {
   const [status, setStatus] = useState<SetupStatus | null>(null);
@@ -54,6 +62,25 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   // Keys already kicked off, so re-renders/re-fetches don't double-start a worker.
   const started = useRef<Set<string>>(new Set());
+  // Read inside the once-registered event listeners, so refs rather than state:
+  // the latest status, retries spent per key, and the keys that ran out of them.
+  const statusRef = useRef<SetupStatus | null>(null);
+  const retries = useRef<Record<string, number>>({});
+  const exhausted = useRef<Set<string>>(new Set());
+  // A required model was missing at mount — a real first run, not an update.
+  const firstRun = useRef(false);
+
+  /** Setup can close: the draft model is optional, so a device that cannot fetch
+   *  it is released into the app rather than stranded here. */
+  const canRelease = (s: SetupStatus) =>
+    s.ready && (s.draft_present || exhausted.current.has(DRAFT));
+
+  /** Hand over to the priming step below, marking a genuine first-run finish. */
+  const release = () => {
+    // §3 telemetry: only a real first run counts, not an update fetching the draft.
+    if (firstRun.current) void markSetupCompleted().catch(() => {});
+    setPriming(true);
+  };
 
   const start = (key: string) => {
     started.current.add(key);
@@ -63,11 +90,39 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
       return next;
     });
     setProgress((p) => ({ ...p, [key]: 0 }));
-    const call = key === STT ? downloadStt() : downloadLlm();
-    call.catch((err) => {
-      started.current.delete(key);
-      setErrors((e) => ({ ...e, [key]: String(err) }));
+    const call =
+      key === STT ? downloadStt() : key === DRAFT ? downloadDraft() : downloadLlm();
+    // A rejected invoke is a failed attempt too — no `model-download-error` event
+    // is coming for it, so it has to enter the same retry path.
+    call.catch((err) => fail(key, String(err)));
+  };
+
+  /** One failed attempt: retry while the budget lasts, else surface the error and
+   *  stop holding Setup if the only thing still missing is the optional draft. */
+  const fail = (key: string, message: string) => {
+    started.current.delete(key);
+    setProgress((prev) => {
+      const next = { ...prev };
+      delete next[key];
+      return next;
     });
+    const spent = (retries.current[key] ?? 0) + 1;
+    retries.current[key] = spent;
+    if (spent <= MAX_RETRIES) {
+      start(key);
+      return;
+    }
+    setErrors((prev) => ({ ...prev, [key]: message }));
+    exhausted.current.add(key);
+    const s = statusRef.current;
+    if (s && canRelease(s)) release();
+  };
+
+  /** Manual Retry: give the key a fresh retry budget and try once more. */
+  const retryNow = (key: string) => {
+    retries.current[key] = 0;
+    exhausted.current.delete(key);
+    start(key);
   };
 
   // Load status once, then auto-start any missing download.
@@ -75,7 +130,9 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
     setupStatus()
       .then((s) => {
         setStatus(s);
-        if (s.ready) {
+        statusRef.current = s;
+        firstRun.current = !s.llm_present || !s.stt_present;
+        if (canRelease(s)) {
           onReady();
           return;
         }
@@ -100,30 +157,19 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
         setupStatus()
           .then((s) => {
             setStatus(s);
-            if (s.ready) {
-              // Reached here only via a completed download → a genuine first-run
-              // setup finish (§3 telemetry). Best-effort; never block the UI.
-              void markSetupCompleted().catch(() => {});
-              // onReady();
-              // Not done yet — hand over to the priming step below.
-              setPriming(true);
-            }
+            statusRef.current = s;
+            // onReady();
+            // Not done yet — hand over to the priming step below.
+            if (canRelease(s)) release();
           })
           .catch(() => {});
       }),
-      onModelDownloadError((e) => {
-        started.current.delete(e.tier);
-        setProgress((prev) => {
-          const next = { ...prev };
-          delete next[e.tier];
-          return next;
-        });
-        setErrors((prev) => ({ ...prev, [e.tier]: e.message }));
-      }),
+      onModelDownloadError((e) => fail(e.tier, e.message)),
     ]);
     return () => {
       unlisten.then((fns) => fns.forEach((fn) => fn()));
     };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
 
   // Third step: load + prime the note model (§8.2 preload, §8.7 prefix cache) and
@@ -201,7 +247,7 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
                     <span className="flex-1 truncate">{err}</span>
                     <button
                       type="button"
-                      onClick={() => start(slot.key)}
+                      onClick={() => retryNow(slot.key)}
                       className="rounded border border-neutral-700 px-2 py-0.5 text-neutral-200 hover:bg-neutral-800"
                     >
                       Retry

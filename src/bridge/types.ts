@@ -53,7 +53,9 @@ export interface InputDevice {
 export interface SetupStatus {
   llm_present: boolean;
   stt_present: boolean;
-  /** Both required models present — the app can leave Setup. */
+  /** The speculative-decoding draft model (spec-decoding B1). */
+  draft_present: boolean;
+  /** All required models present — the app can leave Setup. */
   ready: boolean;
 }
 

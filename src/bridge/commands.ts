@@ -143,6 +143,12 @@ export function downloadStt(): Promise<void> {
   return invoke("download_stt");
 }
 
+/** Begin downloading the speculative-decoding draft model (spec-decoding B1);
+ * progress arrives as `model-download-*` events keyed by tier `"draft"`. */
+export function downloadDraft(): Promise<void> {
+  return invoke("download_draft");
+}
+
 // — Hand-off (§8.6)
 
 /** Copy a SOAP section's plain text to the clipboard for manual EMR paste (F7 interim). */

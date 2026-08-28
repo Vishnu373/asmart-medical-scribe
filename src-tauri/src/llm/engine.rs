@@ -1,4 +1,4 @@
-//! In-process GGUF note generation over `llama-cpp-2` (design §8.2). CPU-only, no
+//! In-process GGUF note generation over `llama-cpp-4` (design §8.2). CPU-only, no
 //! server, no network — generation stays on-device (NFR-6).
 //!
 //! Like the STT engine, the native model sits behind the `NoteGenerator` trait so
@@ -18,15 +18,18 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use log::{info, warn};
 
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
-use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::LlamaStateSeqFlags;
+// These read `llama_cpp_2::…` before the migration — only the crate name changed,
+// every module path below is identical (migration M2).
+use llama_cpp_4::context::params::LlamaContextParams;
+use llama_cpp_4::context::LlamaContext;
+use llama_cpp_4::llama_backend::LlamaBackend;
+use llama_cpp_4::llama_batch::LlamaBatch;
+use llama_cpp_4::model::params::LlamaModelParams;
+use llama_cpp_4::model::{AddBos, LlamaModel, Special};
+use llama_cpp_4::sampling::LlamaSampler;
+use llama_cpp_4::token::LlamaToken;
+// llama-cpp-4 takes the state-seq flags as a plain `u32`, so the newtype is gone:
+// use llama_cpp_2::LlamaStateSeqFlags;
 
 use super::prefill::{self, GenEvent, PrefillCmd, PrefillSession};
 use super::prompt;
@@ -49,6 +52,15 @@ impl LlmModel {
     pub fn file_name(self) -> &'static str {
         match self {
             LlmModel::Gemma => "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
+        }
+    }
+
+    /// The speculative-decoding draft GGUF's filename (spec-decoding B1). Beside
+    /// [`file_name`](Self::file_name) for the same reason: the download
+    /// (`models::DRAFT`) and the loader must agree on the name in one place.
+    pub fn draft_file_name(self) -> &'static str {
+        match self {
+            LlmModel::Gemma => "gemma4-e2b-draft.gguf",
         }
     }
 }
@@ -407,10 +419,14 @@ impl LlmEngine {
         // used (~the prefix), not the N_CTX maximum the whole-context `get_state_size`
         // reports — so priming doesn't briefly allocate and zero ~1 GB right after the
         // model load, which would spike RAM against the §7 co-resident budget.
-        let mut state = vec![0u8; ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty())];
-        let written = unsafe {
-            ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty())
-        };
+        // Pre-migration, through llama-cpp-2's flag newtype and raw destination pointer:
+        // let mut state = vec![0u8; ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty())];
+        // let written = unsafe {
+        //     ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty())
+        // };
+        // Flags `0` = no PARTIAL_ONLY: the full sequence state, as before.
+        let mut state = vec![0u8; ctx.state_seq_get_size_ext(0, 0)];
+        let written = ctx.state_seq_get_data_ext(&mut state, 0, 0);
         state.truncate(written);
         // `state_seq_get_data_ext` reports 0 on internal failure and has no `Result`. An empty
         // (or absurdly short) blob writes and reads back fine, so nothing downstream would ever
@@ -512,7 +528,8 @@ impl LlmEngine {
         // Some(dir.join(format!("prefix_kv_{}_{hash}.bin", kind.file_name())))
         // Stamped with llama-cpp-2's version before the sys fix; see build.rs:
         // let version = env!("LLAMA_CPP_2_VERSION");
-        let version = env!("LLAMA_CPP_SYS_2_VERSION");
+        // let version = env!("LLAMA_CPP_SYS_2_VERSION");   // pre-llama-cpp-4 migration
+        let version = env!("LLAMA_CPP_SYS_4_VERSION");
         Some(dir.join(format!(
             "prefix_kv_{}_{hash}_{version}.bin",
             kind.file_name()
@@ -559,10 +576,13 @@ impl LlmEngine {
         if pc.kind != kind || tokens.len() <= n || tokens[..n] != pc.prefix_tokens[..] {
             return 0;
         }
-        // Safety: `state` came from `state_seq_get_data_ext` on a context created with
-        // the same model and params, restored onto the same sequence id (0) — the
-        // binding's contract for restore.
-        let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
+        // `state` came from `state_seq_get_data_ext` on a context created with the same
+        // model and params, restored onto the same sequence id (0) — llama.cpp rejects
+        // the blob rather than misreading it if that ever stops holding.
+        // Pre-migration this was `unsafe` and returned a bool:
+        // let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
+        // llama-cpp-4 returns the bytes read instead — 0 is the failure signal.
+        let ok = ctx.state_seq_set_data_ext(&pc.state, 0, 0) > 0;
         if !ok {
             // Restore failed — reset any partial state and decode the whole prompt.
             // Logged because this is the one silent way the cache stops paying off: the note
@@ -590,9 +610,10 @@ impl LlmEngine {
         if pc.kind != kind {
             return None;
         }
-        // Safety: same contract as `restore_prefix` — the blob came from
-        // `state_seq_get_data_ext` on a context built from this model and params.
-        let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
+        // Same contract as `restore_prefix` — the blob came from `state_seq_get_data_ext`
+        // on a context built from this model and params.
+        // let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
+        let ok = ctx.state_seq_set_data_ext(&pc.state, 0, 0) > 0;
         if !ok {
             warn!("[PREFILL] prefix KV restore rejected by llama.cpp");
             ctx.clear_kv_cache();

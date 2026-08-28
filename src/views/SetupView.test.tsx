@@ -34,22 +34,41 @@ function firstRunThenComplete(llmStatus: "loading" | "ready" = "loading") {
     if (cmd === "setup_status") {
       calls += 1;
       const done = calls > 1;
-      return Promise.resolve({ llm_present: done, stt_present: done, ready: done });
+      return Promise.resolve({
+        llm_present: done,
+        stt_present: done,
+        draft_present: done,
+        ready: done,
+      });
     }
     if (cmd === "get_llm_status") return Promise.resolve(llmStatus);
     return Promise.resolve(undefined);
   });
 }
 
+/** A device taking the spec-decoding update: only the optional draft is missing,
+ *  so the backend already reports `ready` (it is not part of the gate). */
+const updatingInstall = {
+  llm_present: true,
+  stt_present: true,
+  draft_present: false,
+  ready: true,
+};
+
+/** How many times a `download_draft` worker was asked for. */
+const draftDownloads = () =>
+  mockInvoke.mock.calls.filter(([cmd]) => cmd === "download_draft").length;
+
 describe("SetupView", () => {
   it("auto-starts the missing required downloads on first run", async () => {
-    // First run: neither the note model nor Parakeet is present.
+    // First run: none of the three required models is present.
     mockInvoke.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "setup_status":
           return Promise.resolve({
             llm_present: false,
             stt_present: false,
+            draft_present: false,
             ready: false,
           });
         default:
@@ -59,11 +78,78 @@ describe("SetupView", () => {
 
     render(<SetupView onReady={vi.fn()} />);
 
-    // Both required models begin downloading without a click.
+    // All required models begin downloading without a click.
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("download_llm"));
     expect(mockInvoke).toHaveBeenCalledWith("download_stt");
+    expect(mockInvoke).toHaveBeenCalledWith("download_draft");
     expect(await screen.findByText("Note model")).toBeInTheDocument();
     expect(screen.getByText("Speech recognition")).toBeInTheDocument();
+    expect(screen.getByText("Draft model for note generation")).toBeInTheDocument();
+  });
+
+  it("stays gated and fetches only the draft model on an updating install", async () => {
+    // The spec-decoding update ships to a device that already has the other two:
+    // Setup reopens, pulls the one missing file, and does not re-download the rest.
+    const onReady = vi.fn();
+    mockInvoke.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "setup_status":
+          return Promise.resolve(updatingInstall);
+        default:
+          return Promise.resolve(undefined);
+      }
+    });
+
+    render(<SetupView onReady={onReady} />);
+
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("download_draft"));
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_llm");
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_stt");
+    // The draft is still downloading, so Setup holds even though `ready` is true.
+    expect(onReady).not.toHaveBeenCalled();
+  });
+
+  it("retries a failed download before giving up on it", async () => {
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "setup_status") return Promise.resolve(updatingInstall);
+      return Promise.resolve(undefined);
+    });
+
+    render(<SetupView onReady={vi.fn()} />);
+    await waitFor(() => expect(handlers["model-download-error"]).toBeDefined());
+
+    // The first attempt plus MAX_RETRIES more, then the row is left to the user.
+    for (let i = 0; i < 5; i += 1) {
+      await act(async () => {
+        handlers["model-download-error"]({ tier: "draft", message: "network down" });
+      });
+    }
+
+    expect(draftDownloads()).toBe(4);
+    expect(await screen.findByText("network down")).toBeInTheDocument();
+  });
+
+  it("releases the app when the optional draft model cannot be downloaded", async () => {
+    // An offline clinic on the spec-decoding update: the draft never arrives, but
+    // the LLM and STT are both present, so the app must not be stranded on Setup.
+    const onReady = vi.fn();
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "setup_status") return Promise.resolve(updatingInstall);
+      if (cmd === "get_llm_status") return Promise.resolve("ready");
+      return Promise.resolve(undefined);
+    });
+
+    render(<SetupView onReady={onReady} />);
+    await waitFor(() => expect(handlers["model-download-error"]).toBeDefined());
+    for (let i = 0; i < 5; i += 1) {
+      await act(async () => {
+        handlers["model-download-error"]({ tier: "draft", message: "network down" });
+      });
+    }
+
+    await waitFor(() => expect(onReady).toHaveBeenCalled());
+    // Not a first run — the required models were already there (§3 telemetry).
+    expect(mockInvoke).not.toHaveBeenCalledWith("mark_setup_completed");
   });
 
   it("releases into the app when the required set is already present", async () => {
@@ -74,6 +160,7 @@ describe("SetupView", () => {
           return Promise.resolve({
             llm_present: true,
             stt_present: true,
+            draft_present: true,
             ready: true,
           });
         default:
@@ -84,9 +171,10 @@ describe("SetupView", () => {
     render(<SetupView onReady={onReady} />);
 
     await waitFor(() => expect(onReady).toHaveBeenCalled());
-    // Nothing is downloaded when both models are already on disk.
+    // Nothing is downloaded when every model is already on disk.
     expect(mockInvoke).not.toHaveBeenCalledWith("download_llm");
     expect(mockInvoke).not.toHaveBeenCalledWith("download_stt");
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_draft");
     // `setup_completed` marks a genuine first-run finish (§3 telemetry) — it must
     // NOT fire when models are already present (a later, ordinary launch).
     expect(mockInvoke).not.toHaveBeenCalledWith("mark_setup_completed");

@@ -13,6 +13,7 @@ graphify-out/
 
 # implementation.md file
 docs/implementation.md
+docs/implementation-spec-decoding.md
 
 # uploading models, models folder
 scripts/models/
@@ -42,6 +43,3 @@ src-tauri/resources/models/*
 # Claude files
 .claude/
 CLAUDE.md
-
-# Codex files
-AGENTS.md

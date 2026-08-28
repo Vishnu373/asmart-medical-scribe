@@ -67,7 +67,7 @@ pub trait Pipeline: Send {
 
 /// Produces a SOAP note from a finalized transcript (design §8). Abstracted
 /// behind a trait so the GENERATING state machine is unit-testable with a mock,
-/// while production wires the in-process `llama-cpp-2` model (`RealNoteGenerator`).
+/// while production wires the in-process `llama-cpp-4` model (`RealNoteGenerator`).
 ///
 /// `generate` is long-running and synchronous; the coordinator calls it with the
 /// state lock released so a concurrent `cancel_generation` can flip `cancel`. The

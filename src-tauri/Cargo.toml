@@ -33,7 +33,7 @@ rustfft = "6"
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 # STT engine (B5): Parakeet TDT v3 via the ONNX backend, CPU-only. v1 ships
 # Parakeet only — the `whisper-cpp` feature is intentionally omitted because
-# whisper.cpp and llama-cpp-2 (B10) each statically vendor ggml, which collides at
+# whisper.cpp and llama-cpp-4 (B10) each statically vendor ggml, which collides at
 # link time. Parakeet (ONNX) carries no ggml, so the LLM links cleanly.
 transcribe-rs = { version = "0.3.8", default-features = false, features = ["onnx"] }
 # Direct ORT handle so we can size the global thread pool before any session is built
@@ -63,7 +63,14 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # ROCm: one backend covers every vendor. Version stays pinned — it is part of the
 # §8.7 KV blob filename, so bumping it invalidates every cached blob.
 # llama-cpp-2 = "0.1.150"   # pre-§8.8, CPU-only
-llama-cpp-2 = { version = "0.1.150", features = ["vulkan"] }
+# llama-cpp-2 = { version = "0.1.150", features = ["vulkan"] }   # pre-MTP; no ctx_other
+# Migrated to the `llama-cpp-4` fork for MTP speculative decoding (docs/
+# implementation-spec-decoding.md, Phase M). `default-features = false` drops `mtmd`
+# (no multimodal path) and, critically, `dynamic-link`, which would expect llama.cpp
+# as a shared library the installer does not ship. `openmp` is re-added by hand: it
+# was on by default under llama-cpp-2, so keeping it is what makes M3's parity
+# check a comparison of the crates rather than of two thread backends.
+llama-cpp-4 = { version = "0.6.1", default-features = false, features = ["vulkan", "openmp"] }
 # EMR hand-off: the note's Copy button writes the whole note to the system
 # clipboard. The §8.6 global-hotkey hand-off was withdrawn — no keystroke injection.
 tauri-plugin-clipboard-manager = "2"

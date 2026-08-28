@@ -23,6 +23,7 @@ const { respond } = vi.hoisted(() => ({
         return Promise.resolve({
           llm_present: true,
           stt_present: true,
+          draft_present: true,
           ready: true,
         });
       case "get_settings":

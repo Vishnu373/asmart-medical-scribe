@@ -7,7 +7,8 @@
 //! calls in the app (NFR-6 zero-egress is about *PHI*; this is model weights), and
 //! each is content-verified before use. The LLM is a single GGUF ([`download_llm`]);
 //! Parakeet is a gzipped tar of a *directory*, so it is verified then extracted
-//! ([`download_stt`]).
+//! ([`download_stt`]). Setup also fetches the speculative-decoding draft GGUF
+//! ([`download_draft`]), which is optional — it does not gate the app.
 //!
 //! Downloaded models land in the writable `app_data_dir/models`; [`resolve`] also
 //! searches the read-only `resource_dir/models` after it, so a model bundled by a
@@ -43,6 +44,15 @@ pub static LLM: LlmDownload = LlmDownload {
     tier: "llm",
     url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/gemma-4-E2B-it-UD-Q4_K_XL.gguf",
     sha256: Some("b8906b8c5e05e57b657646bbc657bd35814a269b2c20f0a2579047fafa1a67dd"),
+};
+
+/// The Gemma 4 E2B draft model for speculative decoding (spec-decoding B1). Event
+/// key `"draft"` is distinct from `"llm"` so the frontend tracks its progress bar
+/// separately. Same shape as [`LLM`] — a single GGUF, content-verified before use.
+pub static DRAFT: LlmDownload = LlmDownload {
+    tier: "draft",
+    url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/gemma4-e2b-draft.gguf",
+    sha256: Some("9eba819938efccfd6044f8af84e3bbfddc639a2bcf32ebc36420e6a649191919"),
 };
 
 /// The Parakeet STT model download (D3). Unlike the LLM GGUFs this is a gzipped
@@ -108,20 +118,25 @@ pub fn resolve(file: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 pub struct SetupStatus {
     pub llm_present: bool,
     pub stt_present: bool,
+    /// The speculative-decoding draft model (spec-decoding B1). Reported so Setup
+    /// can fetch it, but not part of `ready` — the app runs fine without it.
+    pub draft_present: bool,
     /// Both required models present — the app can start.
     pub ready: bool,
 }
 
 /// Report whether the required models (Gemma + Parakeet STT) are present so the
-/// frontend can gate the app on first run (D3).
+/// frontend can gate the app on first run (D3), plus the optional draft model.
 #[tauri::command]
 pub fn setup_status(app: AppHandle) -> Result<SetupStatus, String> {
     let dirs = model_dirs(&app).map_err(|e| e.to_string())?;
     let llm_present = resolve(LlmModel::Gemma.file_name(), &dirs).is_some();
     let stt_present = resolve(STT.dir_name, &dirs).is_some();
+    let draft_present = resolve(LlmModel::Gemma.draft_file_name(), &dirs).is_some();
     Ok(SetupStatus {
         llm_present,
         stt_present,
+        draft_present,
         ready: llm_present && stt_present,
     })
 }
@@ -157,8 +172,8 @@ fn remove_retired_in(dir: &Path) {
     }
 }
 
-/// §10.3 `[LAUNCH] downloading {STT|SLM} model {model_name}` (both sinks). `label`
-/// is the catalog's model kind (`"STT"` / `"SLM"`); `tier` is the telemetry key.
+/// §10.3 `[LAUNCH] downloading {STT|SLM|DRAFT} model {model_name}` (both sinks).
+/// `label` is the catalog's model kind; `tier` is the telemetry key.
 fn log_downloading(label: &str, tier: &str, model_name: &str) {
     log::info!("[LAUNCH] downloading {label} model {model_name}");
     crate::telemetry::track_event("model_downloading", serde_json::json!({ "tier": tier }));
@@ -242,6 +257,37 @@ pub fn download_llm(app: AppHandle) -> Result<(), String> {
             set.remove(&tier);
         }
         finish_download(&app, "SLM", &tier, result);
+    });
+    Ok(())
+}
+
+/// Start downloading the speculative-decoding draft model (spec-decoding B1).
+/// Mirrors [`download_llm`] exactly — it is a single GGUF, so it takes the same
+/// [`download_to`] path — but claims and reports under `DRAFT.tier` (`"draft"`) so
+/// its progress bar is independent of the note model's.
+#[tauri::command]
+pub fn download_draft(app: AppHandle) -> Result<(), String> {
+    let file = LlmModel::Gemma.draft_file_name();
+    let dest_dir = model_dirs(&app).map_err(|e| e.to_string())?.remove(0); // app-data/models
+    let tier = DRAFT.tier.to_string();
+
+    // Claim the download; reject if a worker already holds it.
+    {
+        let mut guard = IN_FLIGHT.lock().unwrap();
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !set.insert(tier.clone()) {
+            return Err("the draft model is already downloading".to_string());
+        }
+    }
+
+    std::thread::spawn(move || {
+        log_downloading("DRAFT", &tier, file);
+        let result = download_to(&app, &DRAFT, file, &dest_dir);
+        // Release the claim before the terminal event so a retry isn't rejected.
+        if let Some(set) = IN_FLIGHT.lock().unwrap().as_mut() {
+            set.remove(&tier);
+        }
+        finish_download(&app, "DRAFT", &tier, result);
     });
     Ok(())
 }
@@ -490,6 +536,20 @@ mod tests {
             LLM.url,
             LlmModel::Gemma.file_name()
         );
+    }
+
+    #[test]
+    fn draft_catalog_url_matches_the_loader_filename() {
+        // Same drift guard as the LLM: the draft's URL must reference the filename
+        // the engine will resolve, or the pulled model would never be found.
+        assert!(
+            DRAFT.url.contains(LlmModel::Gemma.draft_file_name()),
+            "DRAFT url {} does not reference its filename {}",
+            DRAFT.url,
+            LlmModel::Gemma.draft_file_name()
+        );
+        // Distinct event key from the note model, or the two progress bars collide.
+        assert_ne!(DRAFT.tier, LLM.tier);
     }
 
     #[test]

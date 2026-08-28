@@ -322,6 +322,7 @@ pub fn run() {
             // commands::trial_status,
             commands::log_update_event,
             models::download_llm,
+            models::download_draft,
             models::setup_status,
             models::download_stt,
             handoff::copy_to_clipboard,
