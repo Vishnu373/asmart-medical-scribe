@@ -44,12 +44,18 @@ impl NoteGenerator for RealNoteGenerator {
         // Stream each decoded piece to the UI as raw text; the frontend renders
         // the markdown once on completion (design §8.5).
         let app = self.app.clone();
+        let restart_app = self.app.clone();
         let result = self.engine.generate(
             record_id,
             &notes_id,
             transcript,
             &move |piece| {
                 let _ = app.emit("generation-token", json!({ "text": piece }));
+            },
+            // The engine is re-streaming from scratch; the UI drops what it already has
+            // so the two notes do not concatenate (§9.5).
+            &move || {
+                let _ = restart_app.emit("generation-restart", json!({}));
             },
             &cancel,
         );

@@ -86,6 +86,9 @@ export interface InputLevelEvent {
 export interface GenerationTokenEvent {
   text: string;
 }
+/** `generation-restart` payload; empty — the event itself is the signal.
+ * (`Record<…>` is unavailable here: the local `Record` interface above shadows it.) */
+export type GenerationRestartEvent = object;
 export interface StateChangedEvent {
   state: AppState;
 }

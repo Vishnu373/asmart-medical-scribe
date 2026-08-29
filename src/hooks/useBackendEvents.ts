@@ -2,6 +2,7 @@ import { useEffect } from "react";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 import {
   onError,
+  onGenerationRestart,
   onGenerationToken,
   onInputLevel,
   onLlmStatus,
@@ -20,6 +21,7 @@ export function useBackendEvents() {
   const setInputLevel = useAppStore((s) => s.setInputLevel);
   const addSegment = useAppStore((s) => s.addSegment);
   const appendStreamingToken = useAppStore((s) => s.appendStreamingToken);
+  const setStreamingNote = useAppStore((s) => s.setStreamingNote);
   const setLlmStatus = useAppStore((s) => s.setLlmStatus);
   const pushToast = useAppStore((s) => s.pushToast);
 
@@ -37,6 +39,8 @@ export function useBackendEvents() {
       onInputLevel((p) => setInputLevel(p.level)),
       onTranscriptSegment((p) => addSegment(p)),
       onGenerationToken((p) => appendStreamingToken(p.text)),
+      // The abandoned partial must go, or the retry's note appends onto it.
+      onGenerationRestart(() => setStreamingNote("")),
       // Note-model readiness (§8.2 startup fix): flip the "preparing" hint to ready,
       // or toast a preload failure (the first Generate still retries and re-surfaces it).
       onLlmStatus((p) => {
@@ -59,6 +63,7 @@ export function useBackendEvents() {
     setInputLevel,
     addSegment,
     appendStreamingToken,
+    setStreamingNote,
     setLlmStatus,
     pushToast,
   ]);

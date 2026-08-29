@@ -90,6 +90,10 @@ impl PrefillSession {
         }
         let queued = self.depth.fetch_add(1, Ordering::Relaxed) + 1;
         if queued > MAX_QUEUE_DEPTH {
+            // §8.10 rule (a) — "shed the draft first, keep prefilling" — does not apply:
+            // it assumed B7 would draft on this thread, but B4/B5/B6 dissolved and the
+            // session is built at Generate, so nothing here is drafting to shed. Shedding
+            // it would cost the note its speed-up and free nothing for the transcript.
             self.give_up("prefill cannot keep pace with speech");
             return;
         }

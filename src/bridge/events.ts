@@ -7,6 +7,7 @@
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   ErrorEvent,
+  GenerationRestartEvent,
   GenerationTokenEvent,
   InputLevelEvent,
   LlmStatusEvent,
@@ -33,6 +34,13 @@ export function onGenerationToken(
   handler: (payload: GenerationTokenEvent) => void,
 ): Promise<UnlistenFn> {
   return on("generation-token", handler);
+}
+
+// The note is being regenerated from scratch, so the tokens already streamed are void.
+export function onGenerationRestart(
+  handler: (payload: GenerationRestartEvent) => void,
+): Promise<UnlistenFn> {
+  return on("generation-restart", handler);
 }
 
 export function onStateChanged(handler: (payload: StateChangedEvent) => void): Promise<UnlistenFn> {

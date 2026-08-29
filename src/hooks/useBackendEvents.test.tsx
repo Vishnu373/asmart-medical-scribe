@@ -10,6 +10,7 @@ const captured = vi.hoisted(() => {
     level?: (p: { level: number[] }) => void;
     segment?: (p: { seq: number; text: string }) => void;
     token?: (p: { text: string }) => void;
+    restart?: (p: object) => void;
     llmStatus?: (p: { status: string; message?: string }) => void;
     error?: (p: { code: string; message: string }) => void;
   };
@@ -30,6 +31,10 @@ vi.mock("@/bridge", () => ({
   },
   onGenerationToken: (h: (p: { text: string }) => void) => {
     captured.token = h;
+    return Promise.resolve(() => {});
+  },
+  onGenerationRestart: (h: (p: object) => void) => {
+    captured.restart = h;
     return Promise.resolve(() => {});
   },
   onLlmStatus: (h: (p: { status: string; message?: string }) => void) => {
@@ -91,6 +96,15 @@ describe("useBackendEvents wires §9.5 events into the store", () => {
     render(<Probe />);
     act(() => captured.token!({ text: "## Sub" }));
     act(() => captured.token!({ text: "jective" }));
+    expect(useAppStore.getState().streamingNote).toBe("## Subjective");
+  });
+
+  it("generation-restart clears the buffer so the retry does not concatenate", () => {
+    render(<Probe />);
+    act(() => captured.token!({ text: "abandoned partial" }));
+    act(() => captured.restart!({}));
+    expect(useAppStore.getState().streamingNote).toBe("");
+    act(() => captured.token!({ text: "## Subjective" }));
     expect(useAppStore.getState().streamingNote).toBe("## Subjective");
   });
 

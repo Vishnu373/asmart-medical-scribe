@@ -820,6 +820,7 @@ The backend owns all state; commands are requests, and state guards reject illeg
 | `transcript-segment` | `{ seq, text }` | Each transcribed segment; UI appends (§6) |
 | `input-level` | `{ level }` | Live mic-level meter (FR-12) |
 | `generation-token` | `{ text }` | Streaming note tokens during GENERATING (§8.5) |
+| `generation-restart` | `{}` | The note is being re-streamed from scratch (poisoned context, §8.10); UI clears the streamed buffer |
 | `state-changed` | `{ state }` | IDLE / RECORDING / PROCESSING / GENERATING transitions; GENERATING→IDLE signals the note is done and the UI loads the active note |
 | `llm-status` | `{ status, message? }` | Note-model load lifecycle: `loading` when the background preload starts, `ready` when warm, `error` on load failure (§8.2/§8.4). Drives the "Preparing note model…" indicator |
 | `error` | `{ code, message }` | Recoverable failures (e.g. RAM guard trips, §8.4) |
@@ -903,6 +904,13 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[THREADS]`, `[LOAD]`,
 | `[LOAD] SLM prefix KV cache primed in {duration}s` | ✓ | |
 | `[LOAD] superseded prefix KV blob removed: {path}` | ✓ | |
 | `[LOAD] prefix KV restore rejected by llama.cpp — full prefill for this note` | ✓ | |
+| `[LOAD] MEDSCRIBE_NO_SPECULATIVE set — speculative decoding off` | ✓ | |
+| `[LOAD] draft model not present — speculative decoding off for this session` | ✓ | |
+| `[LOAD] draft model loaded: {duration}s` | ✓ | |
+| `[LOAD] draft model load failed: {e} — speculative decoding off for this session` | ✓ | |
+| `[LOAD] mtp session ready: n_draft_max={k}, validated in {duration}s` | ✓ | |
+| `[LOAD] mtp session rejected: {detail} — speculative decoding off` | ✓ | |
+| `[GENERATE] speculative decoding off for this session: {why}` | ✓ | |
 | `[PRIME] APPDATA unset — skipping` | ✓ | |
 | `[PRIME] no model in {path} — skipping` | ✓ | |
 | `[PRIME] prefix KV blob already present — nothing to do` | ✓ | |
@@ -932,7 +940,8 @@ Events are grouped by a bracket tag (`[LAUNCH]`, `[GPU]`, `[THREADS]`, `[LOAD]`,
 | `[GENERATE] {note_id} reasoning started` | ✓ | |
 | `[GENERATE] {note_id} reasoning done — reasoning duration {N}s` | ✓ | |
 | `[GENERATE] {note_id} perceived TTFT at {N}s` | ✓ | |
-| `[GENERATE] {note_id} note generation complete — {generated_token_count}, total {N}s, {tokens/s}` | ✓ | |
+| `[GENERATE] {note_id} note generation complete — {generated_token_count}, total {N}s, {tokens/s}, speculative={on|off}` | ✓ | |
+| `[GENERATE] {note_id} speculative — {accepted}/{drafted} accepted ({pct}%), {rounds} rounds, {n} tokens per pass` | ✓ | |
 | `[EDIT] {record_id} transcript updated` | ✓ | |
 | `[EDIT] {record_id} transcript update failed {error message}` | ✓ | |
 | `[EDIT] {note_id} generated notes updated` | ✓ | |
