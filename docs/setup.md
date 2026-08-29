@@ -131,6 +131,21 @@ bun run build
 
 `rustfmt` formats Rust code; `clippy` is the Rust linter that flags common mistakes.
 
+### Environment variables
+
+| Variable | Effect |
+| --- | --- |
+| `MEDSCRIBE_NO_SPECULATIVE` | Skips the draft model, so notes generate with the plain one-token-at-a-time loop (design §8.10). For A/B benchmarking and for ruling speculative decoding out of a slowness report. |
+
+Read at model load, so it must be set before the app starts:
+
+```bash
+set MEDSCRIBE_NO_SPECULATIVE=1     # cmd
+$env:MEDSCRIBE_NO_SPECULATIVE = 1  # PowerShell
+```
+
+**Presence, not value** — any value except `0` and the empty string turns speculative decoding off, so `true` and `yes` work too. To turn it back on, clear the variable (or set it to `0`). Confirm which mode ran from the log: `[LOAD] MEDSCRIBE_NO_SPECULATIVE set — speculative decoding off`.
+
 ---
 
 ## 🧪 Testing

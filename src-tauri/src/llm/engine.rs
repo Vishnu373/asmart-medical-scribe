@@ -339,7 +339,10 @@ impl LlmEngine {
         // Resolved before the guard, not after: the draft is co-resident (decision #6), so
         // its bytes belong in the §8.4 floor. `None` (not downloaded) just means the floor
         // is the target's, as it was before speculative decoding.
-        let draft_path = crate::models::resolve(kind.draft_file_name(), &self.model_dirs);
+        // The env switch is read here, not only in `load_draft` below: the guard runs first,
+        // so the floor would otherwise charge for a draft decision #11 never loads.
+        let draft_path = crate::models::resolve(kind.draft_file_name(), &self.model_dirs)
+            .filter(|_| !speculative_off_by_env());
         // guard_available_ram(&path)?;
         guard_available_ram(&path, draft_path.as_deref())?;
 
@@ -647,7 +650,7 @@ impl LlmEngine {
     /// `self.model`: the session validates the two against each other, so the target has to
     /// be loadable first.
     fn load_draft(&self, draft_path: Option<&Path>, params: &LlamaModelParams) {
-        if speculative_disabled_by_env(std::env::var(NO_SPECULATIVE_ENV).ok().as_deref()) {
+        if speculative_off_by_env() {
             info!("[LOAD] {NO_SPECULATIVE_ENV} set — speculative decoding off"); // §10.3
             return;
         }
@@ -2093,6 +2096,12 @@ fn speculative_round(
 /// "leave it alone", so `MEDSCRIBE_NO_SPECULATIVE=0` is a usable way to say "on".
 fn speculative_disabled_by_env(value: Option<&str>) -> bool {
     value.is_some_and(|v| !v.is_empty() && v != "0")
+}
+
+/// The switch as the process sees it. Shared by the RAM guard and `load_draft`, which must
+/// agree: a floor that charges for a draft the switch skips fails the load for nothing.
+fn speculative_off_by_env() -> bool {
+    speculative_disabled_by_env(std::env::var(NO_SPECULATIVE_ENV).ok().as_deref())
 }
 
 /// Tokens per second, guarding the degenerate zero-elapsed case so a fast phase
