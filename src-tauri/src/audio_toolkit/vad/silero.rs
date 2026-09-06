@@ -1,3 +1,5 @@
+// Load the model, feed it each frame, and turn the score into a keep or drop decision
+
 use anyhow::Result;
 use std::path::Path;
 
@@ -9,8 +11,6 @@ use crate::audio_toolkit::TARGET_SAMPLE_RATE;
 const SILERO_FRAME_MS: u32 = 30;
 const SILERO_FRAME_SAMPLES: usize = (TARGET_SAMPLE_RATE * SILERO_FRAME_MS / 1000) as usize;
 
-/// Silero VAD over 16 kHz mono 30-ms frames. `compute` yields a speech
-/// probability; frames above `threshold` are kept as speech.
 pub struct SileroVad {
     engine: Vad,
     threshold: f32,

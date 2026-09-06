@@ -28,21 +28,14 @@ enum AudioChunk {
     EndOfStream,
 }
 
-/// Callback invoked with each 16 kHz mono frame as it is captured, for live
-/// streaming downstream (segmenter/STT). Frames are ~30 ms.
+// slot for audio-frame function
 type FrameCallback = Arc<dyn Fn(&[f32]) + Send + Sync + 'static>;
-/// Callback invoked with spectrum level buckets for the input-level meter.
+// slot for input level meter function in the UI
 type LevelCallback = Arc<dyn Fn(Vec<f32>) + Send + Sync + 'static>;
-/// Callback invoked with the cpal stream's error string if the input device fails
-/// mid-stream (unplugged, driver reset). Lets the pipeline surface the §10.3
-/// `[RECORD] audio device failed mid-recording` row + a UI notification.
+// slot for mic-died or failure function
 type ErrorCallback = Arc<dyn Fn(String) + Send + Sync + 'static>;
 
-/// Captures microphone audio, downmixes to mono and resamples to 16 kHz f32.
-///
-/// Unlike a push-to-talk recorder, this delivers frames continuously through an
-/// optional frame callback during recording (for live segmentation) while still
-/// returning the full buffer on `stop()`. VAD is applied downstream, not here.
+// Captures microphone audio, downmixes to mono and resamples to 16 kHz f32.
 pub struct AudioRecorder {
     device: Option<Device>,
     cmd_tx: Option<mpsc::Sender<Cmd>>,
@@ -64,7 +57,7 @@ impl AudioRecorder {
         })
     }
 
-    /// Receive every captured 16 kHz mono frame live (for streaming segmentation).
+    // Receive every captured 16 kHz mono frame live
     pub fn with_frame_callback<F>(mut self, cb: F) -> Self
     where
         F: Fn(&[f32]) + Send + Sync + 'static,
@@ -73,7 +66,7 @@ impl AudioRecorder {
         self
     }
 
-    /// Receive spectrum level buckets for the input-level meter (design §9.5).
+    // Receive spectrum level buckets for the input-level meter
     pub fn with_level_callback<F>(mut self, cb: F) -> Self
     where
         F: Fn(Vec<f32>) + Send + Sync + 'static,
@@ -82,9 +75,7 @@ impl AudioRecorder {
         self
     }
 
-    /// Receive the cpal error string if the input device fails mid-stream (§10.3
-    /// `[RECORD] audio device failed mid-recording`). Fires from cpal's stream error
-    /// handler; the callback must be cheap and non-blocking.
+    // Receive the cpal error string if the input device fails mid-stream
     pub fn with_error_callback<F>(mut self, cb: F) -> Self
     where
         F: Fn(String) + Send + Sync + 'static,
@@ -110,8 +101,6 @@ impl AudioRecorder {
                 .ok_or_else(|| Error::new(std::io::ErrorKind::NotFound, "No input device found"))?,
         };
 
-        // §10.3 `[RECORD] using device mic for recording: {mic_name}` (on-device only —
-        // the mic name is PII, never telemetry).
         log::info!(
             "[RECORD] using device mic for recording: {}",
             device.name().unwrap_or_else(|_| "<unknown>".to_string())
@@ -201,7 +190,6 @@ impl AudioRecorder {
             match init_result {
                 Ok((stream, sample_rate)) => {
                     let _ = init_tx.send(Ok(()));
-                    // Keep the stream alive while we process samples.
                     run_consumer(
                         sample_rate,
                         sample_rx,
@@ -252,13 +240,12 @@ impl AudioRecorder {
         Ok(())
     }
 
-    /// Stop recording and return the full captured 16 kHz mono buffer.
     pub fn stop(&self) -> Result<Vec<f32>, Box<dyn std::error::Error>> {
         let (resp_tx, resp_rx) = mpsc::channel();
         if let Some(tx) = &self.cmd_tx {
             tx.send(Cmd::Stop(resp_tx))?;
         }
-        Ok(resp_rx.recv()?) // wait for the samples
+        Ok(resp_rx.recv()?)
     }
 
     pub fn close(&mut self) -> Result<(), Box<dyn std::error::Error>> {
@@ -328,7 +315,6 @@ impl AudioRecorder {
             stream_cb,
             move |err| {
                 log::error!("Stream error: {}", err);
-                // Surface a mid-stream device failure to the pipeline (§10.3).
                 if let Some(cb) = &err_cb {
                     cb(err.to_string());
                 }
@@ -340,14 +326,8 @@ impl AudioRecorder {
     fn get_preferred_config(
         device: &cpal::Device,
     ) -> Result<cpal::SupportedStreamConfig, Box<dyn std::error::Error>> {
-        // Use the device's native/default sample rate and let the FrameResampler
-        // in run_consumer() downsample to 16kHz. This avoids forcing hardware into
-        // a non-native rate which can cause issues on some devices (Bluetooth
-        // codecs, certain ALSA drivers, etc.).
         let default_config = device.default_input_config()?;
         let target_rate = default_config.sample_rate();
-
-        // Try to find the best sample format at the device's default rate
         let supported_configs = match device.supported_input_configs() {
             Ok(configs) => configs,
             Err(e) => {
@@ -364,7 +344,6 @@ impl AudioRecorder {
                 match best_config {
                     None => best_config = Some(config_range),
                     Some(ref current) => {
-                        // Prioritize F32 > I16 > I32 > others
                         let score = |fmt: cpal::SampleFormat| match fmt {
                             cpal::SampleFormat::F32 => 4,
                             cpal::SampleFormat::I16 => 3,
@@ -384,7 +363,6 @@ impl AudioRecorder {
             return Ok(config.with_sample_rate(target_rate));
         }
 
-        // Fall back to device default if no config matched (exotic/virtual devices)
         log::warn!(
             "No supported config matched device default rate {:?}, using default config",
             target_rate
@@ -460,14 +438,8 @@ fn run_consumer(
     let mut processed_samples = Vec::<f32>::new();
     let mut recording = false;
 
-    // ---------- spectrum visualisation setup ---------------------------- //
+    // ---------- spectrum visualisation (input meter in the UI) setup ---------------------------- //
     const BUCKETS: usize = 16;
-    // Scale the FFT window to the device sample rate so the analysis window
-    // (~33 ms) and frequency resolution (~30 Hz/bin) stay roughly constant
-    // across devices. A fixed 512-sample window collapses the low vocal
-    // buckets onto a single bin at 48 kHz (e.g. built-in laptop mics), and
-    // would stutter at ~4-8 updates/sec on an 8-16 kHz Bluetooth headset.
-    // Targets: 48 kHz -> 2048, 16 kHz -> 512, 8 kHz -> 256.
     let target_window = (f64::from(in_sample_rate) / 30.0).round() as usize;
     let window_size = [256usize, 512, 1024, 2048]
         .into_iter()
@@ -477,8 +449,8 @@ fn run_consumer(
         in_sample_rate,
         window_size,
         BUCKETS,
-        400.0,  // vocal_min_hz
-        4000.0, // vocal_max_hz
+        400.0,
+        4000.0,
     );
 
     fn handle_frame(
@@ -499,7 +471,7 @@ fn run_consumer(
     loop {
         let chunk = match sample_rx.recv() {
             Ok(c) => c,
-            Err(_) => break, // stream closed
+            Err(_) => break,
         };
 
         let raw = match chunk {
@@ -519,7 +491,6 @@ fn run_consumer(
             handle_frame(frame, recording, &frame_cb, &mut processed_samples)
         });
 
-        // non-blocking check for a command
         while let Ok(cmd) = cmd_rx.try_recv() {
             match cmd {
                 Cmd::Start => {
@@ -533,9 +504,6 @@ fn run_consumer(
                     stop_flag.store(true, Ordering::Relaxed);
 
                     // Drain all remaining audio until the producer confirms end-of-stream.
-                    // The cpal callback sees the stop flag, sends EndOfStream, and goes
-                    // silent — guaranteeing every captured sample is in the channel
-                    // ahead of the sentinel.
                     loop {
                         match sample_rx.recv_timeout(Duration::from_secs(2)) {
                             Ok(AudioChunk::Samples(remaining)) => {
@@ -558,7 +526,6 @@ fn run_consumer(
                     let _ = reply_tx.send(std::mem::take(&mut processed_samples));
 
                     // Resume the audio callback so the consumer loop can continue
-                    // receiving chunks (important for always-on microphone mode).
                     stop_flag.store(false, Ordering::Relaxed);
                 }
                 Cmd::Shutdown => {

@@ -1,7 +1,6 @@
 use cpal::traits::{DeviceTrait, HostTrait};
 
-/// A capture device the user can pick in settings. `device` is the live cpal
-/// handle the recorder opens; the rest is display metadata.
+// capture device
 pub struct CpalDeviceInfo {
     pub index: String,
     pub name: String,
@@ -9,7 +8,7 @@ pub struct CpalDeviceInfo {
     pub device: cpal::Device,
 }
 
-/// Enumerate microphones for the settings UI, flagging the system default.
+// available microphones list
 pub fn list_input_devices() -> Result<Vec<CpalDeviceInfo>, Box<dyn std::error::Error>> {
     let host = crate::audio_toolkit::get_cpal_host();
     let default_name = host.default_input_device().and_then(|d| d.name().ok());

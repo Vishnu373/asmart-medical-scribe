@@ -1,66 +1,37 @@
-//! In-process GGUF note generation over `llama-cpp-4` (design §8.2). CPU-only, no
-//! server, no network — generation stays on-device (NFR-6).
-//!
-//! Like the STT engine, the native model sits behind the `NoteGenerator` trait so
-//! the GENERATING state machine is testable without it; this file holds the one
-//! part that needs the real llama.cpp binding and is verified by building/running
-//! `cargo test` on Windows (the binding compiles native code; it is not exercised
-//! on the Linux dev box). The streaming/cancel/persist orchestration around it
-//! lives in `generator.rs`.
-
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Instant;
-
 use anyhow::{anyhow, Result};
 use log::{info, warn};
-
-// These read `llama_cpp_2::…` before the migration — only the crate name changed,
-// every module path below is identical (migration M2).
 use llama_cpp_4::context::params::{LlamaContextParams, LlamaContextType};
 use llama_cpp_4::context::LlamaContext;
 use llama_cpp_4::llama_backend::LlamaBackend;
 use llama_cpp_4::llama_batch::LlamaBatch;
 use llama_cpp_4::model::params::LlamaModelParams;
 use llama_cpp_4::model::{AddBos, LlamaModel, Special};
-// Speculative decoding (§8.10). `llama-cpp-2` had no equivalent — this is what the
-// migration to `llama-cpp-4` was for.
 use llama_cpp_4::mtp::{MtpSession, MtpSessionConfig};
 use llama_cpp_4::sampling::LlamaSampler;
 use llama_cpp_4::token::LlamaToken;
-// llama-cpp-4 takes the state-seq flags as a plain `u32`, so the newtype is gone:
-// use llama_cpp_2::LlamaStateSeqFlags;
-
 use super::prefill::{self, GenEvent, PrefillCmd, PrefillSession};
 use super::prompt;
 
-/// The note-generation model (design §8.2). A single on-device model —
-/// `gemma-4-E2B-it-UD-Q4_K_XL` — behind the `NoteGenerator` interface. Kept as an
-/// enum (one variant today) so `prompt` / [`PrefixCache`] keep a
-/// typed dispatch point if a second model is ever added. The installer bundles no
-/// LLM; it is downloaded once at first-run Setup (D3, `models`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum LlmModel {
-    /// Gemma 4 E2B instruct, Unsloth dynamic Q4_K_XL (GGUF).
     Gemma,
 }
 
 impl LlmModel {
-    /// The GGUF filename resolved under the models search dirs (D1: app-data
-    /// download dir first, then the bundled resource dir). Must equal the R2 object's
-    /// on-disk name; `models::LLM` downloads to exactly this name.
+    // llm model
     pub fn file_name(self) -> &'static str {
         match self {
             LlmModel::Gemma => "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
         }
     }
 
-    /// The speculative-decoding draft GGUF's filename (spec-decoding B1). Beside
-    /// [`file_name`](Self::file_name) for the same reason: the download
-    /// (`models::DRAFT`) and the loader must agree on the name in one place.
+    // draft model
     pub fn draft_file_name(self) -> &'static str {
         match self {
             LlmModel::Gemma => "gemma4-e2b-draft.gguf",
@@ -68,27 +39,12 @@ impl LlmModel {
     }
 }
 
-// Tuning constants (design §8.2 "set at implementation via benchmarking"): kept
-// conservative so the context fits a realistic consult without reserving RAM the
-// §7 budget needs.
-const N_CTX: u32 = 8192; // prompt + transcript + reasoning + note; well under the model maxima
-const MAX_OUTPUT_TOKENS: i32 = 1536; // ceiling for the SOAP note itself (post-reasoning)
-const MAX_REASONING_TOKENS: i32 = 1024; // separate cap for the <think> scratchpad (§8.3) so a
-                                        // verbose CoT can't eat the note's budget; tunable (§8.2)
-const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hallucination
-
-/// Speculative-decoding draft length (design §8.10, spec-decoding decision #1): how many
-/// tokens the draft head guesses per round. A fixed constant — not tuned at runtime, not a
-/// setting. Independently matches upstream llama.cpp's own `n_draft_max` CLI default.
+const N_CTX: u32 = 8192;
+const MAX_OUTPUT_TOKENS: i32 = 1536;
+const MAX_REASONING_TOKENS: i32 = 1024; 
+const SAMPLE_TEMP: f32 = 0.2;
 const K_DRAFT: i32 = 3;
-
-/// Set to `1` to run the plain single-token decode loop even when the draft model loaded
-/// (spec-decoding decision #11). Hidden, undocumented for users: benchmarking needs an A/B
-/// on one machine and support needs a way to rule the feature out of a slowness report.
 const NO_SPECULATIVE_ENV: &str = "MEDSCRIBE_NO_SPECULATIVE";
-
-/// Sanity floor for a serialized prefix KV state (§8.7). The real one is ~16.5 MB, so this
-/// only ever rejects a zero/garbage serialize — never a legitimately small prefix.
 const MIN_PREFIX_KV_BYTES: usize = 64 * 1024;
 
 /// Generate-path reasoning suppression (design §8.3): the boundary string that ends
