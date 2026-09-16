@@ -75,12 +75,7 @@ pub fn list_records(store: State<'_, SharedStore>) -> Result<Vec<RecordSummary>,
 
 // Load a full record (transcript included) by id
 #[tauri::command]
-pub fn open_record(
-    store: State<'_, SharedStore>,
-    llm: State<'_, Arc<LlmEngine>>,
-    id: String,
-) -> Result<Option<Record>, String> {
-    llm.end_prefill();
+pub fn open_record(store: State<'_, SharedStore>, id: String) -> Result<Option<Record>, String> {
     store.lock().open_record(&id).map_err(|e| e.to_string())
 }
 
@@ -235,13 +230,7 @@ pub fn frontend_ready(app: AppHandle, gate: State<'_, PreloadGate>) {
 
 // persist patched settings
 #[tauri::command]
-pub fn update_settings(
-    state: State<'_, SharedSettings>,
-    mut settings: Settings,
-) -> Result<(), String> {
-    let current = state.get();
-    settings.gpu = current.gpu;
-    settings.physical_cores = current.physical_cores;
+pub fn update_settings(state: State<'_, SharedSettings>, settings: Settings) -> Result<(), String> {
     state.update(settings).map_err(|e| e.to_string())
 }
 
