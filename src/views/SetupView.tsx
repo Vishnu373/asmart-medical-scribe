@@ -1,6 +1,7 @@
 import { useEffect, useRef, useState } from "react";
 import {
   downloadLlm,
+  downloadLlmDraft,
   downloadStt,
   frontendReady,
   getLlmStatus,
@@ -15,12 +16,14 @@ import type { SetupStatus } from "@/bridge";
 
 /** The note model's download event key (matches `models::LLM.tier`). */
 const LLM = "llm";
+/** The MTP draft model's event key (matches `models::LLM_DRAFT.tier`). */
+const LLM_DRAFT = "llm-draft";
 /** The Parakeet STT download's event key (matches `models::STT.tier`). */
 const STT = "stt";
 
 /** A required model the first run must fetch, derived from `SetupStatus`. */
 interface Slot {
-  /** Event key: `"llm"` or `"stt"`. */
+  /** Event key: `"llm"`, `"llm-draft"` or `"stt"`. */
   key: string;
   label: string;
   present: boolean;
@@ -29,21 +32,29 @@ interface Slot {
 function slotsFor(s: SetupStatus): Slot[] {
   return [
     { key: LLM, label: "Note model", present: s.llm_present },
+    { key: LLM_DRAFT, label: "Draft model", present: s.llm_draft_present },
     { key: STT, label: "Speech recognition", present: s.stt_present },
   ];
 }
 
+/** The command that fetches each slot, so `start()` routes by key without a chain. */
+const DOWNLOADERS: Record<string, () => Promise<void>> = {
+  [LLM]: downloadLlm,
+  [LLM_DRAFT]: downloadLlmDraft,
+  [STT]: downloadStt,
+};
+
 /**
  * First-run Setup gate (§8.2, D3). The installer ships no model weights, so on
- * first launch the required set — the RAM-fit LLM and the Parakeet STT model — is
- * downloaded once, verified, and cached. Missing models start downloading
- * automatically; a failed one shows a Retry.
+ * first launch the required set — the note model, its MTP draft, and the Parakeet
+ * STT model — is downloaded once, verified, and cached. Missing models start
+ * downloading automatically; a failed one shows a Retry.
  *
  * The downloads are not the last step: the note model's first load primes the
  * prompt-prefix KV cache (§8.7), ~22s that would otherwise land on an apparently
- * stalled main screen. So Setup holds for a third step, "Preparing note model…",
- * until the model reports ready. The app is blocked behind this screen until all
- * three finish; thereafter Setup is skipped entirely.
+ * stalled main screen. So Setup holds for a final step, "Preparing note model…",
+ * until the model reports ready. The app is blocked behind this screen until every
+ * step finishes; thereafter Setup is skipped entirely.
  */
 export default function SetupView({ onReady }: { onReady: () => void }) {
   const [status, setStatus] = useState<SetupStatus | null>(null);
@@ -54,6 +65,10 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
   const [errors, setErrors] = useState<Record<string, string>>({});
   // Keys already kicked off, so re-renders/re-fetches don't double-start a worker.
   const started = useRef<Set<string>>(new Set());
+  // Whether this screen is a genuine first run, decided from the status we mounted
+  // with. An upgrade that adds a newly required model (the MTP draft) also lands
+  // here, and finishing that download is not a first-run setup finish (§3).
+  const firstRun = useRef(false);
 
   const start = (key: string) => {
     started.current.add(key);
@@ -63,8 +78,7 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
       return next;
     });
     setProgress((p) => ({ ...p, [key]: 0 }));
-    const call = key === STT ? downloadStt() : downloadLlm();
-    call.catch((err) => {
+    DOWNLOADERS[key]().catch((err) => {
       started.current.delete(key);
       setErrors((e) => ({ ...e, [key]: String(err) }));
     });
@@ -75,6 +89,10 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
     setupStatus()
       .then((s) => {
         setStatus(s);
+        // Both of the models that existed before the draft was required: if either is
+        // missing this is a first run (or a resumed one), and if both are already there
+        // the only reason we are on this screen is a model added by an update.
+        firstRun.current = !(s.llm_present && s.stt_present);
         if (s.ready) {
           onReady();
           return;
@@ -101,9 +119,10 @@ export default function SetupView({ onReady }: { onReady: () => void }) {
           .then((s) => {
             setStatus(s);
             if (s.ready) {
-              // Reached here only via a completed download → a genuine first-run
-              // setup finish (§3 telemetry). Best-effort; never block the UI.
-              void markSetupCompleted().catch(() => {});
+              // Only a genuine first run counts (§3 telemetry): an update that bounced
+              // an existing install here to fetch a newly required model also completes
+              // a download and reads `ready`. Best-effort; never block the UI.
+              if (firstRun.current) void markSetupCompleted().catch(() => {});
               // onReady();
               // Not done yet — hand over to the priming step below.
               setPriming(true);

@@ -18,12 +18,15 @@
 ; tauri.conf.json (authoritative), src/prime_kv.rs (IDENTIFIER), and this file. Change all
 ; three together.
 
-; The app links OpenSSL (libcrypto-4/libssl-4) and the MSVC runtime
-; (MSVCP140/VCRUNTIME140/VCOMP140). Rather than running vc_redist.x64.exe — which
-; needs admin elevation and stalls a per-user, non-elevated install — we ship the
-; individual runtime DLLs app-locally in libs/, bundled next to the exe via the
-; `libs/*` resource glob. Windows loads them from the exe dir, so no elevation,
-; no separate installer, and no missing-DLL error on a clean machine.
+; The app links the MSVC runtime (MSVCP140/VCRUNTIME140/VCOMP140). Rather than running
+; vc_redist.x64.exe — which needs admin elevation and stalls a per-user, non-elevated
+; install — we ship the individual runtime DLLs app-locally in libs/, bundled next to
+; the exe via the `libs/*` resource glob. Windows loads them from the exe dir, so no
+; elevation, no separate installer, and no missing-DLL error on a clean machine.
+;
+; Those redistributables are committed. The rest of libs/ — llama/ggml, and OpenSSL
+; (libcrypto/libssl) when the host's install is shared — is staged per build by
+; scripts/stage_llama_dlls.mjs, because both are linked by ABI-versioned filename.
 !macro NSIS_HOOK_POSTUNINSTALL
   RMDir /r "$APPDATA\com.asmartmedicalscribe.app"
 !macroend

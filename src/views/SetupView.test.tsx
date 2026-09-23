@@ -34,7 +34,12 @@ function firstRunThenComplete(llmStatus: "loading" | "ready" = "loading") {
     if (cmd === "setup_status") {
       calls += 1;
       const done = calls > 1;
-      return Promise.resolve({ llm_present: done, stt_present: done, ready: done });
+      return Promise.resolve({
+        llm_present: done,
+        llm_draft_present: done,
+        stt_present: done,
+        ready: done,
+      });
     }
     if (cmd === "get_llm_status") return Promise.resolve(llmStatus);
     return Promise.resolve(undefined);
@@ -43,12 +48,13 @@ function firstRunThenComplete(llmStatus: "loading" | "ready" = "loading") {
 
 describe("SetupView", () => {
   it("auto-starts the missing required downloads on first run", async () => {
-    // First run: neither the note model nor Parakeet is present.
+    // First run: none of the note model, its draft, or Parakeet is present.
     mockInvoke.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "setup_status":
           return Promise.resolve({
             llm_present: false,
+            llm_draft_present: false,
             stt_present: false,
             ready: false,
           });
@@ -59,10 +65,12 @@ describe("SetupView", () => {
 
     render(<SetupView onReady={vi.fn()} />);
 
-    // Both required models begin downloading without a click.
+    // Every required model begins downloading without a click.
     await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("download_llm"));
+    expect(mockInvoke).toHaveBeenCalledWith("download_llm_draft");
     expect(mockInvoke).toHaveBeenCalledWith("download_stt");
     expect(await screen.findByText("Note model")).toBeInTheDocument();
+    expect(screen.getByText("Draft model")).toBeInTheDocument();
     expect(screen.getByText("Speech recognition")).toBeInTheDocument();
   });
 
@@ -73,6 +81,7 @@ describe("SetupView", () => {
         case "setup_status":
           return Promise.resolve({
             llm_present: true,
+            llm_draft_present: true,
             stt_present: true,
             ready: true,
           });
@@ -84,11 +93,48 @@ describe("SetupView", () => {
     render(<SetupView onReady={onReady} />);
 
     await waitFor(() => expect(onReady).toHaveBeenCalled());
-    // Nothing is downloaded when both models are already on disk.
+    // Nothing is downloaded when every model is already on disk.
     expect(mockInvoke).not.toHaveBeenCalledWith("download_llm");
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_llm_draft");
     expect(mockInvoke).not.toHaveBeenCalledWith("download_stt");
     // `setup_completed` marks a genuine first-run finish (§3 telemetry) — it must
     // NOT fire when models are already present (a later, ordinary launch).
+    expect(mockInvoke).not.toHaveBeenCalledWith("mark_setup_completed");
+  });
+
+  it("does not re-count setup when an update only adds the draft model", async () => {
+    // An upgrading install: the note and speech models are already on disk and only
+    // the newly required draft is missing, so `ready` is false and Setup renders.
+    let calls = 0;
+    mockInvoke.mockImplementation((cmd: string) => {
+      if (cmd === "setup_status") {
+        calls += 1;
+        const done = calls > 1;
+        return Promise.resolve({
+          llm_present: true,
+          llm_draft_present: done,
+          stt_present: true,
+          ready: done,
+        });
+      }
+      if (cmd === "get_llm_status") return Promise.resolve("loading");
+      return Promise.resolve(undefined);
+    });
+
+    render(<SetupView onReady={vi.fn()} />);
+    await waitFor(() => expect(mockInvoke).toHaveBeenCalledWith("download_llm_draft"));
+    // Only the missing model is fetched.
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_llm");
+    expect(mockInvoke).not.toHaveBeenCalledWith("download_stt");
+
+    await waitFor(() => expect(handlers["model-download-done"]).toBeDefined());
+    await act(async () => {
+      handlers["model-download-done"]({ tier: "llm-draft" });
+    });
+
+    // The draft's arrival still hands over to the priming step…
+    expect(await screen.findByText("Preparing note model…")).toBeInTheDocument();
+    // …but this was never a first run, so the §3 counter must not move.
     expect(mockInvoke).not.toHaveBeenCalledWith("mark_setup_completed");
   });
 

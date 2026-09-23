@@ -1,2 +1,6 @@
 [env]
 MEDSCRIBE_CRASH_DSN = "https://7af2def58e6a44c4ab34c18abe20e21c@app.glitchtip.com/25588"
+# Keeps OpenSSL/TLS out of llama-common (see cmake/llama-no-openssl.cmake). Forced:
+# silently losing to a host-set toolchain file would re-link TLS into the note
+# generator, and that regression is invisible until an installed build starts.
+CMAKE_TOOLCHAIN_FILE = { value = "cmake/llama-no-openssl.cmake", relative = true, force = true }

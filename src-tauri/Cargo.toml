@@ -33,7 +33,7 @@ rustfft = "6"
 vad-rs = { git = "https://github.com/cjpais/vad-rs", default-features = false }
 # STT engine (B5): Parakeet TDT v3 via the ONNX backend, CPU-only. v1 ships
 # Parakeet only — the `whisper-cpp` feature is intentionally omitted because
-# whisper.cpp and llama-cpp-2 (B10) each statically vendor ggml, which collides at
+# whisper.cpp and llama-cpp-4 (B10) each statically vendor ggml, which collides at
 # link time. Parakeet (ONNX) carries no ggml, so the LLM links cleanly.
 transcribe-rs = { version = "0.3.8", default-features = false, features = ["onnx"] }
 # Transcript text cleanup (custom words + filler/stutter filtering, ported text.rs).
@@ -55,7 +55,18 @@ sysinfo = { version = "0.32", default-features = false, features = ["system"] }
 # In-process GGUF note generation (§8, B10). CPU-only llama.cpp binding — no
 # server, no network. Compiles native code via cmake + a C/C++ toolchain on the
 # Windows build host (no CUDA/Metal features).
-llama-cpp-2 = "0.1.150"
+#
+# Default features — ["openmp", "mtmd", "dynamic-link"] — are kept deliberately.
+# A static build (`default-features = false`) does not link: llama.cpp's `common`
+# pulls in download.cpp/hf-cache.cpp, which reference cpp-httplib symbols the static
+# path never compiles (LNK2019 x14). `dynamic-link` therefore stays on, and the
+# ggml/llama DLLs it emits are staged into `libs/` for the bundle (see
+# `beforeBundleCommand`). `mtmd` is dead weight we never call.
+#
+# llama.cpp's own cmake knobs are set in cmake/llama-no-openssl.cmake (injected via
+# .cargo/config.toml): `LLAMA_OPENSSL=OFF` keeps cpp-httplib's TLS — and the host's
+# libcrypto/libssl — out of llama-common, i.e. out of the offline note generator.
+llama-cpp-4 = "0.7.0"
 # EMR hand-off: the note's Copy button writes the whole note to the system
 # clipboard. The §8.6 global-hotkey hand-off was withdrawn — no keystroke injection.
 tauri-plugin-clipboard-manager = "2"

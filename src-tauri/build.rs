@@ -3,19 +3,19 @@ fn main() {
     // only place the compiled-in version is stated is Cargo.lock — Cargo.toml holds a range,
     // and the lockfile isn't shipped so it can't be read at runtime.
     //
-    // Stamped from `llama-cpp-sys-2`, not the `llama-cpp-2` wrapper: the sys crate is what
+    // Stamped from `llama-cpp-sys-4`, not the `llama-cpp-4` wrapper: the sys crate is what
     // vendors llama.cpp and therefore what defines the `state_seq_get_data_ext` blob layout,
-    // and the wrapper depends on it by range (`"0.1.150"`, i.e. ^0.1.150). Stamping the
+    // and the wrapper depends on it by range (`"0.7.0"`, i.e. ^0.7.0). Stamping the
     // wrapper would let a sys-only bump change the layout without changing the filename.
     println!("cargo:rerun-if-changed=Cargo.lock");
     let lock = std::fs::read_to_string("Cargo.lock").expect("Cargo.lock not readable");
     // Pre-fix, stamped the wrapper instead of the crate that owns the blob format:
-    // let version = locked_version(&lock, "llama-cpp-2")
-    //     .expect("llama-cpp-2 not found in Cargo.lock — the prefix KV cache cannot be versioned");
-    // println!("cargo:rustc-env=LLAMA_CPP_2_VERSION={version}");
-    let version = locked_version(&lock, "llama-cpp-sys-2")
-        .expect("llama-cpp-sys-2 not found in Cargo.lock — the prefix KV cache cannot be versioned");
-    println!("cargo:rustc-env=LLAMA_CPP_SYS_2_VERSION={version}");
+    // let version = locked_version(&lock, "llama-cpp-4")
+    //     .expect("llama-cpp-4 not found in Cargo.lock — the prefix KV cache cannot be versioned");
+    // println!("cargo:rustc-env=LLAMA_CPP_4_VERSION={version}");
+    let version = locked_version(&lock, "llama-cpp-sys-4")
+        .expect("llama-cpp-sys-4 not found in Cargo.lock — the prefix KV cache cannot be versioned");
+    println!("cargo:rustc-env=LLAMA_CPP_SYS_4_VERSION={version}");
 
     tauri_build::build()
 }

@@ -53,6 +53,14 @@ nmake install
 set OPENSSL_DIR=C:\Program Files\OpenSSL
 ```
 
+> Keep `OPENSSL_DIR` set when **packaging**, not just when building. The `no-shared`
+> configure above links OpenSSL statically and ships nothing; a *shared* install — one
+> with `bin\libcrypto-*-x64.dll` — is equally fine, but those DLLs must travel with the
+> app, and `scripts/stage_llama_dlls.mjs` copies them out of `%OPENSSL_DIR%\bin` at bundle
+> time. They are deliberately **not** committed: the filename carries OpenSSL's ABI
+> version, so a stale copy still bundles cleanly and only fails once installed. The
+> staging step prints which DLLs it took, or `no OpenSSL imports` for a static build.
+
 ### LLVM (libclang) & CMake — for the LLM
 
 The in-process note-generation engine (llama.cpp, via `llama-cpp-2`) is built from source. `bindgen` needs **libclang** (shipped with LLVM) to generate the Rust bindings, and **CMake** drives the C++ build.

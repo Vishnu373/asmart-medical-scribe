@@ -1,13 +1,13 @@
 //! Model distribution: on-disk resolution + model downloads (D1, D3).
 //!
 //! The installer ships **no** model weights (D3 lean installer). On first launch a
-//! one-time Setup downloads the two models the app requires — the note-generation
-//! model (Gemma; design §8.2) and the Parakeet STT model — and the app is gated
-//! until both are present ([`setup_status`]). These downloads are the only network
-//! calls in the app (NFR-6 zero-egress is about *PHI*; this is model weights), and
-//! each is content-verified before use. The LLM is a single GGUF ([`download_llm`]);
-//! Parakeet is a gzipped tar of a *directory*, so it is verified then extracted
-//! ([`download_stt`]).
+//! one-time Setup downloads the models the app requires — the note-generation
+//! model (Gemma; design §8.2), its MTP draft model, and the Parakeet STT model —
+//! and the app is gated until all are present ([`setup_status`]). These downloads
+//! are the only network calls in the app (NFR-6 zero-egress is about *PHI*; this is
+//! model weights), and each is content-verified before use. The LLM and its draft are
+//! single GGUFs ([`download_llm`], [`download_llm_draft`]); Parakeet is a gzipped tar
+//! of a *directory*, so it is verified then extracted ([`download_stt`]).
 //!
 //! Downloaded models land in the writable `app_data_dir/models`; [`resolve`] also
 //! searches the read-only `resource_dir/models` after it, so a model bundled by a
@@ -43,6 +43,16 @@ pub static LLM: LlmDownload = LlmDownload {
     tier: "llm",
     url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/gemma-4-E2B-it-UD-Q4_K_XL.gguf",
     sha256: Some("b8906b8c5e05e57b657646bbc657bd35814a269b2c20f0a2579047fafa1a67dd"),
+};
+
+/// The MTP draft GGUF download (~93 MB) backing speculative decoding. Same shape and
+/// same R2 bucket as [`LLM`]; the distinct `"llm-draft"` tier keeps its progress
+/// events off the main model's bar. Fetched by [`download_llm_draft`] and part of the
+/// [`setup_status`] gate, so the file is on disk before the loader asks for it.
+pub static LLM_DRAFT: LlmDownload = LlmDownload {
+    tier: "llm-draft",
+    url: "https://pub-1f1bec0a40cf47528c6f179d427ffa22.r2.dev/gemma4-e2b-draft.gguf",
+    sha256: Some("9eba819938efccfd6044f8af84e3bbfddc639a2bcf32ebc36420e6a649191919"),
 };
 
 /// The Parakeet STT model download (D3). Unlike the LLM GGUFs this is a gzipped
@@ -102,27 +112,32 @@ pub fn resolve(file: &str, dirs: &[PathBuf]) -> Option<PathBuf> {
 }
 
 /// Whether the models the app *requires* to run are on disk (D3 first-run gate):
-/// the note-generation model and the Parakeet STT model. The frontend shows the
-/// one-time Setup screen until `ready`.
+/// the note-generation model, its MTP draft model, and the Parakeet STT model. The
+/// frontend shows the one-time Setup screen until `ready`.
 #[derive(Serialize)]
 pub struct SetupStatus {
     pub llm_present: bool,
+    /// The MTP draft GGUF — required because the note model's context pair is built
+    /// from both files, so a missing draft is a failed load, not a slow one.
+    pub llm_draft_present: bool,
     pub stt_present: bool,
-    /// Both required models present — the app can start.
+    /// Every required model present — the app can start.
     pub ready: bool,
 }
 
-/// Report whether the required models (Gemma + Parakeet STT) are present so the
-/// frontend can gate the app on first run (D3).
+/// Report whether the required models (Gemma + its MTP draft + Parakeet STT) are
+/// present so the frontend can gate the app on first run (D3).
 #[tauri::command]
 pub fn setup_status(app: AppHandle) -> Result<SetupStatus, String> {
     let dirs = model_dirs(&app).map_err(|e| e.to_string())?;
     let llm_present = resolve(LlmModel::Gemma.file_name(), &dirs).is_some();
+    let llm_draft_present = resolve(LlmModel::Gemma.draft_file_name(), &dirs).is_some();
     let stt_present = resolve(STT.dir_name, &dirs).is_some();
     Ok(SetupStatus {
         llm_present,
+        llm_draft_present,
         stt_present,
-        ready: llm_present && stt_present,
+        ready: llm_present && llm_draft_present && stt_present,
     })
 }
 
@@ -242,6 +257,40 @@ pub fn download_llm(app: AppHandle) -> Result<(), String> {
             set.remove(&tier);
         }
         finish_download(&app, "SLM", &tier, result);
+    });
+    Ok(())
+}
+
+/// Start downloading the note model's MTP draft GGUF (D3). Mirrors [`download_llm`]
+/// exactly — same `.part` + verify + rename via [`download_to`], same spawn-and-report
+/// shape — but keyed by `LLM_DRAFT.tier` (`"llm-draft"`) so its bar is its own:
+///   - `model-download-progress` `{ tier, downloaded, total }` (throttled)
+///   - `model-download-done` `{ tier }`
+///   - `model-download-error` `{ tier, message }`
+#[tauri::command]
+pub fn download_llm_draft(app: AppHandle) -> Result<(), String> {
+    let file = LlmModel::Gemma.draft_file_name();
+    let dest_dir = model_dirs(&app).map_err(|e| e.to_string())?.remove(0); // app-data/models
+    let tier = LLM_DRAFT.tier.to_string();
+
+    // Claim the download; reject if a worker already holds it.
+    {
+        let mut guard = IN_FLIGHT.lock().unwrap();
+        let set = guard.get_or_insert_with(HashSet::new);
+        if !set.insert(tier.clone()) {
+            return Err("the draft model is already downloading".to_string());
+        }
+    }
+
+    std::thread::spawn(move || {
+        log_downloading("SLM draft", &tier, file);
+        let result = download_to(&app, &LLM_DRAFT, file, &dest_dir);
+        // Release the claim before emitting the terminal event so a retry on error
+        // (or a fresh download after done) isn't rejected as still in flight.
+        if let Some(set) = IN_FLIGHT.lock().unwrap().as_mut() {
+            set.remove(&tier);
+        }
+        finish_download(&app, "SLM draft", &tier, result);
     });
     Ok(())
 }
@@ -479,6 +528,12 @@ mod tests {
             "LLM url {} does not reference its filename {}",
             LLM.url,
             LlmModel::Gemma.file_name()
+        );
+        assert!(
+            LLM_DRAFT.url.contains(LlmModel::Gemma.draft_file_name()),
+            "LLM draft url {} does not reference its filename {}",
+            LLM_DRAFT.url,
+            LlmModel::Gemma.draft_file_name()
         );
     }
 

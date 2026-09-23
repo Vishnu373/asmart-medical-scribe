@@ -52,8 +52,10 @@ export interface InputDevice {
 /** Whether the required models are on disk so the app can start (D3 first-run gate). `models::SetupStatus`. */
 export interface SetupStatus {
   llm_present: boolean;
+  /** The note model's MTP draft GGUF — loaded alongside it, so it gates Setup too. */
+  llm_draft_present: boolean;
   stt_present: boolean;
-  /** Both required models present — the app can leave Setup. */
+  /** Every required model present — the app can leave Setup. */
   ready: boolean;
 }
 

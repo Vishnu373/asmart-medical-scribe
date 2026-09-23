@@ -137,6 +137,12 @@ export function downloadLlm(): Promise<void> {
   return invoke("download_llm");
 }
 
+/** Begin downloading the note model's MTP draft GGUF; progress arrives as
+ * `model-download-*` events keyed by tier `"llm-draft"`, separate from `"llm"`. */
+export function downloadLlmDraft(): Promise<void> {
+  return invoke("download_llm_draft");
+}
+
 /** Begin downloading the Parakeet STT model; progress arrives as `model-download-*`
  * events keyed by tier `"stt"`. The archive is verified and extracted server-side. */
 export function downloadStt(): Promise<void> {

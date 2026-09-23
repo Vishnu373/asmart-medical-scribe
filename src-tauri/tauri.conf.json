@@ -7,6 +7,7 @@
     "beforeDevCommand": "bun run dev",
     "devUrl": "http://localhost:1420",
     "beforeBuildCommand": "bun run build",
+    "beforeBundleCommand": "bun scripts/stage_llama_dlls.mjs",
     "frontendDist": "../dist"
   },
   "app": {

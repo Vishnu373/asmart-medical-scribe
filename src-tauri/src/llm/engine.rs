@@ -1,4 +1,4 @@
-//! In-process GGUF note generation over `llama-cpp-2` (design §8.2). CPU-only, no
+//! In-process GGUF note generation over `llama-cpp-4` (design §8.2). CPU-only, no
 //! server, no network — generation stays on-device (NFR-6).
 //!
 //! Like the STT engine, the native model sits behind the `NoteGenerator` trait so
@@ -8,6 +8,7 @@
 //! on the Linux dev box). The streaming/cancel/persist orchestration around it
 //! lives in `generator.rs`.
 
+use std::collections::VecDeque;
 use std::num::NonZeroU32;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -17,15 +18,15 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use log::{info, warn};
 
-use llama_cpp_2::context::params::LlamaContextParams;
-use llama_cpp_2::context::LlamaContext;
-use llama_cpp_2::llama_backend::LlamaBackend;
-use llama_cpp_2::llama_batch::LlamaBatch;
-use llama_cpp_2::model::params::LlamaModelParams;
-use llama_cpp_2::model::{AddBos, LlamaModel, Special};
-use llama_cpp_2::sampling::LlamaSampler;
-use llama_cpp_2::token::LlamaToken;
-use llama_cpp_2::LlamaStateSeqFlags;
+use llama_cpp_4::context::params::{LlamaContextParams, LlamaContextType};
+use llama_cpp_4::context::LlamaContext;
+use llama_cpp_4::llama_backend::LlamaBackend;
+use llama_cpp_4::llama_batch::LlamaBatch;
+use llama_cpp_4::model::params::LlamaModelParams;
+use llama_cpp_4::model::{AddBos, LlamaModel, Special};
+use llama_cpp_4::mtp::MtpSession;
+use llama_cpp_4::sampling::LlamaSampler;
+use llama_cpp_4::token::LlamaToken;
 
 use super::prompt;
 
@@ -49,6 +50,15 @@ impl LlmModel {
             LlmModel::Gemma => "gemma-4-E2B-it-UD-Q4_K_XL.gguf",
         }
     }
+
+    /// The MTP draft GGUF resolved alongside [`file_name`] — a standalone 4-block
+    /// `gemma4-assistant` model carrying the `nextn` projection heads, loaded as its
+    /// own `LlamaModel` to back the speculative draft context.
+    pub fn draft_file_name(self) -> &'static str {
+        match self {
+            LlmModel::Gemma => "gemma4-e2b-draft.gguf",
+        }
+    }
 }
 
 // Tuning constants (design §8.2 "set at implementation via benchmarking"): kept
@@ -59,6 +69,13 @@ const MAX_OUTPUT_TOKENS: i32 = 1536; // ceiling for the SOAP note itself (post-r
 const MAX_REASONING_TOKENS: i32 = 1024; // separate cap for the <think> scratchpad (§8.3) so a
                                         // verbose CoT can't eat the note's budget; tunable (§8.2)
 const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hallucination
+/// Draft tokens the MTP head proposes per verification step (§8.2). 3 is upstream's
+/// own CLI default; the optimum is model/quant dependent, so B5 re-tunes it.
+const N_DRAFT_MAX: i32 = 3;
+
+/// Decode buffers and the KV cache need headroom beyond the weights themselves
+/// (§8.4). Demanded of the target only — the draft adds neither.
+const WORKING_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
 
 /// Sanity floor for a serialized prefix KV state (§8.7). The real one is ~16.5 MB, so this
 /// only ever rejects a zero/garbage serialize — never a legitimately small prefix.
@@ -93,6 +110,10 @@ struct PrefixCache {
 pub struct LlmEngine {
     backend: LlamaBackend,
     model: Mutex<Option<LlamaModel>>,
+    /// The MTP draft model backing the speculative draft context (§8.2). Loaded and
+    /// dropped with the target: a note's context pair needs both, so one without the
+    /// other is a failed load, not a slow one.
+    draft_model: Mutex<Option<LlamaModel>>,
     /// Cached prefix KV state (§8.6), primed on load ([`warmup`]) and dropped on
     /// [`unload`]/model change. Guarded separately from `model`; a fresh context is
     /// still built per note, so cancel/error can never leave stale tokens here.
@@ -131,6 +152,7 @@ impl LlmEngine {
         Ok(Self {
             backend,
             model: Mutex::new(None),
+            draft_model: Mutex::new(None),
             prefix_cache: Mutex::new(None),
             kind,
             model_dirs,
@@ -144,7 +166,13 @@ impl LlmEngine {
         self.kind
     }
 
+    /// The note model. Deliberately not the MTP draft: the draft is a speedup whose
+    /// absence must neither read as "still loading" (`get_llm_status`) nor send every
+    /// later call back through the load body. It gets one attempt, beside the target.
+    // /// Both models — the target and its MTP draft. `get_llm_status` reports "ready"
+    // /// off this, and generation needs the pair, so a half-load is not loaded.
     pub fn is_loaded(&self) -> bool {
+        // self.lock_model().is_some() && self.lock_draft_model().is_some()
         self.lock_model().is_some()
     }
 
@@ -165,75 +193,139 @@ impl LlmEngine {
             return Ok(());
         }
         let kind = self.model_kind();
-        let file = kind.file_name();
-        let path = crate::models::resolve(file, &self.model_dirs).ok_or_else(|| {
-            anyhow!(
-                "model file {file} not found in {:?} — the bundled model is missing, \
-                 or (for the optional tier) it has not been downloaded yet",
-                self.model_dirs
-            )
-        })?;
-        guard_available_ram(&path)?;
+        // Each step below is gated on its own state, so a failure in one can never skip
+        // another: a missing draft must still leave the target loaded and primed.
+        // let target_was_loaded = self.lock_model().is_some();
+        if self.lock_model().is_none() {
+            let file = kind.file_name();
+            let path = crate::models::resolve(file, &self.model_dirs).ok_or_else(|| {
+                anyhow!(
+                    "model file {file} not found in {:?} — the bundled model is missing, \
+                     or (for the optional tier) it has not been downloaded yet",
+                    self.model_dirs
+                )
+            })?;
+            guard_available_ram(&path, WORKING_MARGIN)?;
 
-        info!("[LOAD] loading SLM: {file}"); // §10.3
-        let t_load = Instant::now();
-        let params = LlamaModelParams::default(); // mmap default; CPU-only build
-        let model = LlamaModel::load_from_file(&self.backend, &path, &params).map_err(|e| {
-            // §10.3 `[LOAD] SLM load failed: {e}` (both sinks). Sanitized: the llama.cpp
-            // load error embeds the GGUF path (username = PII).
-            let msg = crate::telemetry::sanitize_error(&e.to_string());
-            log::error!("[LOAD] SLM load failed: {msg}");
-            crate::telemetry::track_event("slm_load_failed", serde_json::json!({ "error": msg }));
-            anyhow!("failed to load LLM model {}: {e}", path.display())
-        })?;
-        *self.lock_model() = Some(model);
-        info!(
-            "[LOAD] SLM model loaded: {:.1}s", // §10.3
-            t_load.elapsed().as_secs_f32()
-        );
-        // info!("Loaded LLM model: {:?}", kind);
+            info!("[LOAD] loading SLM: {file}"); // §10.3
+            let t_load = Instant::now();
+            let params = LlamaModelParams::default(); // mmap default; CPU-only build
+            let model = LlamaModel::load_from_file(&self.backend, &path, &params).map_err(|e| {
+                // §10.3 `[LOAD] SLM load failed: {e}` (both sinks). Sanitized: the llama.cpp
+                // load error embeds the GGUF path (username = PII).
+                let msg = crate::telemetry::sanitize_error(&e.to_string());
+                log::error!("[LOAD] SLM load failed: {msg}");
+                crate::telemetry::track_event(
+                    "slm_load_failed",
+                    serde_json::json!({ "error": msg }),
+                );
+                anyhow!("failed to load LLM model {}: {e}", path.display())
+            })?;
+            *self.lock_model() = Some(model);
+            info!(
+                "[LOAD] SLM model loaded: {:.1}s", // §10.3
+                t_load.elapsed().as_secs_f32()
+            );
+            // info!("Loaded LLM model: {:?}", kind);
+        }
 
-        // Warmup: the first inference after a load is slow (cold weights/buffers);
-        // a tiny throwaway pass keeps the clinician's first real note at full
-        // speed (design §8.4). Failure here is non-fatal — log and continue.
-        // Timed separately from the weight load: priming decodes the whole fixed
-        // prefix, so it is a real slice of startup and worth seeing on its own.
-        // let t_warm = Instant::now();
-        // if let Err(e) = self.warmup() {
-        //     warn!("LLM warmup pass failed (non-fatal): {e}");
-        // } else {
-        //     info!(
-        //         "[LOAD] SLM prefix KV cache primed in {:.1}s",
-        //         t_warm.elapsed().as_secs_f32()
-        //     );
+        // The prefix cache belongs to the target, so a draft-only load skips it — the
+        // blob is already in memory from the launch that loaded the target.
+        // if target_was_loaded {
+        //     return Ok(());
         // }
-        // Try the on-disk prefix KV first (§8.7) — reading the blob skips the prefix
-        // decode entirely. Anything wrong with it (absent, stale prompt, short read)
-        // falls through to priming, the in-memory-only path kept commented above.
-        let t_warm = Instant::now();
-        match self.load_prefix_kv() {
-            Ok(()) => info!(
-                "[LOAD] SLM prefix KV restored from disk in {:.2}s",
-                t_warm.elapsed().as_secs_f32()
-            ),
-            Err(e) => {
-                info!("[LOAD] SLM prefix KV not restored from disk ({e}) — priming");
-                let t_warm = Instant::now();
-                if let Err(e) = self.warmup() {
-                    warn!("LLM warmup pass failed (non-fatal): {e}");
-                } else {
-                    info!(
-                        "[LOAD] SLM prefix KV cache primed in {:.1}s",
-                        t_warm.elapsed().as_secs_f32()
-                    );
+        // Prime as soon as the target is in memory, gated on the cache itself rather than on
+        // whether this call did the load: a retry after a failed draft load must still get
+        // here, or the process primes on no launch at all.
+        if self.prefix_cache.lock().unwrap().is_none() {
+            // Warmup: the first inference after a load is slow (cold weights/buffers);
+            // a tiny throwaway pass keeps the clinician's first real note at full
+            // speed (design §8.4). Failure here is non-fatal — log and continue.
+            // Timed separately from the weight load: priming decodes the whole fixed
+            // prefix, so it is a real slice of startup and worth seeing on its own.
+            // let t_warm = Instant::now();
+            // if let Err(e) = self.warmup() {
+            //     warn!("LLM warmup pass failed (non-fatal): {e}");
+            // } else {
+            //     info!(
+            //         "[LOAD] SLM prefix KV cache primed in {:.1}s",
+            //         t_warm.elapsed().as_secs_f32()
+            //     );
+            // }
+            // Try the on-disk prefix KV first (§8.7) — reading the blob skips the prefix
+            // decode entirely. Anything wrong with it (absent, stale prompt, short read)
+            // falls through to priming, the in-memory-only path kept commented above.
+            let t_warm = Instant::now();
+            match self.load_prefix_kv() {
+                Ok(()) => info!(
+                    "[LOAD] SLM prefix KV restored from disk in {:.2}s",
+                    t_warm.elapsed().as_secs_f32()
+                ),
+                Err(e) => {
+                    info!("[LOAD] SLM prefix KV not restored from disk ({e}) — priming");
+                    let t_warm = Instant::now();
+                    if let Err(e) = self.warmup() {
+                        warn!("LLM warmup pass failed (non-fatal): {e}");
+                    } else {
+                        info!(
+                            "[LOAD] SLM prefix KV cache primed in {:.1}s",
+                            t_warm.elapsed().as_secs_f32()
+                        );
+                    }
                 }
+            }
+        }
+
+        // The draft is a speedup, not a requirement, so its failure is non-fatal: a missing
+        // or broken draft must not cost the target its prime — nor block the installer's
+        // `--prime-kv` pass (§8.7), which runs before Setup has ever downloaded the draft.
+        if self.lock_draft_model().is_none() {
+            match self.load_draft(kind) {
+                Ok(draft) => *self.lock_draft_model() = Some(draft),
+                Err(e) => warn!("[LOAD] SLM draft unavailable ({e}) — no speculative decoding"),
             }
         }
         Ok(())
     }
 
+    /// Load the MTP draft model (design §8.x speculative decoding). Split out of
+    /// `ensure_loaded` so its failure can be logged and swallowed there.
+    fn load_draft(&self, kind: LlmModel) -> Result<LlamaModel> {
+        let file = kind.draft_file_name();
+        let path = crate::models::resolve(file, &self.model_dirs).ok_or_else(|| {
+            anyhow!(
+                "MTP draft model file {file} not found in {:?} — Setup downloads it \
+                 beside the note model",
+                self.model_dirs
+            )
+        })?;
+        // No working margin: 93 MB of weights, and the draft context borrows the
+        // target's KV cache instead of allocating a second one (see `new_draft_context`).
+        guard_available_ram(&path, 0)?;
+
+        info!("[LOAD] loading SLM draft: {file}"); // §10.3
+        let t_load = Instant::now();
+        let params = LlamaModelParams::default();
+        let draft = LlamaModel::load_from_file(&self.backend, &path, &params).map_err(|e| {
+            // Same sanitizing as the target: the llama.cpp load error embeds the GGUF path.
+            let msg = crate::telemetry::sanitize_error(&e.to_string());
+            log::error!("[LOAD] SLM draft load failed: {msg}");
+            crate::telemetry::track_event(
+                "slm_draft_load_failed",
+                serde_json::json!({ "error": msg }),
+            );
+            anyhow!("failed to load the MTP draft model {}: {e}", path.display())
+        })?;
+        info!(
+            "[LOAD] SLM draft model loaded: {:.1}s", // §10.3
+            t_load.elapsed().as_secs_f32()
+        );
+        Ok(draft)
+    }
+
     pub fn unload(&self) {
         *self.lock_model() = None;
+        *self.lock_draft_model() = None;
         // Drop the cached prefix state with the model: it belongs to this model
         // (§8.6). The next load rebuilds it — from the blob when one is present (§8.7),
         // by priming otherwise.
@@ -271,6 +363,12 @@ impl LlmEngine {
         let model = guard
             .as_ref()
             .ok_or_else(|| anyhow!("LLM model is not loaded"))?;
+        // Optional by design (§8.2): a missing or broken draft costs the note its
+        // speculation, never the note itself.
+        // let draft_model = draft_guard
+        //     .as_ref()
+        //     .ok_or_else(|| anyhow!("MTP draft model is not loaded"))?;
+        let draft_guard = self.lock_draft_model();
 
         let tokens = model
             .str_to_token(&prompt, AddBos::Always)
@@ -282,7 +380,12 @@ impl LlmEngine {
         // truncate it mid-decode. Unchanged by caching — the tail still occupies the
         // same positions.
         let output_budget = MAX_REASONING_TOKENS + MAX_OUTPUT_TOKENS;
-        let prompt_budget = N_CTX as i32 - output_budget;
+        // let prompt_budget = N_CTX as i32 - output_budget;
+        // ^ left one spare cell, but every speculation round transiently occupies
+        // `n_cur + 1 ..= n_cur + N_DRAFT_MAX` as well (§8.2), so a full-length note ran
+        // the target out of KV slots mid-decode. Reserved unconditionally — three cells
+        // are cheaper than a budget that depends on whether the draft loaded.
+        let prompt_budget = N_CTX as i32 - output_budget - N_DRAFT_MAX;
         if tokens.len() as i32 >= prompt_budget {
             return Err(anyhow!(
                 "transcript is too long for the model context ({} tokens; the prompt \
@@ -300,10 +403,24 @@ impl LlmEngine {
             tokens.len()
         );
 
-        let mut ctx = self.new_context(model)?;
+        // let mut ctx = self.new_context(model)?;
+        // let mut draft_ctx = draft_guard
+        //     .as_ref()
+        //     .map(|draft_model| self.new_draft_context(draft_model, &ctx))
+        //     .transpose()?;
+        // ^ two independent locals, where only the declaration order stopped the draft
+        // outliving the cells it aliases. `Contexts` owns both and fixes the drop order.
+        //
+        // Built before the prefix restore: the draft context is wired into the target's
+        // KV cache, so it must exist before anything writes cells into it.
+        let mut contexts = match draft_guard.as_ref() {
+            Some(draft_model) => self.pair_with_draft(draft_model, self.new_context(model)?)?,
+            None => Contexts::target_only(self.new_context(model)?),
+        };
+        let (ctx, draft_ctx) = contexts.split_mut();
         // Restore the cached prefix KV if this prompt starts with exactly its
         // tokens; otherwise start from position 0 (full decode, the fallback).
-        let start = self.restore_prefix(&mut ctx, kind, &tokens);
+        let start = self.restore_prefix(ctx, kind, &tokens);
         if start > 0 {
             info!(
                 "[GENERATE] {note_id} prefix cache HIT — {start} of {} tokens restored, {} to prefill",
@@ -316,9 +433,23 @@ impl LlmEngine {
                 tokens.len()
             );
         }
+        // Every target decode runs through the decoder from here on. With a draft it
+        // harvests the target's hidden states into MTP state as it goes, which is what
+        // the drafting reads; without one it is a plain target decode and the loop
+        // degenerates to one token per decode.
+        let mut decoder = match draft_ctx {
+            Some(draft_ctx) => Decoder::Speculative(
+                MtpSession::new(ctx, draft_ctx, 1, N_DRAFT_MAX)
+                    .map_err(|e| anyhow!("failed to create the MTP draft session: {e}"))?,
+            ),
+            None => {
+                warn!("[GENERATE] {note_id} no MTP draft loaded — decoding without speculation");
+                Decoder::Plain(ctx)
+            }
+        };
         let note = self.decode_and_generate(
             note_id,
-            &mut ctx,
+            &mut decoder,
             model,
             &tokens,
             start,
@@ -356,6 +487,10 @@ impl LlmEngine {
             .map_err(|e| anyhow!("failed to tokenize prompt prefix: {e}"))?;
 
         let mut ctx = self.new_context(model)?;
+        // Priming is a one-off prefill with no note in flight, so it gets every physical core.
+        if let Some(physical) = sysinfo::System::new().physical_core_count() {
+            ctx.set_n_threads(ctx.n_threads(), physical as i32);
+        }
         let mut batch = LlamaBatch::new(N_CTX as usize, 1);
         let last = prefix_tokens.len() as i32 - 1;
         for (i, token) in prefix_tokens.iter().enumerate() {
@@ -371,10 +506,8 @@ impl LlmEngine {
         // used (~the prefix), not the N_CTX maximum the whole-context `get_state_size`
         // reports — so priming doesn't briefly allocate and zero ~1 GB right after the
         // model load, which would spike RAM against the §7 co-resident budget.
-        let mut state = vec![0u8; ctx.state_seq_get_size_ext(0, LlamaStateSeqFlags::empty())];
-        let written = unsafe {
-            ctx.state_seq_get_data_ext(state.as_mut_ptr(), 0, LlamaStateSeqFlags::empty())
-        };
+        let mut state = vec![0u8; ctx.state_seq_get_size_ext(0, 0)];
+        let written = ctx.state_seq_get_data_ext(&mut state, 0, 0);
         state.truncate(written);
         // `state_seq_get_data_ext` reports 0 on internal failure and has no `Result`. An empty
         // (or absurdly short) blob writes and reads back fine, so nothing downstream would ever
@@ -453,7 +586,7 @@ impl LlmEngine {
     }
 
     /// Where the prefix KV blob lives — the writable app-data models dir, named with a hash
-    /// of the prompt prefix and the llama-cpp-sys-2 version (stamped by `build.rs`, since that
+    /// of the prompt prefix and the llama-cpp-sys-4 version (stamped by `build.rs`, since that
     /// crate vendors llama.cpp and owns the blob layout). A prompt edit
     /// or a dependency bump changes the name, so a stale blob is never read (the file simply
     /// isn't there). §8.7
@@ -474,9 +607,9 @@ impl LlmEngine {
         }
         // Pre-version-stamp name, kept for reference:
         // Some(dir.join(format!("prefix_kv_{}_{hash}.bin", kind.file_name())))
-        // Stamped with llama-cpp-2's version before the sys fix; see build.rs:
-        // let version = env!("LLAMA_CPP_2_VERSION");
-        let version = env!("LLAMA_CPP_SYS_2_VERSION");
+        // Stamped with llama-cpp-4's version before the sys fix; see build.rs:
+        // let version = env!("LLAMA_CPP_4_VERSION");
+        let version = env!("LLAMA_CPP_SYS_4_VERSION");
         Some(dir.join(format!(
             "prefix_kv_{}_{hash}_{version}.bin",
             kind.file_name()
@@ -523,11 +656,10 @@ impl LlmEngine {
         if pc.kind != kind || tokens.len() <= n || tokens[..n] != pc.prefix_tokens[..] {
             return 0;
         }
-        // Safety: `state` came from `state_seq_get_data_ext` on a context created with
-        // the same model and params, restored onto the same sequence id (0) — the
-        // binding's contract for restore.
-        let ok = unsafe { ctx.state_seq_set_data_ext(&pc.state, 0, LlamaStateSeqFlags::empty()) };
-        if !ok {
+        // Returns the bytes read; `0` means llama.cpp rejected the blob (a state from a
+        // different model/params, or a layout it can't parse). §8.7
+        let read = ctx.state_seq_set_data_ext(&pc.state, 0, 0);
+        if read == 0 {
             // Restore failed — reset any partial state and decode the whole prompt.
             // Logged because this is the one silent way the cache stops paying off: the note
             // is still correct, just at full prefill cost, with the load-time log still
@@ -569,7 +701,7 @@ impl LlmEngine {
     fn decode_and_generate(
         &self,
         note_id: &str,
-        ctx: &mut LlamaContext,
+        decoder: &mut Decoder<'_, '_>,
         model: &LlamaModel,
         tokens: &[LlamaToken],
         start: i32,
@@ -592,7 +724,8 @@ impl LlmEngine {
                 .add(tokens[i as usize], i, &[0], i == last)
                 .map_err(|e| anyhow!("failed to fill prompt batch: {e}"))?;
         }
-        ctx.decode(&mut batch)
+        decoder
+            .decode(&mut batch)
             .map_err(|e| anyhow!("prompt decode failed: {e}"))?;
         let prefilled = tokens.len() as i32 - start;
         // §10.3 `[GENERATE] {note_id} prefill done — prefill duration {N}s` (tok/s kept
@@ -622,6 +755,16 @@ impl LlmEngine {
         // Absolute next position: the prompt fills 0..tokens.len(), so generation
         // continues there regardless of how much of the prompt was cached.
         let mut n_cur = tokens.len() as i32;
+        // Speculation state (§8.2). `verified` holds tokens the target has already
+        // confirmed and decoded but not yet emitted; `seed` is the token sampled from the
+        // newest logits, which is not in the KV yet and starts the next round. Everything
+        // below still consumes one token at a time.
+        let mut verified: VecDeque<LlamaToken> = VecDeque::new();
+        let mut seed: Option<LlamaToken> = None;
+        // Speculation is a speedup, not a requirement (§8.2). A failed proposal latches it
+        // off for the rest of the note instead of failing the note: near-greedy decoding
+        // means a retry hits the same draft with the same state and fails identically.
+        let mut drafting = true;
         let mut note_tokens = 0; // counted against `max_tokens` (the note budget)
         let mut reasoning_tokens = 0; // counted against the reasoning cap, while suppressing
 
@@ -671,6 +814,14 @@ impl LlmEngine {
                     // force-close the `<think>` block by decoding the boundary tokens
                     // into the context and switch to streaming, so the cap means "stop
                     // thinking, write the note now" rather than "fail forever".
+                    // Whatever was drafted past this point continues the reasoning we
+                    // are about to cut off, so drop the unemitted tail and roll the KV
+                    // back to the last emitted token — that tail and the last round's
+                    // rejected drafts both sit where the boundary is about to go.
+                    n_cur -= verified.len() as i32;
+                    verified.clear();
+                    seed = None; // the next sample comes from the injected boundary
+                    rollback_kv(decoder, n_cur)?;
                     let forced = model
                         .str_to_token(s.boundary, AddBos::Never)
                         .map_err(|e| anyhow!("failed to tokenize reasoning boundary: {e}"))?;
@@ -682,7 +833,8 @@ impl LlmEngine {
                             .map_err(|e| anyhow!("failed to inject the reasoning boundary: {e}"))?;
                         n_cur += 1;
                     }
-                    ctx.decode(&mut batch)
+                    decoder
+                        .decode(&mut batch)
                         .map_err(|e| anyhow!("boundary injection decode failed: {e}"))?;
                     raw.push_str(s.boundary);
                     boundary_passed = true;
@@ -690,8 +842,89 @@ impl LlmEngine {
                 }
             }
 
-            let token = sampler.sample(ctx, batch.n_tokens() - 1);
-            sampler.accept(token);
+            // let token = sampler.sample(session.target_context(), batch.n_tokens() - 1);
+            // sampler.accept(token);
+            // ^ superseded by the speculation round: the target still decides every token,
+            //   but up to N_DRAFT_MAX + 1 of them now come out of a single decode (§8.2).
+            if verified.is_empty() {
+                // Only the prefill and a forced boundary leave `seed` empty; after a round
+                // it holds the token sampled past the accepted run, already paid for.
+                let id_last = match seed.take() {
+                    Some(t) => t,
+                    None => {
+                        let t = sampler.sample(decoder.context(), batch.n_tokens() - 1);
+                        sampler.accept(t);
+                        t
+                    }
+                };
+                verified.push_back(id_last);
+
+                // Before drafting, not after: last round's rejected drafts still occupy
+                // `n_cur..`, the positions this round is about to write, and the draft
+                // reads the target's cells (§8.2: it mirrors them), so it would otherwise
+                // draft a continuation of tokens the target already threw away.
+                rollback_kv(decoder, n_cur)?;
+                // let drafts = decoder.draft(n_cur, id_last)?;
+                // ^ a broken draft head took the note down with it, a failure mode the
+                // pre-speculation path did not have.
+                let drafts = if drafting {
+                    decoder.draft(n_cur, id_last).unwrap_or_else(|e| {
+                        drafting = false;
+                        warn!(
+                            "[GENERATE] {note_id} MTP draft failed ({e}) — finishing the note without speculation"
+                        );
+                        Vec::new()
+                    })
+                } else {
+                    Vec::new()
+                };
+
+                batch.clear();
+                batch
+                    .add(id_last, n_cur, &[0], true)
+                    .map_err(|e| anyhow!("failed to add a token to the batch: {e}"))?;
+                for (i, d) in drafts.iter().enumerate() {
+                    batch
+                        .add(*d, n_cur + 1 + i as i32, &[0], true)
+                        .map_err(|e| anyhow!("failed to add a draft token to the batch: {e}"))?;
+                }
+                // No rollback here: `draft` leaves nothing behind — llama.cpp returns from
+                // `apply_ubatch` without touching a cell while the draft's cache mirrors
+                // the target's. The only cells ever in the way are the target's own
+                // rejected drafts, already cleared above before they could be drafted on.
+                decoder
+                    .decode(&mut batch)
+                    .map_err(|e| anyhow!("token decode failed: {e}"))?;
+
+                // Row 0 of the logits is what follows the seed, row i + 1 what follows
+                // draft i. A row that agrees with its draft accepts it; the first
+                // disagreement — or the row past the last draft — is the target's own
+                // next token and seeds the next round, so nothing sampled is wasted and
+                // the emitted sequence is exactly what the target alone would produce.
+                let mut n_accepted = 0usize;
+                seed = Some(loop {
+                    let t = sampler.sample(decoder.context(), n_accepted as i32);
+                    sampler.accept(t);
+                    match drafts.get(n_accepted) {
+                        Some(d) if *d == t => {
+                            verified.push_back(t);
+                            n_accepted += 1;
+                        }
+                        _ => break t,
+                    }
+                });
+                if !drafts.is_empty() {
+                    // Resyncs the draft head's carried hidden state to the accepted prefix.
+                    // Skipped when nothing was proposed — there is no proposal to answer,
+                    // which is also every round of the no-draft path.
+                    decoder.accept(n_accepted)?;
+                }
+                // Everything in `verified` is now in the target's KV; `seed` is not.
+                n_cur += verified.len() as i32;
+            }
+            let token = verified
+                .pop_front()
+                .ok_or_else(|| anyhow!("the speculation round produced no token"))?;
             if model.is_eog_token(token) {
                 break;
             }
@@ -760,13 +993,16 @@ impl LlmEngine {
                 }
             }
 
-            batch.clear();
-            batch
-                .add(token, n_cur, &[0], true)
-                .map_err(|e| anyhow!("failed to add a token to the batch: {e}"))?;
-            n_cur += 1;
-            ctx.decode(&mut batch)
-                .map_err(|e| anyhow!("token decode failed: {e}"))?;
+            // The speculation round already decoded this token — and the drafts that
+            // rode with it — into the target, so the per-token decode is gone:
+            // batch.clear();
+            // batch
+            //     .add(token, n_cur, &[0], true)
+            //     .map_err(|e| anyhow!("failed to add a token to the batch: {e}"))?;
+            // n_cur += 1;
+            // session
+            //     .decode_target_and_process(&mut batch)
+            //     .map_err(|e| anyhow!("token decode failed: {e}"))?;
         }
 
         if boundary_passed {
@@ -829,8 +1065,51 @@ impl LlmEngine {
             .map_err(|e| anyhow!("failed to create LLM context: {e}"))
     }
 
+    /// The MTP draft context for `model`, paired with the target `target` (§8.2).
+    ///
+    /// `gemma4-assistant` is a draft-only architecture: llama.cpp refuses to build a
+    /// context for it without `ctx_other`, and uses that pairing to map the draft's four
+    /// blocks onto the target's last two KV layers rather than allocating a second cache
+    /// — hence the matching `N_CTX`.
+    ///
+    /// The target is taken by value and handed back inside [`Contexts`]: llama.cpp keeps
+    /// its pointer in the draft's `ctx_other` and aliases its KV cells for the draft's
+    /// whole life, yet the returned context borrows nothing, so only co-ownership can
+    /// stop the target being dropped first.
+    // fn new_draft_context<'a>(&'a self, model: &'a LlamaModel, target: &LlamaContext<'_>)
+    //     -> Result<LlamaContext<'a>>
+    // ^ handed back a free-standing draft context: nothing in the type system tied it to
+    // the target it aliases, so a swap of the two `let`s in `generate` was a UAF.
+    fn pair_with_draft<'a>(
+        &'a self,
+        model: &'a LlamaModel,
+        target: LlamaContext<'a>,
+    ) -> Result<Contexts<'a>> {
+        let mut ctx_params = LlamaContextParams::default()
+            .with_n_ctx(NonZeroU32::new(N_CTX))
+            .with_ctx_type(LlamaContextType::Mtp)
+            .with_ctx_other(&target)
+            // Dead for this arch (the draft is not recurrent), but `MtpSession` validates
+            // it against `n_draft_max` for the architectures that are.
+            .with_n_rs_seq(N_DRAFT_MAX.max(4) as u32);
+        if let Some(n) = self.n_threads {
+            ctx_params = ctx_params.with_n_threads(n).with_n_threads_batch(n);
+        }
+        let draft = model
+            .new_context(&self.backend, ctx_params)
+            .map_err(|e| anyhow!("failed to create the MTP draft context: {e}"))?;
+        Ok(Contexts {
+            draft: Some(draft),
+            target,
+        })
+    }
+
     fn lock_model(&self) -> MutexGuard<'_, Option<LlamaModel>> {
         self.model.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    fn lock_draft_model(&self) -> MutexGuard<'_, Option<LlamaModel>> {
+        self.draft_model.lock().unwrap_or_else(|p| p.into_inner())
     }
 }
 
@@ -845,6 +1124,108 @@ fn rate(tokens: i32, elapsed: std::time::Duration) -> f32 {
     }
 }
 
+/// The target context plus, when a draft model is loaded, the MTP draft context built
+/// against it (§8.2). Owning both is a tie the borrow checker cannot express on its own:
+/// `LlamaModel::new_context` returns a context that borrows nothing, while llama.cpp
+/// stores the target's pointer in the draft's `ctx_other` and aliases the target's KV
+/// cells for as long as the draft lives. Field order is drop order — the draft goes
+/// first, so the cells it points at are still there.
+struct Contexts<'a> {
+    draft: Option<LlamaContext<'a>>,
+    target: LlamaContext<'a>,
+}
+
+impl<'a> Contexts<'a> {
+    /// A run with no speculation: the target alone.
+    fn target_only(target: LlamaContext<'a>) -> Self {
+        Self {
+            draft: None,
+            target,
+        }
+    }
+
+    /// Both halves at once — `MtpSession` needs them mutably together.
+    fn split_mut(&mut self) -> (&mut LlamaContext<'a>, Option<&mut LlamaContext<'a>>) {
+        (&mut self.target, self.draft.as_mut())
+    }
+}
+
+/// How the generate loop decodes on the target: with MTP speculation when a draft model
+/// is loaded, plain otherwise. The draft is a speedup, not a requirement (§8.2), so its
+/// absence must not cost the clinician the note — `Plain` proposes nothing and the
+/// round degenerates to one target-decided token per decode.
+enum Decoder<'ctx, 'model> {
+    Speculative(MtpSession<'ctx, 'model>),
+    Plain(&'ctx mut LlamaContext<'model>),
+}
+
+impl<'ctx, 'model> Decoder<'ctx, 'model> {
+    /// The target context — what every sample reads its logits from.
+    fn context(&self) -> &LlamaContext<'model> {
+        match self {
+            Self::Speculative(s) => s.target_context(),
+            Self::Plain(ctx) => ctx,
+        }
+    }
+
+    /// Decode one batch on the target, harvesting it into MTP state when speculating.
+    fn decode(&mut self, batch: &mut LlamaBatch) -> Result<()> {
+        match self {
+            Self::Speculative(s) => s
+                .decode_target_and_process(batch)
+                .map_err(|e| anyhow!("{e}")),
+            Self::Plain(ctx) => ctx.decode(batch).map_err(|e| anyhow!("{e}")),
+        }
+    }
+
+    /// Propose up to `N_DRAFT_MAX` continuations of `id_last`; none without a draft.
+    fn draft(&mut self, n_past: i32, id_last: LlamaToken) -> Result<Vec<LlamaToken>> {
+        match self {
+            Self::Speculative(s) => s
+                .draft(0, n_past, id_last)
+                .map_err(|e| anyhow!("MTP draft failed: {e}")),
+            Self::Plain(_) => Ok(Vec::new()),
+        }
+    }
+
+    /// Answer the outstanding proposal with how much of it the target kept.
+    fn accept(&mut self, n_accepted: usize) -> Result<()> {
+        match self {
+            Self::Speculative(s) => s
+                .accept(0, n_accepted as u16)
+                .map_err(|e| anyhow!("failed to accept {n_accepted} draft tokens: {e}")),
+            Self::Plain(_) => Ok(()),
+        }
+    }
+}
+
+/// Drop every target KV cell at or past `n_past` on sequence 0 (§8.2). What occupies those
+/// positions is the target's own work — last round's rejected drafts, or the unemitted tail
+/// at a forced boundary. The draft context marks no cells of its own: llama.cpp skips
+/// `apply_ubatch` entirely while its cache mirrors the target's, so it only ever reads.
+fn rollback_kv(decoder: &mut Decoder<'_, '_>, n_past: i32) -> Result<()> {
+    // let removed = match decoder { … }
+    // .map_err(…)?;
+    // if removed { Ok(()) } else { Err(anyhow!("the target KV cache refused …")) }
+    // ^ dead guard: `llama_kv_cache::seq_rm` returns true on every path. Only a recurrent
+    // cache can refuse a partial removal, and neither context has one.
+    match decoder {
+        Decoder::Speculative(s) => s.clear_target_kv_cache_seq(Some(0), Some(n_past as u32), None),
+        Decoder::Plain(ctx) => ctx.clear_kv_cache_seq(Some(0), Some(n_past as u32), None),
+    }
+    .map_err(|e| anyhow!("failed to clear the speculative KV range: {e}"))?;
+    // Ask the cells instead of trusting the return value. Stale cells past `n_past` are
+    // attended alongside the tokens that replace them, so a removal that did not take is a
+    // corrupt note, not a slow one.
+    let highest = decoder.context().kv_cache_seq_pos_max(0);
+    if highest >= n_past {
+        return Err(anyhow!(
+            "the target KV cache still holds position {highest} after the removal at {n_past}"
+        ));
+    }
+    Ok(())
+}
+
 /// Fail the load if free RAM is below the model file size plus a working margin
 /// (design §8.4): better a graceful error in IDLE than a mid-load OOM crash.
 #[cfg(test)]
@@ -854,13 +1235,13 @@ mod tests {
     #[test]
     fn remove_superseded_blobs_deletes_only_other_prefix_kv_files() {
         let dir = tempfile::tempdir().unwrap();
-        let current = dir.path().join("prefix_kv_gemma.gguf_abc123_0.1.150.bin");
+        let current = dir.path().join("prefix_kv_gemma.gguf_abc123_0.7.0.bin");
 
         // The current blob, two superseded ones, a crashed write's leftover, and the
         // model weights sitting in the same dir.
-        let stale = dir.path().join("prefix_kv_gemma.gguf_abc123_0.1.149.bin");
-        let old_prompt = dir.path().join("prefix_kv_gemma.gguf_deadbe_0.1.150.bin");
-        let leftover = dir.path().join("prefix_kv_gemma.gguf_abc123_0.1.150.tmp");
+        let stale = dir.path().join("prefix_kv_gemma.gguf_abc123_0.6.1.bin");
+        let old_prompt = dir.path().join("prefix_kv_gemma.gguf_deadbe_0.7.0.bin");
+        let leftover = dir.path().join("prefix_kv_gemma.gguf_abc123_0.7.0.tmp");
         let weights = dir.path().join(LlmModel::Gemma.file_name());
         for p in [&current, &stale, &old_prompt, &leftover, &weights] {
             std::fs::write(p, b"x").unwrap();
@@ -887,13 +1268,11 @@ mod tests {
     }
 }
 
-fn guard_available_ram(model_path: &Path) -> Result<()> {
+fn guard_available_ram(model_path: &Path, margin: u64) -> Result<()> {
     let model_bytes = std::fs::metadata(model_path)
         .map(|m| m.len())
         .map_err(|e| anyhow!("model file not found at {}: {e}", model_path.display()))?;
-    // Decode buffers/KV-cache need headroom beyond the weights themselves.
-    const WORKING_MARGIN: u64 = 2 * 1024 * 1024 * 1024;
-    let needed = model_bytes + WORKING_MARGIN;
+    let needed = model_bytes + margin;
 
     let mut sys = sysinfo::System::new();
     sys.refresh_memory();

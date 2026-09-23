@@ -42,3 +42,12 @@ src-tauri/resources/models/*
 # Claude files
 .claude/
 CLAUDE.md
+# Staged from target/release by scripts/stage_llama_dlls.mjs at bundle time —
+# a committed copy would go stale against the rlib and crash at model load.
+src-tauri/libs/ggml*.dll
+src-tauri/libs/llama*.dll
+src-tauri/libs/mtmd*.dll
+# OpenSSL is staged by the same script: its DLL name carries the ABI version, so a
+# committed copy stops matching the build the day the host's OpenSSL is bumped.
+src-tauri/libs/libcrypto*.dll
+src-tauri/libs/libssl*.dll
