@@ -10,6 +10,7 @@
 
 mod engine;
 mod generator;
+mod mtp;
 mod prompt;
 
 pub use engine::{LlmEngine, LlmModel};

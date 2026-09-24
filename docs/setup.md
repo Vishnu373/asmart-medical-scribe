@@ -131,7 +131,18 @@ bun run test
 
 </details>
 
----
+<details>
+<summary><b>In case prefill is stuck or priming isn't working</b></summary>
+
+1. Rebuilt the llama-cpp-sys-4
+
+``` bash
+cd src-tuari
+cargo clean -p llama-cpp-sys-4
+```
+
+</details>
+
 
 ## 📦 Release & packaging
 

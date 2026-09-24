@@ -18,16 +18,18 @@ use std::time::Instant;
 use anyhow::{anyhow, Result};
 use log::{info, warn};
 
-use llama_cpp_4::context::params::{LlamaContextParams, LlamaContextType};
+// use llama_cpp_4::context::params::{LlamaContextParams, LlamaContextType};
+use llama_cpp_4::context::params::LlamaContextParams;
 use llama_cpp_4::context::LlamaContext;
 use llama_cpp_4::llama_backend::LlamaBackend;
 use llama_cpp_4::llama_batch::LlamaBatch;
 use llama_cpp_4::model::params::LlamaModelParams;
 use llama_cpp_4::model::{AddBos, LlamaModel, Special};
-use llama_cpp_4::mtp::MtpSession;
+// use llama_cpp_4::mtp::MtpSession;
 use llama_cpp_4::sampling::LlamaSampler;
 use llama_cpp_4::token::LlamaToken;
 
+use super::mtp::{self, MtpContexts, MtpDecoder};
 use super::prompt;
 
 /// The note-generation model (design §8.2). A single on-device model —
@@ -66,12 +68,14 @@ impl LlmModel {
 // §7 budget needs.
 const N_CTX: u32 = 8192; // prompt + transcript + reasoning + note; well under the model maxima
 const MAX_OUTPUT_TOKENS: i32 = 1536; // ceiling for the SOAP note itself (post-reasoning)
-const MAX_REASONING_TOKENS: i32 = 1024; // separate cap for the <think> scratchpad (§8.3) so a
-                                        // verbose CoT can't eat the note's budget; tunable (§8.2)
+const MAX_REASONING_TOKENS: i32 = 512; // separate cap for the <think> scratchpad (§8.3); observed
+                                       // reasoning runs ~240–250 tokens, so 512 leaves headroom
 const SAMPLE_TEMP: f32 = 0.2; // low temperature → near-deterministic, low hallucination
-/// Draft tokens the MTP head proposes per verification step (§8.2). 3 is upstream's
-/// own CLI default; the optimum is model/quant dependent, so B5 re-tunes it.
-const N_DRAFT_MAX: i32 = 3;
+
+// /// Draft tokens the MTP head proposes per verification step (§8.2). 3 is upstream's
+// /// own CLI default; the optimum is model/quant dependent, so B5 re-tunes it.
+// const N_DRAFT_MAX: i32 = 3;
+// ^ moved to `mtp::N_DRAFT`.
 
 /// Decode buffers and the KV cache need headroom beyond the weights themselves
 /// (§8.4). Demanded of the target only — the draft adds neither.
@@ -134,6 +138,9 @@ pub struct LlmEngine {
     /// §8.2 startup fix) and an early Generate can't both load the model at once.
     /// Held only across the load itself, never nested inside the `model` lock.
     load_lock: Mutex<()>,
+    /// `MTP_ENABLED`, read once at construction. Off only for `MTP_ENABLED=0`; when
+    /// off, the draft model is never loaded.
+    mtp_enabled: bool,
 }
 
 impl LlmEngine {
@@ -149,6 +156,12 @@ impl LlmEngine {
         // `llama_log_set`, which forwards to `ggml_log_set` — covers both. Errors still
         // come back as `Result`s. Comment out to get the firehose back when debugging.
         backend.void_logs();
+        let mtp_enabled = std::env::var("MTP_ENABLED").map_or(true, |v| v != "0");
+        if mtp_enabled {
+            info!("[LOAD] MTP enabled");
+        } else {
+            info!("[LOAD] MTP disabled (MTP_ENABLED=0)");
+        }
         Ok(Self {
             backend,
             model: Mutex::new(None),
@@ -159,6 +172,7 @@ impl LlmEngine {
             n_threads: n_threads.map(|n| n.max(1)),
             // n_threads: n_threads.max(1),
             load_lock: Mutex::new(()),
+            mtp_enabled,
         })
     }
 
@@ -279,7 +293,7 @@ impl LlmEngine {
         // The draft is a speedup, not a requirement, so its failure is non-fatal: a missing
         // or broken draft must not cost the target its prime — nor block the installer's
         // `--prime-kv` pass (§8.7), which runs before Setup has ever downloaded the draft.
-        if self.lock_draft_model().is_none() {
+        if self.mtp_enabled && self.lock_draft_model().is_none() {
             match self.load_draft(kind) {
                 Ok(draft) => *self.lock_draft_model() = Some(draft),
                 Err(e) => warn!("[LOAD] SLM draft unavailable ({e}) — no speculative decoding"),
@@ -385,7 +399,8 @@ impl LlmEngine {
         // `n_cur + 1 ..= n_cur + N_DRAFT_MAX` as well (§8.2), so a full-length note ran
         // the target out of KV slots mid-decode. Reserved unconditionally — three cells
         // are cheaper than a budget that depends on whether the draft loaded.
-        let prompt_budget = N_CTX as i32 - output_budget - N_DRAFT_MAX;
+        // let prompt_budget = N_CTX as i32 - output_budget - N_DRAFT_MAX;
+        let prompt_budget = N_CTX as i32 - output_budget - mtp::N_DRAFT;
         if tokens.len() as i32 >= prompt_budget {
             return Err(anyhow!(
                 "transcript is too long for the model context ({} tokens; the prompt \
@@ -413,14 +428,30 @@ impl LlmEngine {
         //
         // Built before the prefix restore: the draft context is wired into the target's
         // KV cache, so it must exist before anything writes cells into it.
-        let mut contexts = match draft_guard.as_ref() {
-            Some(draft_model) => self.pair_with_draft(draft_model, self.new_context(model)?)?,
-            None => Contexts::target_only(self.new_context(model)?),
+        // let mut contexts = match draft_guard.as_ref() {
+        //     Some(draft_model) => self.pair_with_draft(draft_model, self.new_context(model)?)?,
+        //     None => Contexts::target_only(self.new_context(model)?),
+        // };
+        // let (ctx, draft_ctx) = contexts.split_mut();
+        let target = self.new_context(model)?;
+        let mut contexts = match (self.mtp_enabled, draft_guard.as_ref()) {
+            (true, Some(draft_model)) => MtpContexts::with_draft(
+                &self.backend,
+                draft_model,
+                target,
+                self.n_threads,
+                note_id,
+            ),
+            (true, None) => {
+                warn!("[GENERATE] {note_id} draft model missing — generating with the main model only");
+                MtpContexts::target_only(target)
+            }
+            (false, _) => MtpContexts::target_only(target),
         };
-        let (ctx, draft_ctx) = contexts.split_mut();
         // Restore the cached prefix KV if this prompt starts with exactly its
         // tokens; otherwise start from position 0 (full decode, the fallback).
-        let start = self.restore_prefix(ctx, kind, &tokens);
+        // let start = self.restore_prefix(ctx, kind, &tokens);
+        let start = self.restore_prefix(contexts.target_mut(), kind, &tokens);
         if start > 0 {
             info!(
                 "[GENERATE] {note_id} prefix cache HIT — {start} of {} tokens restored, {} to prefill",
@@ -437,31 +468,50 @@ impl LlmEngine {
         // harvests the target's hidden states into MTP state as it goes, which is what
         // the drafting reads; without one it is a plain target decode and the loop
         // degenerates to one token per decode.
-        let mut decoder = match draft_ctx {
-            Some(draft_ctx) => Decoder::Speculative(
-                MtpSession::new(ctx, draft_ctx, 1, N_DRAFT_MAX)
-                    .map_err(|e| anyhow!("failed to create the MTP draft session: {e}"))?,
-            ),
-            None => {
-                warn!("[GENERATE] {note_id} no MTP draft loaded — decoding without speculation");
-                Decoder::Plain(ctx)
+        // let mut decoder = match draft_ctx {
+        //     Some(draft_ctx) => Decoder::Speculative(
+        //         MtpSession::new(ctx, draft_ctx, 1, N_DRAFT_MAX)
+        //             .map_err(|e| anyhow!("failed to create the MTP draft session: {e}"))?,
+        //     ),
+        //     None => {
+        //         warn!("[GENERATE] {note_id} no MTP draft loaded — decoding without speculation");
+        //         Decoder::Plain(ctx)
+        //     }
+        // };
+        // let mut decoder = contexts.decoder(note_id)?;
+        // let note = self.decode_and_generate(
+        //     note_id,
+        //     &mut decoder,
+        //     …
+        // );
+        // if decoder.is_speculative() { info!(…) }
+        // ^ a failed MTP session failed the note; `with_decoder` falls back to plain.
+        let note = contexts.with_decoder(note_id, |decoder| {
+            let note = self.decode_and_generate(
+                note_id,
+                decoder,
+                model,
+                &tokens,
+                start,
+                MAX_OUTPUT_TOKENS,
+                Some(Suppress {
+                    open: prompt::REASONING_OPEN,
+                    boundary: prompt::REASONING_BOUNDARY,
+                    max_reasoning_tokens: MAX_REASONING_TOKENS,
+                }),
+                on_token,
+                cancel,
+            );
+            // Logged on every exit (done, cancelled, failed) once the MTP session existed.
+            if decoder.is_speculative() {
+                info!(
+                    "[GENERATE] {note_id} MTP — {} drafted, {} accepted",
+                    decoder.drafted, decoder.accepted
+                );
             }
-        };
-        let note = self.decode_and_generate(
-            note_id,
-            &mut decoder,
-            model,
-            &tokens,
-            start,
-            MAX_OUTPUT_TOKENS,
-            Some(Suppress {
-                open: prompt::REASONING_OPEN,
-                boundary: prompt::REASONING_BOUNDARY,
-                max_reasoning_tokens: MAX_REASONING_TOKENS,
-            }),
-            on_token,
-            cancel,
-        )?;
+            note
+        });
+        let note = note?;
         // Deterministic scrub of any reasoning marker the model echoed after the note
         // body (§8.5) — the streamed buffer may briefly flash it, but the persisted
         // note never carries it. Cancellation returns `None` and is passed through.
@@ -701,7 +751,8 @@ impl LlmEngine {
     fn decode_and_generate(
         &self,
         note_id: &str,
-        decoder: &mut Decoder<'_, '_>,
+        // decoder: &mut Decoder<'_, '_>,
+        decoder: &mut MtpDecoder<'_, '_>,
         model: &LlamaModel,
         tokens: &[LlamaToken],
         start: i32,
@@ -761,10 +812,11 @@ impl LlmEngine {
         // below still consumes one token at a time.
         let mut verified: VecDeque<LlamaToken> = VecDeque::new();
         let mut seed: Option<LlamaToken> = None;
-        // Speculation is a speedup, not a requirement (§8.2). A failed proposal latches it
-        // off for the rest of the note instead of failing the note: near-greedy decoding
-        // means a retry hits the same draft with the same state and fails identically.
-        let mut drafting = true;
+        // // Speculation is a speedup, not a requirement (§8.2). A failed proposal latches it
+        // // off for the rest of the note instead of failing the note: near-greedy decoding
+        // // means a retry hits the same draft with the same state and fails identically.
+        // let mut drafting = true;
+        // ^ the draft-failure latch now lives in `MtpDecoder`.
         let mut note_tokens = 0; // counted against `max_tokens` (the note budget)
         let mut reasoning_tokens = 0; // counted against the reasoning cap, while suppressing
 
@@ -818,10 +870,15 @@ impl LlmEngine {
                     // are about to cut off, so drop the unemitted tail and roll the KV
                     // back to the last emitted token — that tail and the last round's
                     // rejected drafts both sit where the boundary is about to go.
+                    info!(
+                        "[GENERATE] {note_id} reasoning cap reached ({} tokens) — forcing {}",
+                        s.max_reasoning_tokens, s.boundary
+                    );
                     n_cur -= verified.len() as i32;
                     verified.clear();
                     seed = None; // the next sample comes from the injected boundary
-                    rollback_kv(decoder, n_cur)?;
+                    decoder.rollback(n_cur)?;
+                    // ^ was `rollback_kv(decoder, n_cur)?`.
                     let forced = model
                         .str_to_token(s.boundary, AddBos::Never)
                         .map_err(|e| anyhow!("failed to tokenize reasoning boundary: {e}"))?;
@@ -857,70 +914,75 @@ impl LlmEngine {
                         t
                     }
                 };
-                verified.push_back(id_last);
-
-                // Before drafting, not after: last round's rejected drafts still occupy
-                // `n_cur..`, the positions this round is about to write, and the draft
-                // reads the target's cells (§8.2: it mirrors them), so it would otherwise
-                // draft a continuation of tokens the target already threw away.
-                rollback_kv(decoder, n_cur)?;
-                // let drafts = decoder.draft(n_cur, id_last)?;
-                // ^ a broken draft head took the note down with it, a failure mode the
-                // pre-speculation path did not have.
-                let drafts = if drafting {
-                    decoder.draft(n_cur, id_last).unwrap_or_else(|e| {
-                        drafting = false;
-                        warn!(
-                            "[GENERATE] {note_id} MTP draft failed ({e}) — finishing the note without speculation"
-                        );
-                        Vec::new()
-                    })
-                } else {
-                    Vec::new()
-                };
-
-                batch.clear();
-                batch
-                    .add(id_last, n_cur, &[0], true)
-                    .map_err(|e| anyhow!("failed to add a token to the batch: {e}"))?;
-                for (i, d) in drafts.iter().enumerate() {
-                    batch
-                        .add(*d, n_cur + 1 + i as i32, &[0], true)
-                        .map_err(|e| anyhow!("failed to add a draft token to the batch: {e}"))?;
-                }
-                // No rollback here: `draft` leaves nothing behind — llama.cpp returns from
-                // `apply_ubatch` without touching a cell while the draft's cache mirrors
-                // the target's. The only cells ever in the way are the target's own
-                // rejected drafts, already cleared above before they could be drafted on.
-                decoder
-                    .decode(&mut batch)
-                    .map_err(|e| anyhow!("token decode failed: {e}"))?;
-
-                // Row 0 of the logits is what follows the seed, row i + 1 what follows
-                // draft i. A row that agrees with its draft accepts it; the first
-                // disagreement — or the row past the last draft — is the target's own
-                // next token and seeds the next round, so nothing sampled is wasted and
-                // the emitted sequence is exactly what the target alone would produce.
-                let mut n_accepted = 0usize;
-                seed = Some(loop {
-                    let t = sampler.sample(decoder.context(), n_accepted as i32);
-                    sampler.accept(t);
-                    match drafts.get(n_accepted) {
-                        Some(d) if *d == t => {
-                            verified.push_back(t);
-                            n_accepted += 1;
-                        }
-                        _ => break t,
-                    }
-                });
-                if !drafts.is_empty() {
-                    // Resyncs the draft head's carried hidden state to the accepted prefix.
-                    // Skipped when nothing was proposed — there is no proposal to answer,
-                    // which is also every round of the no-draft path.
-                    decoder.accept(n_accepted)?;
-                }
-                // Everything in `verified` is now in the target's KV; `seed` is not.
-                n_cur += verified.len() as i32;
+                // verified.push_back(id_last);
+                //
+                // // Before drafting, not after: last round's rejected drafts still occupy
+                // // `n_cur..`, the positions this round is about to write, and the draft
+                // // reads the target's cells (§8.2: it mirrors them), so it would otherwise
+                // // draft a continuation of tokens the target already threw away.
+                // rollback_kv(decoder, n_cur)?;
+                // // let drafts = decoder.draft(n_cur, id_last)?;
+                // // ^ a broken draft head took the note down with it, a failure mode the
+                // // pre-speculation path did not have.
+                // let drafts = if drafting {
+                //     decoder.draft(n_cur, id_last).unwrap_or_else(|e| {
+                //         drafting = false;
+                //         warn!(
+                //             "[GENERATE] {note_id} MTP draft failed ({e}) — finishing the note without speculation"
+                //         );
+                //         Vec::new()
+                //     })
+                // } else {
+                //     Vec::new()
+                // };
+                //
+                // batch.clear();
+                // batch
+                //     .add(id_last, n_cur, &[0], true)
+                //     .map_err(|e| anyhow!("failed to add a token to the batch: {e}"))?;
+                // for (i, d) in drafts.iter().enumerate() {
+                //     batch
+                //         .add(*d, n_cur + 1 + i as i32, &[0], true)
+                //         .map_err(|e| anyhow!("failed to add a draft token to the batch: {e}"))?;
+                // }
+                // // No rollback here: `draft` leaves nothing behind — llama.cpp returns from
+                // // `apply_ubatch` without touching a cell while the draft's cache mirrors
+                // // the target's. The only cells ever in the way are the target's own
+                // // rejected drafts, already cleared above before they could be drafted on.
+                // decoder
+                //     .decode(&mut batch)
+                //     .map_err(|e| anyhow!("token decode failed: {e}"))?;
+                //
+                // // Row 0 of the logits is what follows the seed, row i + 1 what follows
+                // // draft i. A row that agrees with its draft accepts it; the first
+                // // disagreement — or the row past the last draft — is the target's own
+                // // next token and seeds the next round, so nothing sampled is wasted and
+                // // the emitted sequence is exactly what the target alone would produce.
+                // let mut n_accepted = 0usize;
+                // seed = Some(loop {
+                //     let t = sampler.sample(decoder.context(), n_accepted as i32);
+                //     sampler.accept(t);
+                //     match drafts.get(n_accepted) {
+                //         Some(d) if *d == t => {
+                //             verified.push_back(t);
+                //             n_accepted += 1;
+                //         }
+                //         _ => break t,
+                //     }
+                // });
+                // if !drafts.is_empty() {
+                //     // Resyncs the draft head's carried hidden state to the accepted prefix.
+                //     // Skipped when nothing was proposed — there is no proposal to answer,
+                //     // which is also every round of the no-draft path.
+                //     decoder.accept(n_accepted)?;
+                // }
+                // // Everything in `verified` is now in the target's KV; `seed` is not.
+                // n_cur += verified.len() as i32;
+                // Draft → verify → accept lives in `mtp.rs`; `tokens` are already in the KV.
+                let round = decoder.round(id_last, n_cur, &mut sampler)?;
+                n_cur += round.tokens.len() as i32;
+                verified.extend(round.tokens);
+                seed = Some(round.next_seed);
             }
             let token = verified
                 .pop_front()
@@ -1045,64 +1107,60 @@ impl LlmEngine {
     /// is built per note (and per prefix priming); the cached prefix state is
     /// restored into it, so nothing needs to hold a context across notes (§8.6).
     fn new_context<'a>(&'a self, model: &'a LlamaModel) -> Result<LlamaContext<'a>> {
-        // Both phases run on the tuned thread count (physical // 2, design §8.2): decode
-        // (`n_threads`) is memory-bandwidth-bound and regresses past a fraction of the
-        // cores, and we cap prefill (`n_threads_batch`) at the same count rather than let
-        // it fall to the llama.cpp default of 4 — 4 would throttle the transcript-tail
-        // prefill (the uncached part of every note) on any many-core machine.
-        // When the physical core count was unavailable, neither is set and llama.cpp
-        // uses its own defaults.
+        // Decode (`n_threads`, physical // 2, §8.2) is memory-bandwidth-bound and regresses
+        // past a fraction of the cores. Unset values fall back to llama.cpp defaults.
         let mut ctx_params = LlamaContextParams::default().with_n_ctx(NonZeroU32::new(N_CTX));
         if let Some(n) = self.n_threads {
-            ctx_params = ctx_params.with_n_threads(n).with_n_threads_batch(n);
+            ctx_params = ctx_params.with_n_threads(n);
         }
-        // let ctx_params = LlamaContextParams::default()
-        //     .with_n_ctx(NonZeroU32::new(N_CTX))
-        //     .with_n_threads(self.n_threads)
-        //     .with_n_threads_batch(self.n_threads);
+        // Prefill is compute-bound, so it gets every physical core.
+        if let Some(physical) = sysinfo::System::new().physical_core_count() {
+            ctx_params = ctx_params.with_n_threads_batch(physical as i32);
+        }
         model
             .new_context(&self.backend, ctx_params)
             .map_err(|e| anyhow!("failed to create LLM context: {e}"))
     }
 
-    /// The MTP draft context for `model`, paired with the target `target` (§8.2).
-    ///
-    /// `gemma4-assistant` is a draft-only architecture: llama.cpp refuses to build a
-    /// context for it without `ctx_other`, and uses that pairing to map the draft's four
-    /// blocks onto the target's last two KV layers rather than allocating a second cache
-    /// — hence the matching `N_CTX`.
-    ///
-    /// The target is taken by value and handed back inside [`Contexts`]: llama.cpp keeps
-    /// its pointer in the draft's `ctx_other` and aliases its KV cells for the draft's
-    /// whole life, yet the returned context borrows nothing, so only co-ownership can
-    /// stop the target being dropped first.
-    // fn new_draft_context<'a>(&'a self, model: &'a LlamaModel, target: &LlamaContext<'_>)
-    //     -> Result<LlamaContext<'a>>
-    // ^ handed back a free-standing draft context: nothing in the type system tied it to
-    // the target it aliases, so a swap of the two `let`s in `generate` was a UAF.
-    fn pair_with_draft<'a>(
-        &'a self,
-        model: &'a LlamaModel,
-        target: LlamaContext<'a>,
-    ) -> Result<Contexts<'a>> {
-        let mut ctx_params = LlamaContextParams::default()
-            .with_n_ctx(NonZeroU32::new(N_CTX))
-            .with_ctx_type(LlamaContextType::Mtp)
-            .with_ctx_other(&target)
-            // Dead for this arch (the draft is not recurrent), but `MtpSession` validates
-            // it against `n_draft_max` for the architectures that are.
-            .with_n_rs_seq(N_DRAFT_MAX.max(4) as u32);
-        if let Some(n) = self.n_threads {
-            ctx_params = ctx_params.with_n_threads(n).with_n_threads_batch(n);
-        }
-        let draft = model
-            .new_context(&self.backend, ctx_params)
-            .map_err(|e| anyhow!("failed to create the MTP draft context: {e}"))?;
-        Ok(Contexts {
-            draft: Some(draft),
-            target,
-        })
-    }
+    // /// The MTP draft context for `model`, paired with the target `target` (§8.2).
+    // ///
+    // /// `gemma4-assistant` is a draft-only architecture: llama.cpp refuses to build a
+    // /// context for it without `ctx_other`, and uses that pairing to map the draft's four
+    // /// blocks onto the target's last two KV layers rather than allocating a second cache
+    // /// — hence the matching `N_CTX`.
+    // ///
+    // /// The target is taken by value and handed back inside [`Contexts`]: llama.cpp keeps
+    // /// its pointer in the draft's `ctx_other` and aliases its KV cells for the draft's
+    // /// whole life, yet the returned context borrows nothing, so only co-ownership can
+    // /// stop the target being dropped first.
+    // // fn new_draft_context<'a>(&'a self, model: &'a LlamaModel, target: &LlamaContext<'_>)
+    // //     -> Result<LlamaContext<'a>>
+    // // ^ handed back a free-standing draft context: nothing in the type system tied it to
+    // // the target it aliases, so a swap of the two `let`s in `generate` was a UAF.
+    // fn pair_with_draft<'a>(
+    //     &'a self,
+    //     model: &'a LlamaModel,
+    //     target: LlamaContext<'a>,
+    // ) -> Result<Contexts<'a>> {
+    //     let mut ctx_params = LlamaContextParams::default()
+    //         .with_n_ctx(NonZeroU32::new(N_CTX))
+    //         .with_ctx_type(LlamaContextType::Mtp)
+    //         .with_ctx_other(&target)
+    //         // Dead for this arch (the draft is not recurrent), but `MtpSession` validates
+    //         // it against `n_draft_max` for the architectures that are.
+    //         .with_n_rs_seq(N_DRAFT_MAX.max(4) as u32);
+    //     if let Some(n) = self.n_threads {
+    //         ctx_params = ctx_params.with_n_threads(n).with_n_threads_batch(n);
+    //     }
+    //     let draft = model
+    //         .new_context(&self.backend, ctx_params)
+    //         .map_err(|e| anyhow!("failed to create the MTP draft context: {e}"))?;
+    //     Ok(Contexts {
+    //         draft: Some(draft),
+    //         target,
+    //     })
+    // }
+    // ^ replaced by `mtp::MtpContexts::with_draft`.
 
     fn lock_model(&self) -> MutexGuard<'_, Option<LlamaModel>> {
         self.model.lock().unwrap_or_else(|p| p.into_inner())
@@ -1124,107 +1182,108 @@ fn rate(tokens: i32, elapsed: std::time::Duration) -> f32 {
     }
 }
 
-/// The target context plus, when a draft model is loaded, the MTP draft context built
-/// against it (§8.2). Owning both is a tie the borrow checker cannot express on its own:
-/// `LlamaModel::new_context` returns a context that borrows nothing, while llama.cpp
-/// stores the target's pointer in the draft's `ctx_other` and aliases the target's KV
-/// cells for as long as the draft lives. Field order is drop order — the draft goes
-/// first, so the cells it points at are still there.
-struct Contexts<'a> {
-    draft: Option<LlamaContext<'a>>,
-    target: LlamaContext<'a>,
-}
-
-impl<'a> Contexts<'a> {
-    /// A run with no speculation: the target alone.
-    fn target_only(target: LlamaContext<'a>) -> Self {
-        Self {
-            draft: None,
-            target,
-        }
-    }
-
-    /// Both halves at once — `MtpSession` needs them mutably together.
-    fn split_mut(&mut self) -> (&mut LlamaContext<'a>, Option<&mut LlamaContext<'a>>) {
-        (&mut self.target, self.draft.as_mut())
-    }
-}
-
-/// How the generate loop decodes on the target: with MTP speculation when a draft model
-/// is loaded, plain otherwise. The draft is a speedup, not a requirement (§8.2), so its
-/// absence must not cost the clinician the note — `Plain` proposes nothing and the
-/// round degenerates to one target-decided token per decode.
-enum Decoder<'ctx, 'model> {
-    Speculative(MtpSession<'ctx, 'model>),
-    Plain(&'ctx mut LlamaContext<'model>),
-}
-
-impl<'ctx, 'model> Decoder<'ctx, 'model> {
-    /// The target context — what every sample reads its logits from.
-    fn context(&self) -> &LlamaContext<'model> {
-        match self {
-            Self::Speculative(s) => s.target_context(),
-            Self::Plain(ctx) => ctx,
-        }
-    }
-
-    /// Decode one batch on the target, harvesting it into MTP state when speculating.
-    fn decode(&mut self, batch: &mut LlamaBatch) -> Result<()> {
-        match self {
-            Self::Speculative(s) => s
-                .decode_target_and_process(batch)
-                .map_err(|e| anyhow!("{e}")),
-            Self::Plain(ctx) => ctx.decode(batch).map_err(|e| anyhow!("{e}")),
-        }
-    }
-
-    /// Propose up to `N_DRAFT_MAX` continuations of `id_last`; none without a draft.
-    fn draft(&mut self, n_past: i32, id_last: LlamaToken) -> Result<Vec<LlamaToken>> {
-        match self {
-            Self::Speculative(s) => s
-                .draft(0, n_past, id_last)
-                .map_err(|e| anyhow!("MTP draft failed: {e}")),
-            Self::Plain(_) => Ok(Vec::new()),
-        }
-    }
-
-    /// Answer the outstanding proposal with how much of it the target kept.
-    fn accept(&mut self, n_accepted: usize) -> Result<()> {
-        match self {
-            Self::Speculative(s) => s
-                .accept(0, n_accepted as u16)
-                .map_err(|e| anyhow!("failed to accept {n_accepted} draft tokens: {e}")),
-            Self::Plain(_) => Ok(()),
-        }
-    }
-}
-
-/// Drop every target KV cell at or past `n_past` on sequence 0 (§8.2). What occupies those
-/// positions is the target's own work — last round's rejected drafts, or the unemitted tail
-/// at a forced boundary. The draft context marks no cells of its own: llama.cpp skips
-/// `apply_ubatch` entirely while its cache mirrors the target's, so it only ever reads.
-fn rollback_kv(decoder: &mut Decoder<'_, '_>, n_past: i32) -> Result<()> {
-    // let removed = match decoder { … }
-    // .map_err(…)?;
-    // if removed { Ok(()) } else { Err(anyhow!("the target KV cache refused …")) }
-    // ^ dead guard: `llama_kv_cache::seq_rm` returns true on every path. Only a recurrent
-    // cache can refuse a partial removal, and neither context has one.
-    match decoder {
-        Decoder::Speculative(s) => s.clear_target_kv_cache_seq(Some(0), Some(n_past as u32), None),
-        Decoder::Plain(ctx) => ctx.clear_kv_cache_seq(Some(0), Some(n_past as u32), None),
-    }
-    .map_err(|e| anyhow!("failed to clear the speculative KV range: {e}"))?;
-    // Ask the cells instead of trusting the return value. Stale cells past `n_past` are
-    // attended alongside the tokens that replace them, so a removal that did not take is a
-    // corrupt note, not a slow one.
-    let highest = decoder.context().kv_cache_seq_pos_max(0);
-    if highest >= n_past {
-        return Err(anyhow!(
-            "the target KV cache still holds position {highest} after the removal at {n_past}"
-        ));
-    }
-    Ok(())
-}
+// /// The target context plus, when a draft model is loaded, the MTP draft context built
+// /// against it (§8.2). Owning both is a tie the borrow checker cannot express on its own:
+// /// `LlamaModel::new_context` returns a context that borrows nothing, while llama.cpp
+// /// stores the target's pointer in the draft's `ctx_other` and aliases the target's KV
+// /// cells for as long as the draft lives. Field order is drop order — the draft goes
+// /// first, so the cells it points at are still there.
+// struct Contexts<'a> {
+//     draft: Option<LlamaContext<'a>>,
+//     target: LlamaContext<'a>,
+// }
+//
+// impl<'a> Contexts<'a> {
+//     /// A run with no speculation: the target alone.
+//     fn target_only(target: LlamaContext<'a>) -> Self {
+//         Self {
+//             draft: None,
+//             target,
+//         }
+//     }
+//
+//     /// Both halves at once — `MtpSession` needs them mutably together.
+//     fn split_mut(&mut self) -> (&mut LlamaContext<'a>, Option<&mut LlamaContext<'a>>) {
+//         (&mut self.target, self.draft.as_mut())
+//     }
+// }
+//
+// /// How the generate loop decodes on the target: with MTP speculation when a draft model
+// /// is loaded, plain otherwise. The draft is a speedup, not a requirement (§8.2), so its
+// /// absence must not cost the clinician the note — `Plain` proposes nothing and the
+// /// round degenerates to one target-decided token per decode.
+// enum Decoder<'ctx, 'model> {
+//     Speculative(MtpSession<'ctx, 'model>),
+//     Plain(&'ctx mut LlamaContext<'model>),
+// }
+//
+// impl<'ctx, 'model> Decoder<'ctx, 'model> {
+//     /// The target context — what every sample reads its logits from.
+//     fn context(&self) -> &LlamaContext<'model> {
+//         match self {
+//             Self::Speculative(s) => s.target_context(),
+//             Self::Plain(ctx) => ctx,
+//         }
+//     }
+//
+//     /// Decode one batch on the target, harvesting it into MTP state when speculating.
+//     fn decode(&mut self, batch: &mut LlamaBatch) -> Result<()> {
+//         match self {
+//             Self::Speculative(s) => s
+//                 .decode_target_and_process(batch)
+//                 .map_err(|e| anyhow!("{e}")),
+//             Self::Plain(ctx) => ctx.decode(batch).map_err(|e| anyhow!("{e}")),
+//         }
+//     }
+//
+//     /// Propose up to `N_DRAFT_MAX` continuations of `id_last`; none without a draft.
+//     fn draft(&mut self, n_past: i32, id_last: LlamaToken) -> Result<Vec<LlamaToken>> {
+//         match self {
+//             Self::Speculative(s) => s
+//                 .draft(0, n_past, id_last)
+//                 .map_err(|e| anyhow!("MTP draft failed: {e}")),
+//             Self::Plain(_) => Ok(Vec::new()),
+//         }
+//     }
+//
+//     /// Answer the outstanding proposal with how much of it the target kept.
+//     fn accept(&mut self, n_accepted: usize) -> Result<()> {
+//         match self {
+//             Self::Speculative(s) => s
+//                 .accept(0, n_accepted as u16)
+//                 .map_err(|e| anyhow!("failed to accept {n_accepted} draft tokens: {e}")),
+//             Self::Plain(_) => Ok(()),
+//         }
+//     }
+// }
+//
+// /// Drop every target KV cell at or past `n_past` on sequence 0 (§8.2). What occupies those
+// /// positions is the target's own work — last round's rejected drafts, or the unemitted tail
+// /// at a forced boundary. The draft context marks no cells of its own: llama.cpp skips
+// /// `apply_ubatch` entirely while its cache mirrors the target's, so it only ever reads.
+// fn rollback_kv(decoder: &mut Decoder<'_, '_>, n_past: i32) -> Result<()> {
+//     // let removed = match decoder { … }
+//     // .map_err(…)?;
+//     // if removed { Ok(()) } else { Err(anyhow!("the target KV cache refused …")) }
+//     // ^ dead guard: `llama_kv_cache::seq_rm` returns true on every path. Only a recurrent
+//     // cache can refuse a partial removal, and neither context has one.
+//     match decoder {
+//         Decoder::Speculative(s) => s.clear_target_kv_cache_seq(Some(0), Some(n_past as u32), None),
+//         Decoder::Plain(ctx) => ctx.clear_kv_cache_seq(Some(0), Some(n_past as u32), None),
+//     }
+//     .map_err(|e| anyhow!("failed to clear the speculative KV range: {e}"))?;
+//     // Ask the cells instead of trusting the return value. Stale cells past `n_past` are
+//     // attended alongside the tokens that replace them, so a removal that did not take is a
+//     // corrupt note, not a slow one.
+//     let highest = decoder.context().kv_cache_seq_pos_max(0);
+//     if highest >= n_past {
+//         return Err(anyhow!(
+//             "the target KV cache still holds position {highest} after the removal at {n_past}"
+//         ));
+//     }
+//     Ok(())
+// }
+// ^ replaced by `mtp::MtpContexts` / `mtp::MtpDecoder`.
 
 /// Fail the load if free RAM is below the model file size plus a working margin
 /// (design §8.4): better a graceful error in IDLE than a mid-load OOM crash.
