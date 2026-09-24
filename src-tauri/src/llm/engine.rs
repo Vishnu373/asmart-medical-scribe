@@ -302,6 +302,20 @@ impl LlmEngine {
         Ok(())
     }
 
+    /// Load the draft into an engine whose target is already resident — the upgrade case,
+    /// where Setup downloads the draft after launch loaded Gemma without it. No-op otherwise.
+    pub fn load_draft_if_target_loaded(&self) {
+        // Same lock as `ensure_loaded`: an in-flight preload finishes (loading the draft) first.
+        let _load = self.load_lock.lock().unwrap_or_else(|p| p.into_inner());
+        if !self.mtp_enabled || self.lock_model().is_none() || self.lock_draft_model().is_some() {
+            return;
+        }
+        match self.load_draft(self.model_kind()) {
+            Ok(draft) => *self.lock_draft_model() = Some(draft),
+            Err(e) => warn!("[LOAD] SLM draft unavailable ({e}) — no speculative decoding"),
+        }
+    }
+
     /// Load the MTP draft model (design §8.x speculative decoding). Split out of
     /// `ensure_loaded` so its failure can be logged and swallowed there.
     fn load_draft(&self, kind: LlmModel) -> Result<LlamaModel> {

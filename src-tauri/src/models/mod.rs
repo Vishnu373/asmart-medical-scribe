@@ -17,6 +17,7 @@ use std::collections::HashSet;
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::sync::Mutex;
 
 use anyhow::{anyhow, bail, Result};
@@ -24,6 +25,7 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 use tauri::{AppHandle, Emitter, Manager};
 
+use crate::llm::LlmEngine;
 use crate::llm::LlmModel;
 
 /// The single note-generation model download (D3). One GGUF, content-verified before
@@ -289,6 +291,10 @@ pub fn download_llm_draft(app: AppHandle) -> Result<(), String> {
         // (or a fresh download after done) isn't rejected as still in flight.
         if let Some(set) = IN_FLIGHT.lock().unwrap().as_mut() {
             set.remove(&tier);
+        }
+        // Load it before `done` so Setup closes with MTP live, not after a restart.
+        if result.is_ok() {
+            app.state::<Arc<LlmEngine>>().load_draft_if_target_loaded();
         }
         finish_download(&app, "SLM draft", &tier, result);
     });
