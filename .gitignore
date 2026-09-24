@@ -14,8 +14,9 @@ graphify-out/
 # implementation.md file
 docs/implementation.md
 
-# uploading models, models folder
+# uploading models, models folder, web url
 scripts/models/
+website/
 
 # private key
 ~/
